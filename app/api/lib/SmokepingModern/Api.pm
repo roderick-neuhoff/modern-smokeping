@@ -436,10 +436,11 @@ sub _rrd_stddev_spark {
     $col{ $names->[$_] } = $_ for 0 .. $#$names;
     return (undef, undef) unless defined $col{median};
 
-    my @med = map { $_->[ $col{median} ] } @$data;
-    my @los = defined $col{loss} ? map { $_->[ $col{loss} ] } @$data : ();
+    my @medAll = map { $_->[ $col{median} ] } @$data;
+    my @losAll = defined $col{loss} ? map { $_->[ $col{loss} ] } @$data : ();
 
-    my @v = grep { defined } @med;
+    # stddev over the whole window
+    my @v = grep { defined } @medAll;
     my $stddev;
     if (@v >= 3) {
         my $mean = 0; $mean += $_ for @v; $mean /= @v;
@@ -447,7 +448,12 @@ sub _rrd_stddev_spark {
         $stddev = sqrt($var) * 1000;
     }
 
-    # downsample to at most 60 buckets
+    # sparkline: only the most recent slice, so it is legible from minute one
+    my $tail = 240;                       # ~40 min at a 10 s step
+    my $from = @medAll > $tail ? @medAll - $tail : 0;
+    my @med = @medAll[ $from .. $#medAll ];
+    my @los = @losAll ? @losAll[ $from .. $#losAll ] : ();
+
     my $want = 60;
     my $n = scalar @med;
     my $bucket = $n > $want ? int($n / $want) + 1 : 1;

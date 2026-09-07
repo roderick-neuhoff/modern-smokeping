@@ -71,37 +71,77 @@ async function api(path, { retries = 1 } = {}) {
 
 // --- data refresh -------------------------------------------------
 
+let refreshing = null;   // in-flight refresh promise, so overlapping triggers coalesce
 async function refresh() {
-  try {
-    const [summary, alerts] = await Promise.all([api('/summary'), api('/alerts')]);
-    state.summary = summary;
-    state.alerts = alerts;
-    state.bySeverity = {};
-    for (const n of summary.nodes) state.bySeverity[n.path] = n.severity;
-    setOnline(true);
-  } catch (e) {
-    console.warn('refresh failed', e);
-    setOnline(false);
-  }
-  renderStatusPills();
-  decorateTree();
-  render();          // re-render current view with fresh data
-  bumpRefreshClock();
+  if (refreshing) return refreshing;
+  refreshing = (async () => {
+    let failed = null;
+    try {
+      const [summary, alerts] = await Promise.all([
+        api('/summary', { retries: 2 }).catch(e => { throw tag(e, '/api/summary'); }),
+        api('/alerts',  { retries: 2 }).catch(e => { throw tag(e, '/api/alerts'); }),
+      ]);
+      state.summary = summary;
+      state.alerts = alerts;
+      state.bySeverity = {};
+      for (const n of summary.nodes) state.bySeverity[n.path] = n.severity;
+      setOnline(true);
+    } catch (e) {
+      failed = e;
+      console.warn('refresh failed', e);
+      setOnline(false, e);
+    }
+    try {
+      renderStatusPills();
+      decorateTree();
+      render();          // re-render current view with fresh data
+    } catch (e) {
+      console.error('render failed', e);   // never let a render bug kill the poll loop
+    }
+    bumpRefreshClock();
+  })();
+  try { await refreshing; } finally { refreshing = null; }
 }
+function tag(e, where) { e.where = where; return e; }
 
-function setOnline(ok) {
+let lastOk = 0;
+let lastErr = null;
+function setOnline(ok, err) {
   state.online = ok;
-  document.getElementById('offlineBanner').hidden = ok;
+  const b = document.getElementById('offlineBanner');
+  if (ok) {
+    lastOk = Date.now();
+    lastErr = null;
+    b.hidden = true;
+    return;
+  }
+  lastErr = { at: Date.now(), where: err?.where || '?', msg: (err && (err.message || String(err))) || 'unknown' };
+  try { localStorage.setItem('sp.lastErr', JSON.stringify(lastErr)); } catch {}
+  const d = document.getElementById('offlineDetail');
+  if (d) d.textContent = `${lastErr.where}: ${lastErr.msg} (${new Date(lastErr.at).toLocaleTimeString()})`
+    + (lastOk ? ` · last good update ${ago(lastOk / 1000)}` : '');
+  b.hidden = false;
 }
 
 let refreshDeadline = 0;
 function bumpRefreshClock() { refreshDeadline = Date.now() + REFRESH_MS; }
 setInterval(() => {
   const left = Math.max(0, Math.round((refreshDeadline - Date.now()) / 1000));
-  document.getElementById('refreshCount').textContent = left ? left + 's' : '';
-  if (left === 0 && !document.hidden) { bumpRefreshClock(); refresh(); }
+  const rc = document.getElementById('refreshCount');
+  rc.textContent = left ? left + 's' : '';
+  rc.title = lastOk ? 'last update ' + ago(lastOk / 1000) : '';
+  // hidden tabs: keep a slow heartbeat so the page never sits on stale state
+  const due = left === 0 || (document.hidden && Date.now() - lastOk > 60_000);
+  if (due) { bumpRefreshClock(); refresh(); }
 }, 1000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+
+// Browsers freeze/throttle background tabs (Edge "sleeping tabs", Chromium page
+// freezing); an in-flight fetch can be dropped on resume. Refresh on every
+// "we are back" signal so a stale banner clears immediately.
+for (const ev of ['visibilitychange', 'pageshow', 'focus', 'online', 'resume']) {
+  const target = ev === 'resume' || ev === 'visibilitychange' ? document : window;
+  target.addEventListener(ev, () => { if (!document.hidden) { bumpRefreshClock(); refresh(); } });
+}
 
 // --- status pills ------------------------------------------------
 
@@ -581,7 +621,12 @@ document.getElementById('menuToggle').addEventListener('click', () => {
 });
 document.getElementById('scrim').addEventListener('click', closeDrawer);
 document.getElementById('refreshBtn').addEventListener('click', () => { bumpRefreshClock(); refresh(); });
-document.getElementById('offlineRetry').addEventListener('click', () => { bumpRefreshClock(); boot(); });
+document.getElementById('offlineRetry').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true; btn.textContent = 'Retrying…';
+  try { bumpRefreshClock(); await (booted ? refresh() : boot()); }
+  finally { btn.disabled = false; btn.textContent = 'Retry'; }
+});
 
 const themeBtn = document.getElementById('themeBtn');
 function applyTheme(t) {

@@ -271,6 +271,8 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; font-
   box-shadow: var(--shadow); z-index: 40; font-size: 13px; display: flex; gap: 12px; align-items: center;
 }
 .offline-banner button { background: rgba(255,255,255,.2); border: 0; color: #fff; padding: 4px 10px; border-radius: 6px; }
+.offline-banner button:disabled { opacity: .6; cursor: wait; }
+.offline-detail { font-size: 11px; opacity: .85; font-family: var(--mono); margin-top: 2px; max-width: 70vw; white-space: normal; }
 
 .zoom-sel {
   position: absolute; pointer-events: none; background: rgba(47, 109, 246, 0.14);

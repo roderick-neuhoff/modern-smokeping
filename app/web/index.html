@@ -49,8 +49,11 @@
     </main>
   </div>
 
-  <div class="offline-banner" id="offlineBanner" hidden>
-    <strong>API unreachable.</strong> Data shown may be stale.
+  <div class="offline-banner" id="offlineBanner" hidden role="status" aria-live="polite">
+    <div>
+      <strong>API unreachable.</strong> Data shown may be stale.
+      <div class="offline-detail" id="offlineDetail"></div>
+    </div>
     <button id="offlineRetry">Retry</button>
   </div>
 </div>

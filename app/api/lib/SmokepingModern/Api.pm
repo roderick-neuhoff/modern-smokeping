@@ -58,8 +58,9 @@ sub run {
         return _cached('tree', $ttl{tree}, \&tree)          if $route eq 'tree';
         return _cached('summary', $ttl{summary}, sub { summary($q) }) if $route eq 'summary';
         if ($route eq 'node') {
-            my $safe = ($q->{path} // '') . '|' . ($q->{range} // '3h');
-            $safe =~ s/[^A-Za-z0-9._-]+/_/g;
+            my $safe = join '|', map { $q->{$_} // '' } qw(path range start end);
+            $safe =~ s/[^A-Za-z0-9._|-]+/_/g;
+            $safe =~ s/\|/./g;
             return _cached("node-$safe", 8, sub { node($q) });
         }
         return _cached('alerts', $ttl{alerts}, \&alerts)    if $route eq 'alerts';
@@ -254,6 +255,15 @@ sub node {
     my $range = $RANGE_SEC{ $q->{range} || '3h' } ? ($q->{range} || '3h') : '3h';
     my $secs  = $RANGE_SEC{$range};
 
+    # explicit window (zoom): ?start=<epoch>&end=<epoch>
+    my ($start_arg, $end_arg) = ("-${secs}s", 'now');
+    my ($zs, $ze) = (_num($q->{start}), _num($q->{end}));
+    if (defined $zs && defined $ze && $ze > $zs && ($ze - $zs) >= 60) {
+        ($start_arg, $end_arg) = (int $zs, int $ze);
+        $secs = int($ze - $zs);
+        $range = 'custom';
+    }
+
     my $rrd = _rrd_for($path);
     die { status => 404, error => "no rrd for $path" } unless -f $rrd;
 
@@ -265,8 +275,8 @@ sub node {
     });
     my $pings = $found ? _pings_for($found) : ($cfg->{Database}{pings} || 20);
 
-    my $stats = $si->stat_node({ path => $path, pings => $pings }, "-${secs}s", 'now');
-    my $series = _smoke_series($rrd, $pings, $secs);
+    my $stats = $si->stat_node({ path => $path, pings => $pings }, $start_arg, $end_arg);
+    my $series = _smoke_series($rrd, $pings, $start_arg, $end_arg);
 
     my @alerts = $found && $found->{alerts}
         ? (ref $found->{alerts} eq 'ARRAY' ? @{ $found->{alerts} }
@@ -280,6 +290,7 @@ sub node {
         host      => $found && $found->{host},
         probe     => $found && $found->{probe},
         range     => $range,
+        window    => { start => ($series->{t}[0] // undef), end => ($series->{t}[-1] // undef) },
         pings     => $pings + 0,
         legacyUrl => "$LEGACY?target=" . _legacy_target($path),
         alerts    => \@alerts,
@@ -301,9 +312,9 @@ sub _pct { my $v = _num($_[0]); defined $v ? $v * 100  : undef }
 
 # pull median / loss / pingN straight from the rrd and derive percentile bands
 sub _smoke_series {
-    my ($rrd, $pings, $secs) = @_;
+    my ($rrd, $pings, $start_arg, $end_arg) = @_;
     my ($start, $step, $names, $data) =
-        RRDs::fetch($rrd, 'AVERAGE', '--start', "-${secs}s", '--end', 'now');
+        RRDs::fetch($rrd, 'AVERAGE', '--start', $start_arg, '--end', $end_arg);
     if (my $e = RRDs::error()) { die { status => 500, error => "rrd fetch: $e" } }
 
     my %col;
@@ -378,7 +389,7 @@ sub summary {
             $lossNow = _num($s->{loss_now});
             $medNow  = _num($s->{med_now});
             $medAvg  = _num($s->{med_avg});
-            ($stddev, $spark) = _rrd_stddev_spark($rrd, $secs);
+            ($stddev, $spark) = _rrd_stddev_spark($rrd, $secs, $pings);
         }
 
         # loss is a fraction 0..1. a single dropped ping (~1/20) is noise;
@@ -428,7 +439,8 @@ sub summary {
 
 # one fetch -> stddev (over the window) + a ~60-point sparkline for the card
 sub _rrd_stddev_spark {
-    my ($rrd, $secs) = @_;
+    my ($rrd, $secs, $pings) = @_;
+    $pings ||= 20;
     my ($start, $step, $names, $data) =
         RRDs::fetch($rrd, 'AVERAGE', '--start', "-${secs}s", '--end', 'now');
     return (undef, undef) if RRDs::error();
@@ -466,7 +478,7 @@ sub _rrd_stddev_spark {
             push @ll, $los[$j] if @los && defined $los[$j];
         }
         push @sm, @mm ? (_avg(@mm) * 1000) : undef;
-        push @sl, @ll ? _avg(@ll) : undef;   # loss as ping count; UI only needs >0
+        push @sl, @ll ? (_avg(@ll) * 100 / $pings) : undef;   # loss in %
     }
     my $spark = { median => \@sm, loss => \@sl, step => $step * $bucket };
     return ($stddev, $spark);

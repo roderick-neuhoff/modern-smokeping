@@ -115,33 +115,96 @@ export function drawSmoke(canvas, series, opts = {}) {
   band(p20, pmax, css('--smoke-outer'));
   band(p20, p80, css('--smoke-inner'));
 
-  // median line, broken across gaps
-  ctx.strokeStyle = css('--median-line');
-  ctx.lineWidth = 1.6;
-  ctx.beginPath();
-  let pen = false;
+  // median line, coloured by packet loss per segment (classic SmokePing look)
+  ctx.lineWidth = 2.2;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  let prev = null;
   for (let i = 0; i < t.length; i++) {
-    if (median[i] == null) { pen = false; continue; }
+    if (median[i] == null) { prev = null; continue; }
     const x = X(t[i]), y = Y(median[i]);
-    if (!pen) { ctx.moveTo(x, y); pen = true; } else ctx.lineTo(x, y);
+    if (prev) {
+      ctx.strokeStyle = lossColor(loss[i]);
+      ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(x, y); ctx.stroke();
+    }
+    prev = { x, y };
   }
-  ctx.stroke();
+  // isolated single points (gaps either side) still need a mark
+  for (let i = 0; i < t.length; i++) {
+    if (median[i] == null) continue;
+    const alone = (i === 0 || median[i - 1] == null) && (i === t.length - 1 || median[i + 1] == null);
+    if (!alone) continue;
+    ctx.fillStyle = lossColor(loss[i]);
+    ctx.beginPath(); ctx.arc(X(t[i]), Y(median[i]), 2, 0, Math.PI * 2); ctx.fill();
+  }
 
-  // loss markers along the bottom
-  const lossColor = css('--loss-mark');
+  // loss ribbon along the x axis: solid colour where loss > 0
+  const slotW = Math.max(1, plotW / Math.max(1, t.length - 1));
+  const ribbonH = 6;
+  const ribbonY = pad.t + plotH - ribbonH;
   for (let i = 0; i < t.length; i++) {
     const lp = loss[i];
     if (lp == null || lp <= 0) continue;
-    const x = X(t[i]);
-    const strength = Math.min(1, lp / 100);
-    ctx.fillStyle = lossColor;
-    ctx.globalAlpha = 0.25 + 0.75 * strength;
-    const barH = 3 + strength * 7;
-    ctx.fillRect(x - 1.2, pad.t + plotH - barH, 2.4, barH);
+    ctx.fillStyle = lossColor(lp);
+    ctx.fillRect(X(t[i]) - slotW / 2, ribbonY, slotW + 0.5, ribbonH);
   }
-  ctx.globalAlpha = 1;
 
-  return { X, Y, t0, spanSec, ymax, pad, plotW, plotH, series };
+  return { X, Y, t0, t1, spanSec, ymax, pad, plotW, plotH, series };
+}
+
+// loss (%) -> colour ramp. 0 = ok green, then amber, orange, red, purple.
+export function lossColor(pct) {
+  if (pct == null || pct <= 0) return css('--loss-0') || '#1f9d57';
+  if (pct <= 5)   return css('--loss-1') || '#7cb518';
+  if (pct <= 15)  return css('--loss-2') || '#c9860b';
+  if (pct <= 40)  return css('--loss-3') || '#e8590c';
+  if (pct <= 80)  return css('--loss-4') || '#d93a3a';
+  return css('--loss-5') || '#8a2be0';
+}
+
+// drag-to-zoom on the time axis. onZoom(startSec, endSec) is called on release;
+// double-click calls onReset().
+export function attachSmokeZoom(canvas, geom, selEl, onZoom, onReset) {
+  if (!geom) { canvas.onmousedown = null; canvas.ondblclick = null; return; }
+  const { pad, plotW, t0, spanSec } = geom;
+  const tsAt = (mx) => t0 + (Math.min(Math.max(mx, pad.l), pad.l + plotW) - pad.l) / plotW * spanSec;
+  let anchor = null;
+
+  const show = (a, b) => {
+    const l = Math.min(a, b), r = Math.max(a, b);
+    selEl.hidden = false;
+    selEl.style.left = (canvas.offsetLeft + l) + 'px';
+    selEl.style.top = (canvas.offsetTop + pad.t) + 'px';
+    selEl.style.width = (r - l) + 'px';
+    selEl.style.height = geom.plotH + 'px';
+  };
+  const px = (e) => (e.touches ? e.touches[0].clientX : e.clientX) - canvas.getBoundingClientRect().left;
+
+  const onMove = (e) => { if (anchor != null) show(anchor, px(e)); };
+  const onUp = (e) => {
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+    if (anchor == null) return;
+    const end = px(e.changedTouches ? e.changedTouches[0] : e);
+    selEl.hidden = true;
+    const a = tsAt(anchor), b = tsAt(end);
+    const dragPx = Math.abs(end - anchor);
+    anchor = null;
+    if (dragPx < 4) return;                 // a click, not a drag
+    if (Math.abs(b - a) >= 60) onZoom(Math.floor(Math.min(a, b)), Math.ceil(Math.max(a, b)));
+  };
+  canvas.onmousedown = (e) => {
+    if (e.button !== 0) return;
+    const mx = px(e);
+    if (mx < pad.l || mx > pad.l + plotW) return;
+    anchor = mx;
+    show(mx, mx);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    e.preventDefault();
+  };
+  canvas.ondblclick = (e) => { e.preventDefault(); onReset(); };
+  canvas.style.cursor = 'crosshair';
 }
 
 export function attachSmokeHover(canvas, geom, tooltipEl) {
@@ -183,42 +246,48 @@ export function attachSmokeHover(canvas, geom, tooltipEl) {
 export function drawSpark(canvas, series) {
   const { ctx, w, h } = setupHiDPI(canvas);
   ctx.clearRect(0, 0, w, h);
-  const vals = (series && series.median) || [];
-  const loss = (series && series.loss) || [];
-  const t = (series && series.t) || vals.map((_, i) => i);
-  if (t.length < 2) {
+  let vals = (series && series.median) || [];
+  let loss = (series && series.loss) || [];
+
+  // drop the empty run at the start so a young target still fills the width
+  let first = vals.findIndex(v => v != null);
+  if (first > 0) { vals = vals.slice(first); loss = loss.slice(first); }
+
+  if (vals.filter(v => v != null).length < 2) {
     ctx.fillStyle = css('--text-faint');
     ctx.font = `11px ${css('--sans') || 'sans-serif'}`;
     ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-    ctx.fillText('no data', 2, h / 2);
+    ctx.fillText('collecting…', 2, h / 2);
     return;
   }
+  const n = vals.length;
   let ymax = 0;
   for (const v of vals) if (v != null && v > ymax) ymax = v;
   ymax = ymax || 1;
-  const X = (i) => (i / (t.length - 1)) * (w - 2) + 1;
-  const Y = (v) => h - 2 - (v / ymax) * (h - 4);
+  const X = (i) => (i / Math.max(1, n - 1)) * (w - 2) + 1;
+  const Y = (v) => h - 5 - (v / ymax) * (h - 9);
 
-  // loss shading
-  ctx.fillStyle = css('--loss-mark');
-  for (let i = 0; i < t.length; i++) {
+  // loss ticks along the bottom edge
+  const slotW = Math.max(1.5, (w - 2) / Math.max(1, n - 1));
+  for (let i = 0; i < n; i++) {
     if (loss[i] == null || loss[i] <= 0) continue;
-    ctx.globalAlpha = 0.15 + 0.6 * Math.min(1, loss[i] / 100);
-    ctx.fillRect(X(i) - 1, 1, 2, h - 2);
+    ctx.fillStyle = lossColor(loss[i]);
+    ctx.fillRect(X(i) - slotW / 2, h - 3, slotW + 0.5, 3);
   }
-  ctx.globalAlpha = 1;
 
-  // area + line
-  ctx.beginPath();
-  let pen = false;
-  for (let i = 0; i < t.length; i++) {
-    if (vals[i] == null) { pen = false; continue; }
+  // median line coloured by loss per segment
+  ctx.lineWidth = 1.4;
+  ctx.lineCap = 'round';
+  let prev = null;
+  for (let i = 0; i < n; i++) {
+    if (vals[i] == null) { prev = null; continue; }
     const x = X(i), y = Y(vals[i]);
-    if (!pen) { ctx.moveTo(x, y); pen = true; } else ctx.lineTo(x, y);
+    if (prev) {
+      ctx.strokeStyle = lossColor(loss[i]);
+      ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(x, y); ctx.stroke();
+    }
+    prev = { x, y };
   }
-  ctx.strokeStyle = css('--accent');
-  ctx.lineWidth = 1.3;
-  ctx.stroke();
 }
 
 export { fmtMs };

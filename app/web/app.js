@@ -1,5 +1,5 @@
 // SmokePing Modern UI - app shell, router and views.
-import { drawSmoke, attachSmokeHover, drawSpark, fmtMs } from './chart.js';
+import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs } from './chart.js';
 
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
 const REFRESH_MS = 15_000;
@@ -342,46 +342,70 @@ function card(n) {
 const RANGES = ['3h', '30h', '10d', '360d'];
 let nodeRange = localStorage.getItem('sp.range') || '3h';
 let nodeRO = null;
+// zoom window (epoch seconds) for the node currently on screen; null = preset range
+let zoom = { path: null, start: null, end: null };
+
+function nodeQuery(path) {
+  const qs = new URLSearchParams({ path, range: nodeRange });
+  if (zoom.path === path && zoom.start && zoom.end) {
+    qs.set('start', zoom.start); qs.set('end', zoom.end);
+  }
+  return '/node?' + qs.toString();
+}
 
 async function renderNode(path) {
   const main = document.getElementById('main');
   if (nodeRO) { nodeRO.disconnect(); nodeRO = null; }
+  if (zoom.path !== path) zoom = { path, start: null, end: null };
   const fresh = !main.querySelector('.smokechart');
   if (fresh) main.innerHTML = '<div class="loading">Loading ' + path + ' …</div>';
   let d;
-  try { d = await api(`/node?range=${nodeRange}&path=` + encodeURIComponent(path)); }
+  try { d = await api(nodeQuery(path)); }
   catch (e) {
     if (fresh) main.innerHTML = `<div class="empty">Could not load <code>${path}</code>.<br>${e.message}</div>`;
     return;
   }
 
+  const zoomed = !!(zoom.start && zoom.end);
   const st = d.stats;
   main.innerHTML = '';
   main.append(el('div', { class: 'page-head' },
     el('h1', {}, d.title),
     d.host ? el('span', { class: 'sub' }, d.host + (d.probe ? ' · ' + d.probe : '')) : null,
     el('span', { class: 'spacer' }),
+    zoomed ? el('button', {
+      class: 'chip on', title: 'Back to the preset range (or double-click the chart)',
+      onclick: () => { zoom = { path, start: null, end: null }; renderNode(path); },
+    }, '⟲ Reset zoom') : null,
     el('div', { class: 'seg' }, ...RANGES.map(r => el('button', {
-      class: r === nodeRange ? 'on' : '',
-      onclick: () => { nodeRange = r; localStorage.setItem('sp.range', r); renderNode(path); },
+      class: (r === nodeRange && !zoomed) ? 'on' : '',
+      onclick: () => { nodeRange = r; localStorage.setItem('sp.range', r); zoom = { path, start: null, end: null }; renderNode(path); },
     }, r))),
   ));
 
   const wrap = el('div', { class: 'chart-wrap', style: 'position:relative' });
   const cv = el('canvas', { class: 'smokechart' });
   const tip = el('div', { class: 'chart-tooltip', hidden: 'hidden' });
-  wrap.append(cv, tip);
+  const sel = el('div', { class: 'zoom-sel', hidden: 'hidden' });
+  wrap.append(cv, sel, tip);
+  const ramp = el('span', { class: 'legend-ramp' },
+    ...[0, 1, 2, 3, 4, 5].map(i => el('i', { style: `background:var(--loss-${i})` })));
   wrap.append(el('div', { class: 'chart-legend' },
-    el('span', {}, el('i', { style: 'background:var(--median-line)' }), 'median'),
+    el('span', {}, 'median, coloured by loss: ', ramp, '0 % → 100 %'),
     el('span', {}, el('i', { style: 'background:var(--smoke-inner)' }), 'p20–p80'),
     el('span', {}, el('i', { style: 'background:var(--smoke-outer)' }), 'p20–max'),
-    el('span', {}, el('i', { style: 'background:var(--loss-mark)' }), 'packet loss'),
+    el('span', { class: 'zoom-hint' }, zoomed
+      ? `${new Date(d.window.start * 1000).toLocaleString()} – ${new Date(d.window.end * 1000).toLocaleString()}`
+      : 'drag on the chart to zoom · double-click to reset'),
   ));
   main.append(wrap);
 
   const drawNow = () => {
     const geom = drawSmoke(cv, d.series);
     attachSmokeHover(cv, geom, tip);
+    attachSmokeZoom(cv, geom, sel,
+      (s, e) => { zoom = { path, start: s, end: e }; renderNode(path); },
+      () => { zoom = { path, start: null, end: null }; renderNode(path); });
   };
   requestAnimationFrame(drawNow);
   nodeRO = new ResizeObserver(() => drawNow());

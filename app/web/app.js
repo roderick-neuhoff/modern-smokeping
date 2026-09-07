@@ -761,7 +761,7 @@ function signInDialog() {
 
 // --- settings view --------------------------------------------------
 
-const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Add target'], ['config', 'Config files'], ['access', 'Access']];
+const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Targets'], ['config', 'Config files'], ['access', 'Access']];
 let settingsData = null;
 
 async function renderSettings(tab) {
@@ -947,6 +947,38 @@ function paneTargets(pane) {
       } catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
       e.currentTarget.disabled = false;
     } }, 'Add target')), res));
+
+  // --- remove ---------------------------------------------------------
+  const all = [];
+  const walk2 = (node) => { for (const c of (node.children || [])) { all.push([c.path, c.isLeaf ? 'target' : 'group']); walk2(c); } };
+  if (state.tree) walk2(state.tree.root);
+  const rsel = el('select', { class: 'input' }, el('option', { value: '' }, '— choose —'),
+    ...all.map(([p, kind]) => el('option', { value: p }, `${p}  (${kind})`)));
+  const rpass = input({ type: 'password', placeholder: 'settings password, again', autocomplete: 'current-password' });
+  const rdata = el('input', { type: 'checkbox' });
+  const rres = resultBox();
+  pane.append(el('div', { class: 'card-plain danger' },
+    el('h2', {}, 'Remove a target'),
+    el('p', { class: 'sub' }, 'Deletes the target (or a whole group with everything under it) from the Targets file, validates, reloads. Because this is destructive, the password is checked again server-side for this request.'),
+    el('div', { class: 'form-grid' },
+      field('Target / group', rsel),
+      field('Confirm password', rpass, 'required even if you are signed in'),
+      field('Also delete collected data', rdata, 'removes the .rrd history files; leave off to keep the graphs recoverable')),
+    el('div', { class: 'modal-actions' }, el('button', { class: 'chip danger', onclick: async (e) => {
+      const path = rsel.value;
+      if (!path) { showResult(rres, { ok: false, error: 'Choose a target first.' }); return; }
+      const isGroup = all.find(([p]) => p === path)?.[1] === 'group';
+      if (!confirm(`Remove ${path}${isGroup ? ' and every target under it' : ''}${rdata.checked ? ' AND delete its collected data' : ''}?`)) return;
+      e.currentTarget.disabled = true;
+      try {
+        const r = await authed(() => post('/targets/remove', { path, password: rpass.value, deleteData: rdata.checked }));
+        showResult(rres, r, `Removed ${r.path} (${r.removedLines} lines${r.removedChildren ? ', ' + r.removedChildren + ' sub-targets' : ''}${r.deletedFiles?.length ? ', ' + r.deletedFiles.length + ' data files deleted' : ''}).`);
+        rpass.value = '';
+        state.tree = await api('/tree'); renderTree();
+        [...rsel.options].find(o => o.value === path)?.remove();
+      } catch (err) { showResult(rres, { ok: false, error: err.message, ...(err.data || {}) }); }
+      e.currentTarget.disabled = false;
+    } }, 'Remove target')), rres));
 }
 
 function paneConfig(pane) {

@@ -53,7 +53,8 @@ sub handle {
         return config_put($sub, $body)              if $method eq 'POST';
     }
     if ($route eq 'targets') {
-        return target_add($body)                    if $sub eq 'add' && $method eq 'POST';
+        return target_add($body)                    if $sub eq 'add'    && $method eq 'POST';
+        return target_remove($body)                 if $sub eq 'remove' && $method eq 'POST';
     }
     if ($route eq 'acks') {
         return (200, acks_get())                    if $method eq 'GET';
@@ -320,6 +321,84 @@ sub target_add {
     _spew($file, $text, 0644);
     my $rl = _hup();
     return (200, { ok => \1, check => $chk, reload => $rl, path => '/' . join('/', @segs, $key) });
+}
+
+# Removing is destructive, so it demands the password *again* in the request
+# body and verifies it against the htpasswd file - a cached session is not enough.
+my $HTPASSWD = "$CONFIG_DIR/modern-auth/htpasswd";
+
+sub _verify_password {
+    my $pass = shift // '';
+    my $user = $ENV{REMOTE_USER} // '';
+    if (!-s $HTPASSWD) {
+        # login disabled (WEBUI_AUTH=off): nothing to verify against
+        return 1;
+    }
+    die { status => 401, error => 'not signed in' } unless length $user;
+    die { status => 403, error => 'password confirmation required' } unless length $pass;
+    my (undef, $rc) = _capture(10, '/usr/bin/htpasswd', '-vb', $HTPASSWD, $user, $pass);
+    die { status => 403, error => 'password does not match' } unless $rc == 0;
+    return 1;
+}
+
+sub target_remove {
+    my $b = shift || {};
+    _verify_password($b->{password});
+    my $path = $b->{path} // '';
+    $path =~ s{^/+}{}; $path =~ s{/+$}{};
+    my @segs = split m{/}, $path;
+    die { status => 422, error => 'path is required' } unless @segs;
+    for (@segs) { die { status => 422, error => "bad path segment '$_'" } if /[^A-Za-z0-9_-]/ }
+
+    my $file = "$CONFIG_DIR/Targets";
+    my $s = _slurp($file) // die { status => 500, error => 'Targets file missing' };
+    my @lines = split /\n/, $s;
+
+    # walk the section headers to locate the exact node (depth + name chain)
+    my @stack;                      # names by depth
+    my ($start, $end);
+    for my $i (0 .. $#lines) {
+        next unless $lines[$i] =~ /^\s*(\++)\s*([A-Za-z0-9_-]+)\s*$/;
+        my ($depth, $name) = (length $1, $2);
+        if (defined $start && !defined $end && $depth <= scalar @segs) { $end = $i; last }
+        $#stack = $depth - 2 if $depth - 1 <= $#stack;   # drop deeper levels
+        $stack[$depth - 1] = $name;
+        if (!defined $start && $depth == @segs && join('/', @stack[0 .. $depth - 1]) eq join('/', @segs)) { $start = $i }
+    }
+    die { status => 404, error => "target '/$path' not found in Targets" } unless defined $start;
+    $end //= scalar @lines;
+    # keep a leading blank line tidy
+    my $from = $start; $from-- while $from > 0 && $lines[$from - 1] =~ /^\s*$/ && $from > $start - 1;
+    my @removed = @lines[$start .. $end - 1];
+    splice @lines, $from, $end - $from;
+    my $text = join("\n", @lines) . "\n";
+    my $children = scalar grep { /^\s*\++\s*\S/ } @removed[1 .. $#removed];
+
+    my $chk = _check_candidate('Targets', $text);
+    return (422, { ok => \0, check => $chk, error => 'config check failed - target not removed' }) unless _passed($chk);
+    _spew("$file.bak", $s);
+    _spew($file, $text, 0644);
+    my $rl = _hup();
+
+    my @deleted;
+    if ($b->{deleteData}) {
+        my $datadir = _datadir();
+        my $base = "$datadir/$path";
+        for my $f (glob("$base.rrd"), glob("$base.adr"), glob("$base~*.rrd")) { push @deleted, $f if -f $f && unlink $f }
+        if (-d $base) {                          # a group: remove its subtree of rrd files
+            require File::Find;
+            File::Find::find({ no_chdir => 1, wanted => sub { push @deleted, $_ if -f $_ && /\.(rrd|adr)$/ && unlink $_ } }, $base);
+            system('rmdir', '-p', $base) if -d $base;   # best effort, ignores non-empty
+        }
+    }
+    return (200, { ok => \1, check => $chk, reload => $rl, path => "/$path", removedLines => scalar @removed,
+                   removedChildren => $children, deletedFiles => \@deleted });
+}
+
+sub _datadir {
+    my $s = _slurp("$CONFIG_DIR/pathnames") // '';
+    my ($d) = $s =~ /^\s*datadir\s*=\s*(\S+)/m;
+    return $d || '/data';
 }
 
 # ---------------------------------------------------------------------------

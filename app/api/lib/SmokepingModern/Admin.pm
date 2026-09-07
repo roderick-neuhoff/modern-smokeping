@@ -346,6 +346,25 @@ sub _curl_form_json {
     return $d;
 }
 
+# turn Entra's AADSTS codes into something a person can act on
+sub _ms_hint {
+    my $d = shift;
+    my $desc = $d->{error_description} // '';
+    my ($code) = $desc =~ /(AADSTS\d+)/;
+    my %hint = (
+        AADSTS7000218 => 'Your app registration is a confidential client. Either set Entra ID -> App -> Authentication -> "Allow public client flows" = Yes (recommended), or paste a client secret from "Certificates & secrets" into the Client secret field, then Connect again.',
+        AADSTS700016  => 'Application not found in this tenant - check the client ID, and use your tenant ID instead of "common" for a single-tenant app.',
+        AADSTS65001   => 'Consent is missing - an admin may need to grant the SMTP.Send permission for the app, or sign in with an account allowed to consent.',
+        AADSTS700038  => 'That is not a valid application (client) ID.',
+        AADSTS50126   => 'Wrong user name or password during sign-in.',
+        AADSTS50076   => 'Multi-factor authentication was required and not completed - sign in again and finish MFA.',
+        AADSTS70016   => 'The sign-in code expired before it was used - click Connect again.',
+        AADSTS7000215 => 'The client secret is wrong or expired.',
+    );
+    my $h = $code && $hint{$code} ? " -> $hint{$code}" : '';
+    return "$d->{error}: " . ($desc =~ s/\s*Trace ID:.*$//sr) . $h;
+}
+
 sub oauth_device_start {
     my $b = shift || {};
     my $client = $b->{clientId} // '';
@@ -355,7 +374,7 @@ sub oauth_device_start {
     $tenant =~ s/[^A-Za-z0-9.-]//g;
     my $d = _curl_form_json("https://login.microsoftonline.com/$tenant/oauth2/v2.0/devicecode",
         client_id => $client, scope => 'https://outlook.office365.com/SMTP.Send offline_access openid email');
-    die { status => 422, error => "$d->{error}: " . ($d->{error_description} // '') } if $d->{error};
+    die { status => 422, error => _ms_hint($d) } if $d->{error};
     _spew($DEVICE_STATE, $JSON->encode({ clientId => $client, clientSecret => ($b->{clientSecret} // ''), tenant => $tenant,
         deviceCode => $d->{device_code}, interval => ($d->{interval} || 5), expires => time + ($d->{expires_in} || 900) }), 0600);
     return { ok => \1, userCode => $d->{user_code}, verificationUri => $d->{verification_uri},
@@ -371,7 +390,7 @@ sub oauth_device_poll {
     if ($d->{error}) {
         return { ok => \0, pending => \1, status => $d->{error} } if $d->{error} =~ /^(authorization_pending|slow_down)$/;
         unlink $DEVICE_STATE;
-        die { status => 422, error => "$d->{error}: " . ($d->{error_description} // '') };
+        die { status => 422, error => _ms_hint($d) };
     }
     die { status => 502, error => 'no refresh_token returned - is offline_access consented?' } unless $d->{refresh_token};
     # mailbox address from the id_token (preferred_username / email)

@@ -145,7 +145,11 @@ let refreshDeadline = 0;
 let autoRefresh = localStorage.getItem('sp.auto') !== 'off';
 function bumpRefreshClock() { refreshDeadline = Date.now() + REFRESH_MS; }
 // auto-refresh is suspended on Settings so it can never wipe a half-filled form
-function autoRefreshActive() { return autoRefresh && currentRoute().name !== 'settings'; }
+function autoRefreshActive() {
+  const r = currentRoute().name;
+  if (r === 'wall') return true;          // a wallboard must always be live - the pause button isn't visible there
+  return autoRefresh && r !== 'settings';
+}
 setInterval(() => {
   const left = Math.max(0, Math.round((refreshDeadline - Date.now()) / 1000));
   const rc = document.getElementById('refreshCount');

@@ -110,7 +110,7 @@ async function refresh() {
     try {
       renderStatusPills();
       decorateTree();
-      render();          // re-render current view with fresh data
+      render(true);      // re-render current view with fresh data (skipped on Settings)
     } catch (e) {
       console.error('render failed', e);   // never let a render bug kill the poll loop
     }
@@ -140,23 +140,40 @@ function setOnline(ok, err) {
 }
 
 let refreshDeadline = 0;
+let autoRefresh = localStorage.getItem('sp.auto') !== 'off';
 function bumpRefreshClock() { refreshDeadline = Date.now() + REFRESH_MS; }
+// auto-refresh is suspended on Settings so it can never wipe a half-filled form
+function autoRefreshActive() { return autoRefresh && currentRoute().name !== 'settings'; }
 setInterval(() => {
   const left = Math.max(0, Math.round((refreshDeadline - Date.now()) / 1000));
   const rc = document.getElementById('refreshCount');
-  rc.textContent = left ? left + 's' : '';
-  rc.title = lastOk ? 'last update ' + ago(lastOk / 1000) : '';
+  const active = autoRefreshActive();
+  rc.textContent = !autoRefresh ? 'paused' : (!active ? 'off here' : (left ? left + 's' : ''));
+  rc.title = (lastOk ? 'last update ' + ago(lastOk / 1000) : '') + (autoRefresh ? '' : ' · auto-refresh paused');
+  if (!active) return;
   // hidden tabs: keep a slow heartbeat so the page never sits on stale state
   const due = left === 0 || (document.hidden && Date.now() - lastOk > 60_000);
   if (due) { bumpRefreshClock(); refresh(); }
 }, 1000);
+
+function setAutoRefresh(on, silent) {
+  autoRefresh = on;
+  try { localStorage.setItem('sp.auto', on ? 'on' : 'off'); } catch {}
+  const b = document.getElementById('pauseBtn');
+  b.classList.toggle('is-paused', !on);
+  b.title = on ? 'Pause auto-refresh' : 'Resume auto-refresh';
+  b.setAttribute('aria-pressed', String(!on));
+  if (on && !silent) { bumpRefreshClock(); refresh(); }
+}
+document.getElementById('pauseBtn').addEventListener('click', () => setAutoRefresh(!autoRefresh));
+setAutoRefresh(autoRefresh, true);
 
 // Browsers freeze/throttle background tabs (Edge "sleeping tabs", Chromium page
 // freezing); an in-flight fetch can be dropped on resume. Refresh on every
 // "we are back" signal so a stale banner clears immediately.
 for (const ev of ['visibilitychange', 'pageshow', 'focus', 'online', 'resume']) {
   const target = ev === 'resume' || ev === 'visibilitychange' ? document : window;
-  target.addEventListener(ev, () => { if (!document.hidden) { bumpRefreshClock(); refresh(); } });
+  target.addEventListener(ev, () => { if (!document.hidden && autoRefreshActive()) { bumpRefreshClock(); refresh(); } });
 }
 
 // --- status pills ------------------------------------------------
@@ -316,8 +333,16 @@ function currentRoute() {
   return { name: 'dashboard' };
 }
 
-function render() {
+let lastRouteName = null;
+function render(fromRefresh) {
   const r = currentRoute();
+  // a background data refresh must never rebuild Settings (it would wipe the forms)
+  if (fromRefresh && r.name === 'settings') return;
+  // leaving Settings after a while: pull fresh data once, but only if we were away long enough to matter
+  if (!fromRefresh && lastRouteName === 'settings' && r.name !== 'settings' && Date.now() - lastOk > REFRESH_MS) {
+    bumpRefreshClock(); refresh();           // refresh() re-enters render(true) with fresh data
+  }
+  lastRouteName = r.name;
   document.body.classList.toggle('wall-mode', r.name === 'wall');
   if (r.name === 'node') renderNode(r.path);
   else if (r.name === 'alerts') renderAlerts(r.sev);

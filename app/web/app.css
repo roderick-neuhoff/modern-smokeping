@@ -125,6 +125,10 @@ button { font: inherit; color: inherit; cursor: pointer; }
 }
 .iconbtn:hover { color: var(--text); border-color: var(--border-strong); }
 .refresh-count { font-variant-numeric: tabular-nums; font-size: 11px; min-width: 20px; text-align: left; }
+#pauseBtn .ic-play { display: none; }
+#pauseBtn.is-paused .ic-pause { display: none; }
+#pauseBtn.is-paused .ic-play { display: inline; }
+#pauseBtn.is-paused { color: var(--warn); border-color: var(--warn); }
 
 /* status pills -------------------------------------------------------- */
 .statuspills { display: flex; gap: 6px; flex-wrap: wrap; }

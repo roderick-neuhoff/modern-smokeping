@@ -60,6 +60,8 @@ async function api(path, { retries = 1, method = 'GET', body = null, timeout = F
     try {
       const headers = { accept: 'application/json' };
       if (write) { headers['content-type'] = 'application/json'; headers['x-requested-with'] = 'modern-smokeping'; }
+      const auth = sessionAuth();
+      if (auth) headers['authorization'] = 'Basic ' + auth;
       const r = await fetch(API + path, { method, headers, body: body == null ? undefined : JSON.stringify(body), signal: ctrl.signal });
       clearTimeout(timer);
       let data = null;
@@ -663,8 +665,18 @@ function ackFor(a) {
 }
 function isAcked(a) { return !!ackFor(a); }
 
+// run a write; on 401 ask for the settings password once and retry
+async function authed(fn) {
+  try { return await fn(); }
+  catch (e) {
+    if (e.status !== 401) throw e;
+    if (!(await signInDialog())) throw new Error('sign-in cancelled');
+    return fn();
+  }
+}
+
 async function unack(key) {
-  try { const r = await post('/acks/delete', { key }); state.acks = r.acks || {}; renderStatusPills(); }
+  try { const r = await authed(() => post('/acks/delete', { key })); state.acks = r.acks || {}; renderStatusPills(); }
   catch (e) { toast('Could not remove ack: ' + e.message, true); }
 }
 
@@ -686,7 +698,7 @@ function ackDialog(key, label) {
       el('div', { class: 'modal-actions' },
         el('button', { class: 'chip', onclick: () => close(false) }, 'Cancel'),
         el('button', { class: 'chip on', onclick: async () => {
-          try { const r = await post('/acks', { key, hours, note }); state.acks = r.acks || {}; renderStatusPills(); close(true); }
+          try { const r = await authed(() => post('/acks', { key, hours, note })); state.acks = r.acks || {}; renderStatusPills(); close(true); }
           catch (e) { toast('Ack failed: ' + e.message, true); }
         } }, 'Acknowledge'))));
     document.body.append(box);
@@ -701,6 +713,51 @@ function toast(msg, bad) {
   setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, bad ? 6000 : 3000);
 }
 
+// --- sign-in (Basic auth, kept for this browser session only) ------------
+
+function sessionAuth() { try { return sessionStorage.getItem('sp.auth') || ''; } catch { return ''; } }
+function setSessionAuth(user, pass) {
+  try { sessionStorage.setItem('sp.auth', btoa(unescape(encodeURIComponent(`${user}:${pass}`)))); } catch {}
+}
+function signOut() { try { sessionStorage.removeItem('sp.auth'); } catch {} }
+function isAuthError(e) { return e && (e.status === 401 || e.status === 403 && /auth/i.test(e.message || '')); }
+
+// inline sign-in form; resolves true once /api/me accepts the credentials
+function signInForm(target, message) {
+  return new Promise(resolve => {
+    const user = input({ value: 'admin', autocomplete: 'username', placeholder: 'user' });
+    const pass = input({ type: 'password', autocomplete: 'current-password', placeholder: 'password' });
+    const err = el('div', { class: 'field-help', style: 'color:var(--crit)' });
+    const submit = async (e) => {
+      e.preventDefault();
+      err.textContent = '';
+      setSessionAuth(user.value.trim(), pass.value);
+      try { await api('/me'); resolve(true); }
+      catch (ex) { signOut(); err.textContent = ex.status === 401 ? 'Wrong user or password.' : ex.message; }
+    };
+    target.innerHTML = '';
+    target.append(el('form', { class: 'card-plain signin', onsubmit: submit },
+      el('h2', {}, 'Sign in'),
+      el('p', { class: 'sub' }, message || 'This area changes the SmokePing configuration and needs the settings password.'),
+      el('div', { class: 'form-grid' }, field('User', user), field('Password', pass)),
+      err,
+      el('div', { class: 'modal-actions' }, el('button', { class: 'chip on', type: 'submit' }, 'Sign in')),
+      el('p', { class: 'sub', style: 'margin:10px 0 0' }, 'Set with WEBUI_USER / WEBUI_PASS; a generated password is in /config/modern-auth/password.txt.')));
+    pass.focus();
+  });
+}
+
+// modal variant for actions elsewhere (e.g. acknowledging an alert)
+function signInDialog() {
+  return new Promise(resolve => {
+    const box = el('div', { class: 'modal-scrim', onclick: (e) => { if (e.target === box) { box.remove(); resolve(false); } } });
+    const inner = el('div', { class: 'modal' });
+    box.append(inner);
+    document.body.append(box);
+    signInForm(inner, 'Acknowledging alerts needs the settings password.').then(() => { box.remove(); resolve(true); });
+  });
+}
+
 // --- settings view --------------------------------------------------
 
 const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Add target'], ['config', 'Config files'], ['access', 'Access']];
@@ -711,7 +768,13 @@ async function renderSettings(tab) {
   main.innerHTML = '<div class="loading">Loading settings…</div>';
   try { settingsData = await api('/settings'); }
   catch (e) {
-    main.innerHTML = `<div class="empty">Settings unavailable: ${e.message}${e.status === 403 || e.status === 401 ? '<br>Log in to change settings.' : ''}</div>`;
+    if (e.status === 401) {
+      const holder = el('div', { class: 'settings-pane' });
+      main.innerHTML = ''; main.append(el('div', { class: 'page-head' }, el('h1', {}, 'Settings')), holder);
+      await signInForm(holder);
+      return renderSettings(tab);
+    }
+    main.innerHTML = `<div class="empty">Settings unavailable: ${e.message}</div>`;
     return;
   }
   main.innerHTML = '';
@@ -919,7 +982,10 @@ function paneAccess(pane) {
     el('p', {}, settingsData.user ? `You are signed in as ${settingsData.user}.` : 'Login is disabled (WEBUI_AUTH=off).'),
     el('p', { class: 'sub' }, 'Viewing (dashboard, alerts, wall, classic UI) is open. The password guards only what changes things: this Settings page, config files, add-target, test mail/notify, reload and acknowledgements. It is set from the container environment, not from here:'),
     el('pre', { class: 'result ok', style: 'display:block' }, 'WEBUI_AUTH=on        # off disables the login\nWEBUI_USER=admin\nWEBUI_PASS=…          # blank = generated once, see /config/modern-auth/password.txt'),
-    el('p', { class: 'sub' }, 'Change the values in .env and restart the container. Sign out by closing the browser (Basic auth has no logout).')));
+    el('p', { class: 'sub' }, 'Change the values in .env and restart the container.'),
+    el('div', { class: 'modal-actions', style: 'justify-content:flex-start' },
+      el('button', { class: 'chip', onclick: () => { signOut(); toast('Signed out for this session.'); location.hash = '#/'; } }, 'Sign out'),
+      el('span', { class: 'sub', style: 'margin:0 0 0 8px' }, sessionAuth() ? '' : 'Credentials are currently supplied by the browser, not the app; closing the browser signs out.'))));
 }
 
 // --- wall display ---------------------------------------------------
@@ -1009,6 +1075,9 @@ async function boot() {
     return;
   }
   await refresh();
+  // refresh() renders via render(true), which deliberately skips Settings -
+  // so a direct load / reload of #/settings must be rendered here.
+  if (currentRoute().name === 'settings') render(false);
   bumpRefreshClock();
 }
 boot();

@@ -1,0 +1,11 @@
+#!/bin/sh
+# sendmail-compatible entry point SmokePing calls for alert mail
+# (pathnames: sendmail = /app/smokeping-modern/bin/sendmail).
+# msmtp reads /config/msmtp.conf, written by Settings -> E-mail; for OAuth2
+# accounts it fetches the access token through bin/oauth-token (passwordeval).
+CONF=/config/msmtp.conf
+if [ ! -s "$CONF" ]; then
+    echo "modern-smokeping: no mail configuration yet (open Settings -> E-mail)" >&2
+    exit 78   # EX_CONFIG
+fi
+exec /usr/bin/msmtp -C "$CONF" "$@"

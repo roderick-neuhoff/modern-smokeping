@@ -15,11 +15,17 @@
 ARG BASE_TAG=latest
 FROM lscr.io/linuxserver/smokeping:${BASE_TAG}
 
+# msmtp replaces ssmtp for outgoing mail: it can do OAuth2 (XOAUTH2) for
+# Gmail / Microsoft 365 via passwordeval, as well as plain passwords.
+RUN apk add --no-cache msmtp
+
 COPY app/ /app/smokeping-modern/
 COPY root/ /
 
 RUN chmod +x /app/smokeping-modern/api/smokeping-api.cgi \
              /app/smokeping-modern/bin/notify \
+             /app/smokeping-modern/bin/sendmail \
+             /app/smokeping-modern/bin/oauth-token \
              /custom-cont-init.d/50-smokeping-modern \
              /etc/s6-overlay/s6-rc.d/svc-smokeping/run
 

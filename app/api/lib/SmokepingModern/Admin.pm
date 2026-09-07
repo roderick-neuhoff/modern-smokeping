@@ -20,10 +20,18 @@ my $CONFIG_DIR = $ENV{SMOKEPING_CONFIG_DIR} || '/config';
 my $MASTER     = $ENV{SMOKEPING_CONF}       || '/etc/smokeping/config';
 my $SMOKEPING  = '/usr/sbin/smokeping';
 my $SSMTP_BIN  = '/usr/sbin/ssmtp';
+my $SENDMAIL   = '/app/smokeping-modern/bin/sendmail';     # msmtp wrapper
+my $OAUTH_BIN  = '/app/smokeping-modern/bin/oauth-token';
 my $NOTIFY_BIN = '/app/smokeping-modern/bin/notify';
 my $SSMTP_CONF = "$CONFIG_DIR/ssmtp.conf";
+my $MSMTP_CONF = "$CONFIG_DIR/msmtp.conf";
+my $OAUTH_CFG  = "$CONFIG_DIR/modern-oauth.json";
 my $NOTIFY_CFG = "$CONFIG_DIR/modern-notify.json";
 my $ACKS_FILE  = "$CONFIG_DIR/modern-acks.json";
+my $PATHNAMES  = "$CONFIG_DIR/pathnames";
+
+# Microsoft device-code flow state (short-lived, one at a time)
+my $DEVICE_STATE = '/tmp/spm-oauth-device.json';
 
 my @EDITABLE = qw(Targets Alerts Probes Database General Presentation Slaves);
 my %EDITABLE = map { $_ => 1 } @EDITABLE;
@@ -65,6 +73,13 @@ sub handle {
         return (200, test_mail($body))              if $sub eq 'mail'   && $method eq 'POST';
         return (200, test_notify($body))            if $sub eq 'notify' && $method eq 'POST';
     }
+    if ($route eq 'oauth') {
+        my $act = $rest->[1] // '';
+        return (200, oauth_device_start($body))     if $sub eq 'microsoft' && $act eq 'start' && $method eq 'POST';
+        return (200, oauth_device_poll($body))      if $sub eq 'microsoft' && $act eq 'poll'  && $method eq 'POST';
+        return (200, oauth_token_check())           if $sub eq 'check' && $method eq 'POST';
+        return (200, oauth_forget())                if $sub eq 'forget' && $method eq 'POST';
+    }
     return (200, reload())                          if $route eq 'reload' && $method eq 'POST';
 
     die { status => 405, error => "$method $route/$sub not supported" };
@@ -103,27 +118,99 @@ sub _spew {
     rename $tmp, $f or die { status => 500, error => "cannot replace $f: $!" };
 }
 
-sub _read_ssmtp {
+# Mail is sent through msmtp (/config/msmtp.conf). We keep reading a legacy
+# ssmtp.conf so an existing install shows its old server/user on first visit.
+sub _read_kv {
+    my ($file, $sep) = @_;
     my %c;
-    my $s = _slurp($SSMTP_CONF) // '';
-    for my $line (split /\n/, $s) {
-        next if $line =~ /^\s*#/ || $line !~ /=/;
-        my ($k, $v) = split /=/, $line, 2;
+    for my $line (split /\n/, _slurp($file) // '') {
+        next if $line =~ /^\s*#/;
+        my ($k, $v) = $sep eq '=' ? split(/=/, $line, 2) : split(/\s+/, ($line =~ s/^\s+//r), 2);
+        next unless defined $k && defined $v;
         $k =~ s/^\s+|\s+$//g; $v =~ s/^\s+|\s+$//g;
         $c{$k} = $v;
     }
-    my ($host, $port) = ($c{mailhub} // '') =~ /^([^:]*)(?::(\d+))?$/;
+    return \%c;
+}
+
+sub _read_oauth {
+    my $d = eval { $JSON->decode(_slurp($OAUTH_CFG) // '{}') } || {};
+    return $d;
+}
+
+sub _read_ssmtp {
+    my $m = _read_kv($MSMTP_CONF, ' ');
+    if (%$m && $m->{host}) {
+        my $o = _read_oauth();
+        my $method = ($m->{auth} // '') eq 'xoauth2' ? 'oauth-' . ($o->{provider} || 'google') : 'password';
+        return {
+            host      => $m->{host} // '',
+            port      => ($m->{port} // 587) + 0,
+            starttls  => (($m->{tls_starttls} // 'on') eq 'on' ? \1 : \0),
+            tls       => (($m->{tls} // 'on') eq 'on' && ($m->{tls_starttls} // 'on') eq 'off' ? \1 : \0),
+            authUser  => $m->{user} // '',
+            passSet   => (length($m->{password} // '') ? \1 : \0),
+            root      => $m->{from} // '',
+            hostname  => '',
+            authMethod => $method,
+            engine    => 'msmtp',
+            _pass     => $m->{password} // '',
+        };
+    }
+    # legacy ssmtp.conf (pre-OAuth installs)
+    my $c = _read_kv($SSMTP_CONF, '=');
+    my ($host, $port) = ($c->{mailhub} // '') =~ /^([^:]*)(?::(\d+))?$/;
     return {
         host      => $host // '',
         port      => ($port // 587) + 0,
-        starttls  => (($c{UseSTARTTLS} // 'no') =~ /yes/i ? \1 : \0),
-        tls       => (($c{UseTLS} // 'no') =~ /yes/i ? \1 : \0),
-        authUser  => $c{AuthUser} // '',
-        passSet   => (length($c{AuthPass} // '') ? \1 : \0),
-        root      => $c{root} // '',
-        hostname  => $c{hostname} // '',
-        _pass     => $c{AuthPass} // '',
+        starttls  => (($c->{UseSTARTTLS} // 'no') =~ /yes/i ? \1 : \0),
+        tls       => (($c->{UseTLS} // 'no') =~ /yes/i ? \1 : \0),
+        authUser  => $c->{AuthUser} // '',
+        passSet   => (length($c->{AuthPass} // '') ? \1 : \0),
+        root      => $c->{root} // '',
+        hostname  => $c->{hostname} // '',
+        authMethod => 'password',
+        engine    => 'ssmtp',
+        _pass     => $c->{AuthPass} // '',
     };
+}
+
+sub _write_msmtp {
+    my ($h) = @_;      # host port starttls tls user pass from method
+    my $starttls = $h->{tls} ? 'off' : ($h->{starttls} ? 'on' : 'off');
+    my $tls      = ($h->{tls} || $h->{starttls}) ? 'on' : 'off';
+    my @l = (
+        '# managed by modern-smokeping - edit via Settings -> E-mail',
+        'defaults',
+        "tls $tls",
+        "tls_starttls $starttls",
+        'tls_trust_file /etc/ssl/certs/ca-certificates.crt',
+        "logfile $CONFIG_DIR/log/msmtp.log",
+        'timeout 30',
+        '',
+        'account default',
+        "host $h->{host}",
+        "port $h->{port}",
+        "from $h->{from}",
+    );
+    if ($h->{method} =~ /^oauth/) {
+        push @l, 'auth xoauth2', "user $h->{user}", "passwordeval $OAUTH_BIN";
+    } elsif (length($h->{user} // '')) {
+        push @l, 'auth on', "user $h->{user}", 'password ' . ($h->{pass} // '');
+    } else {
+        push @l, 'auth off';
+    }
+    _spew($MSMTP_CONF, join("\n", @l) . "\n", 0600);
+}
+
+# point SmokePing at the msmtp wrapper (pathnames: sendmail = ...)
+sub _ensure_sendmail_path {
+    my $s = _slurp($PATHNAMES) // '';
+    return 0 if $s =~ /^\s*sendmail\s*=\s*\Q$SENDMAIL\E\s*$/m;
+    if ($s =~ /^\s*sendmail\s*=/m) { $s =~ s/^\s*sendmail\s*=.*$/sendmail = $SENDMAIL/m }
+    else                            { $s = "sendmail = $SENDMAIL\n$s" }
+    _spew($PATHNAMES, $s, 0644);
+    return 1;
 }
 
 # "to = ..." / "from = ..." at the top of the Alerts file (before the first +alert)
@@ -166,6 +253,16 @@ sub _read_notify {
 sub settings_get {
     my $smtp = _read_ssmtp();
     delete $smtp->{_pass};
+    my $o = _read_oauth();
+    $smtp->{oauth} = {
+        provider        => $o->{provider} // '',
+        clientId        => $o->{clientId} // '',
+        clientSecretSet => (length($o->{clientSecret} // '') ? \1 : \0),
+        refreshTokenSet => (length($o->{refreshToken} // '') ? \1 : \0),
+        tenant          => $o->{tenant} // 'common',
+        account         => $o->{account} // '',
+        connectedAt     => $o->{connectedAt},
+    };
     my $hdr = _read_alert_header();
     my $notify = _read_notify();
     return {
@@ -181,33 +278,128 @@ sub settings_get {
 sub settings_smtp {
     my $b = shift || {};
     my $cur = _read_ssmtp();
+    my $method = $b->{authMethod} // 'password';
+    die { status => 422, error => 'authMethod must be password, oauth-google or oauth-microsoft' }
+        unless $method =~ /^(password|oauth-google|oauth-microsoft)$/;
     my $host = $b->{host} // '';
     $host =~ s/\s//g;
+    $host ||= $method eq 'oauth-google' ? 'smtp.gmail.com' : $method eq 'oauth-microsoft' ? 'smtp.office365.com' : '';
     die { status => 422, error => 'mail server host is required' } unless length $host;
     my $port = int($b->{port} || 587);
     my $pass = defined $b->{authPass} && length $b->{authPass} ? $b->{authPass} : $cur->{_pass};
     my $from = $b->{from} || $cur->{root} || 'smokeping@localhost';
     die { status => 422, error => 'from must be an e-mail address' } unless $from =~ /^[^\s@]+@[^\s@]+$/;
+    my $user = $b->{authUser} // '';
+    $user =~ s/\s//g;
     my @emails = grep { length } map { s/\s//gr } @{ $b->{to} || [] };
     for (@emails) { die { status => 422, error => "invalid recipient '$_'" } unless /^[^\s@]+@[^\s@]+$/ }
 
-    my $conf = join "\n",
-        "# managed by modern-smokeping - edit via the Settings page",
-        "root=$from",
-        "mailhub=$host:$port",
-        "AuthUser=" . ($b->{authUser} // ''),
-        "AuthPass=$pass",
-        "UseSTARTTLS=" . ($b->{starttls} ? 'yes' : 'no'),
-        "UseTLS=" . ($b->{tls} ? 'yes' : 'no'),
-        "FromLineOverride=YES",
-        "hostname=" . ($b->{hostname} || (POSIX::uname())[1]),
-        "";
-    _spew($SSMTP_CONF, $conf, 0640);
+    if ($method =~ /^oauth-(\w+)$/) {
+        my $provider = $1;
+        my $o = _read_oauth();
+        my $oi = $b->{oauth} || {};
+        # keep stored secrets when the form sends them blank; switching provider clears them
+        my $same = ($o->{provider} // '') eq $provider;
+        my %new = (
+            provider     => $provider,
+            clientId     => (length($oi->{clientId} // '') ? $oi->{clientId} : ($same ? $o->{clientId} : '')),
+            clientSecret => (length($oi->{clientSecret} // '') ? $oi->{clientSecret} : ($same ? $o->{clientSecret} : '')),
+            refreshToken => (length($oi->{refreshToken} // '') ? $oi->{refreshToken} : ($same ? $o->{refreshToken} : '')),
+            tenant       => ($oi->{tenant} || ($same ? $o->{tenant} : '') || 'common'),
+            account      => ($user || ($same ? $o->{account} : '') || ''),
+            connectedAt  => ($same ? $o->{connectedAt} : undef),
+        );
+        $new{connectedAt} //= time if $new{refreshToken};
+        for (qw(clientId clientSecret refreshToken tenant account)) { $new{$_} =~ s/[\r\n]//g if defined $new{$_} }
+        die { status => 422, error => 'OAuth client ID is required' } unless length $new{clientId};
+        $user ||= $new{account};
+        die { status => 422, error => 'mailbox address (user) is required for OAuth2' } unless $user =~ /^[^\s@]+@[^\s@]+$/;
+        $new{account} = $user;
+        _spew($OAUTH_CFG, $JSON->canonical->encode(\%new) . "\n", 0600);
+        unlink '/tmp/spm-oauth-token.json';
+    }
+
+    _write_msmtp({ host => $host, port => $port, starttls => $b->{starttls} ? 1 : 0, tls => $b->{tls} ? 1 : 0,
+                   user => $user, pass => $pass, from => $from, method => $method });
+    my $switched = _ensure_sendmail_path();
     _write_alert_header(\@emails, $from, $b->{webhooks} ? 1 : 0);
 
     my $chk = _check_config();
     my $rl = _passed($chk) ? _hup() : { ok => \0, note => 'not reloaded - config check failed' };
-    return { ok => \1, check => $chk, reload => $rl, settings => settings_get() };
+    return { ok => \1, check => $chk, reload => $rl, sendmailSwitched => ($switched ? \1 : \0), settings => settings_get() };
+}
+
+# ---------------------------------------------------------------------------
+# OAuth2 helpers (Microsoft device-code sign-in; Google = pasted refresh token)
+# ---------------------------------------------------------------------------
+
+sub _curl_form_json {
+    my ($url, %form) = @_;
+    my @cmd = ('/usr/bin/curl', '-sS', '-m', '25', '-X', 'POST', $url);
+    for my $k (sort keys %form) { push @cmd, '--data-urlencode', "$k=$form{$k}" }
+    my ($out, $rc) = _capture(30, @cmd);
+    die { status => 502, error => "token endpoint unreachable (curl rc=$rc)" } if $rc;
+    my $d = eval { $JSON->decode($out) };
+    die { status => 502, error => 'token endpoint returned non-JSON: ' . substr($out, 0, 200) } unless $d;
+    return $d;
+}
+
+sub oauth_device_start {
+    my $b = shift || {};
+    my $client = $b->{clientId} // '';
+    $client =~ s/\s//g;
+    die { status => 422, error => 'Microsoft application (client) ID is required' } unless length $client;
+    my $tenant = $b->{tenant} || 'common';
+    $tenant =~ s/[^A-Za-z0-9.-]//g;
+    my $d = _curl_form_json("https://login.microsoftonline.com/$tenant/oauth2/v2.0/devicecode",
+        client_id => $client, scope => 'https://outlook.office365.com/SMTP.Send offline_access openid email');
+    die { status => 422, error => "$d->{error}: " . ($d->{error_description} // '') } if $d->{error};
+    _spew($DEVICE_STATE, $JSON->encode({ clientId => $client, clientSecret => ($b->{clientSecret} // ''), tenant => $tenant,
+        deviceCode => $d->{device_code}, interval => ($d->{interval} || 5), expires => time + ($d->{expires_in} || 900) }), 0600);
+    return { ok => \1, userCode => $d->{user_code}, verificationUri => $d->{verification_uri},
+             message => $d->{message}, expiresIn => $d->{expires_in}, interval => ($d->{interval} || 5) };
+}
+
+sub oauth_device_poll {
+    my $st = eval { $JSON->decode(_slurp($DEVICE_STATE) // '') } or die { status => 409, error => 'no sign-in in progress' };
+    die { status => 410, error => 'sign-in expired - start again' } if time > $st->{expires};
+    my %form = (client_id => $st->{clientId}, grant_type => 'urn:ietf:params:oauth:grant-type:device_code', device_code => $st->{deviceCode});
+    $form{client_secret} = $st->{clientSecret} if length($st->{clientSecret} // '');
+    my $d = _curl_form_json("https://login.microsoftonline.com/$st->{tenant}/oauth2/v2.0/token", %form);
+    if ($d->{error}) {
+        return { ok => \0, pending => \1, status => $d->{error} } if $d->{error} =~ /^(authorization_pending|slow_down)$/;
+        unlink $DEVICE_STATE;
+        die { status => 422, error => "$d->{error}: " . ($d->{error_description} // '') };
+    }
+    die { status => 502, error => 'no refresh_token returned - is offline_access consented?' } unless $d->{refresh_token};
+    # mailbox address from the id_token (preferred_username / email)
+    my $account = '';
+    if ($d->{id_token} && (my ($mid) = (split /\./, $d->{id_token})[1])) {
+        $mid =~ tr{-_}{+/}; $mid .= '=' x ((4 - length($mid) % 4) % 4);
+        require MIME::Base64;
+        my $claims = eval { $JSON->decode(MIME::Base64::decode_base64($mid)) } || {};
+        $account = $claims->{preferred_username} || $claims->{email} || '';
+    }
+    my $o = _read_oauth();
+    my %new = (provider => 'microsoft', clientId => $st->{clientId}, clientSecret => ($st->{clientSecret} // ''),
+               refreshToken => $d->{refresh_token}, tenant => $st->{tenant}, account => ($account || $o->{account} || ''),
+               connectedAt => time);
+    _spew($OAUTH_CFG, $JSON->canonical->encode(\%new) . "\n", 0600);
+    unlink $DEVICE_STATE, '/tmp/spm-oauth-token.json';
+    return { ok => \1, account => $new{account}, connectedAt => $new{connectedAt} };
+}
+
+# exchange the stored refresh token once, to prove the credentials work
+sub oauth_token_check {
+    my ($out, $rc) = _capture(40, $OAUTH_BIN);
+    my $token = $rc == 0 ? ($out =~ s/\s+//gr) : '';
+    return { ok => ($rc == 0 && length $token ? \1 : \0), rc => $rc,
+             output => ($rc == 0 ? 'access token obtained (' . length($token) . ' chars)' : ($out =~ s/\s+$//r)) };
+}
+
+sub oauth_forget {
+    unlink $OAUTH_CFG, $DEVICE_STATE, '/tmp/spm-oauth-token.json';
+    return { ok => \1 };
 }
 
 sub settings_notify {
@@ -454,8 +646,26 @@ sub test_mail {
         "This is a test message from modern-smokeping on $host.",
         "If you can read this, SMTP is configured correctly.",
         "", "Sent " . scalar(localtime), "";
-    my ($out, $rc) = _capture(45, $SSMTP_BIN, '-t', $msg);
-    return { ok => ($rc == 0 ? \1 : \0), rc => $rc, output => ($out =~ s/\s+$//r) || ($rc == 0 ? 'sent' : '') };
+    my $bin = -s $MSMTP_CONF ? $SENDMAIL : $SSMTP_BIN;   # msmtp once configured, else legacy ssmtp
+    my ($out, $rc) = _capture_in(60, $msg, $bin, '-t');
+    return { ok => ($rc == 0 ? \1 : \0), rc => $rc, engine => ($bin eq $SENDMAIL ? 'msmtp' : 'ssmtp'),
+             output => ($out =~ s/\s+$//r) || ($rc == 0 ? 'sent' : "exit code $rc") };
+}
+
+# run a command feeding $stdin; returns (output, exit code)
+sub _capture_in {
+    my ($timeout, $stdin, @cmd) = @_;
+    return _capture($timeout, $SSMTP_BIN, @cmd[1 .. $#cmd], $stdin) if $cmd[0] eq $SSMTP_BIN;
+    my ($in, $out) = (Symbol::gensym(), Symbol::gensym());
+    my $pid = eval { IPC::Open3::open3($in, $out, undef, @cmd) };
+    return ("cannot run $cmd[0]: $@", 127) unless $pid;
+    print $in $stdin;
+    close $in;
+    my $buf = '';
+    eval { local $SIG{ALRM} = sub { die "timeout\n" }; alarm $timeout; local $/; $buf = <$out> // ''; alarm 0; };
+    if ($@) { kill 'KILL', $pid; $buf .= "\n(timed out after ${timeout}s)"; }
+    waitpid $pid, 0;
+    return ($buf, $? >> 8);
 }
 
 sub test_notify {

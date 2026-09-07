@@ -197,13 +197,42 @@ container restart.
 
 | Tab | |
 |-----|---|
-| **E-mail** | SMTP server / port / STARTTLS / TLS / credentials (writes `ssmtp.conf`), alert *from* + recipient list, **Send test e-mail** |
+| **E-mail** | SMTP server / port / STARTTLS / TLS, sign-in method **password or OAuth2** (Google, Microsoft 365), alert *from* + recipient list, **Send test e-mail** — see [E-mail: OAuth2](#e-mail-oauth2) |
 | **Notifications** | Discord, Slack, Telegram, ntfy, Gotify, generic JSON webhook — each with **Save & send test**. Enable *Webhook notifications* on the E-mail tab to route alerts there |
 | **Targets** | **Add** a target under any group. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
 | **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves`; nothing is saved if the check fails |
 | **Access** | who you are, how the login is set, **Sign out** |
 
 Auto-refresh is off on this page so it can never wipe a half-filled form.
+
+### E-mail: OAuth2
+
+Alert mail goes out through **msmtp** (added to the image), configured from
+Settings → E-mail. Three sign-in methods:
+
+* **Password / app password** — classic SMTP AUTH. Gmail needs an *app password*
+  (2-step verification on).
+* **OAuth2 — Google / Gmail.** Google has no device sign-in for the Gmail scope, so
+  it's a one-time manual dance: create an OAuth client (type *Desktop app*) in
+  Google Cloud Console and enable the Gmail API; open the
+  [OAuth 2.0 Playground](https://developers.google.com/oauthplayground/), tick
+  *Use your own OAuth credentials*, authorize scope `https://mail.google.com/`,
+  exchange for tokens; paste client ID, client secret and **refresh token** into
+  the form. The mailbox is the account you authorized.
+* **OAuth2 — Microsoft 365 / Outlook.** Register an app in Entra ID as a *public
+  client* with the delegated permission `https://outlook.office365.com/SMTP.Send`
+  and *Allow public client flows* = Yes; make sure SMTP AUTH is enabled for the
+  mailbox in Exchange admin. In the form enter the application (client) ID and
+  tenant, click **Connect with Microsoft**, open the URL it shows, type the code,
+  sign in — the refresh token and mailbox are stored automatically.
+
+Under the hood: `msmtp` uses `auth xoauth2` with
+`passwordeval bin/oauth-token`, which exchanges the stored refresh token for an
+access token (cached in `/tmp` until near expiry). Secrets live in
+`/config/modern-oauth.json` (0600) and `/config/msmtp.conf` (0600). **Check
+token** proves the credentials without sending mail; **Forget OAuth2** wipes them.
+On first save `pathnames` is switched to `sendmail = /app/smokeping-modern/bin/sendmail`
+(the msmtp wrapper); until then a legacy `ssmtp.conf` keeps working.
 
 ### Wall display (`#/wall`)
 

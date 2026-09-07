@@ -35,7 +35,7 @@ else
     # add-target, test mail/notify, reload, and ack writes.
     cat > "$AUTH_INC" <<EOF
 # written by modern-smokeping init - do not edit (set WEBUI_USER/WEBUI_PASS/WEBUI_AUTH instead)
-<LocationMatch "^/api/(settings|config|targets|test|reload|me)(/|$)">
+<LocationMatch "^/api/(settings|config|targets|test|reload|me|oauth)(/|$)">
     AuthType Basic
     AuthName "SmokePing settings"
     AuthUserFile $HTPASSWD
@@ -62,14 +62,19 @@ ln -sf /config/ssmtp.conf /etc/ssmtp/ssmtp.conf
 [[ -s /config/modern-acks.json ]]   || echo '{}' > /config/modern-acks.json
 
 # alert history log (SmokePing has no alert db - see svc-smokeping override)
-touch /config/log/smokeping.log /config/log/notify.log
+touch /config/log/smokeping.log /config/log/notify.log /config/log/msmtp.log
 
-chmod +x /app/smokeping-modern/api/smokeping-api.cgi /app/smokeping-modern/bin/notify
+chmod +x /app/smokeping-modern/api/smokeping-api.cgi /app/smokeping-modern/bin/notify \
+         /app/smokeping-modern/bin/sendmail /app/smokeping-modern/bin/oauth-token
 chmod 0640 /config/ssmtp.conf /config/modern-notify.json 2>/dev/null || true
+# msmtp insists its config is private; the OAuth file holds a refresh token
+chmod 0600 /config/msmtp.conf /config/modern-oauth.json 2>/dev/null || true
 
 lsiown -R abc:abc /app/smokeping-modern /config/log /config/site-confs /config/modern-auth \
-    /config/ssmtp.conf /config/modern-notify.json /config/modern-acks.json 2>/dev/null || \
+    /config/ssmtp.conf /config/modern-notify.json /config/modern-acks.json \
+    /config/msmtp.conf /config/modern-oauth.json 2>/dev/null || \
     chown -R abc:abc /app/smokeping-modern /config/log /config/site-confs /config/modern-auth \
-    /config/ssmtp.conf /config/modern-notify.json /config/modern-acks.json || true
+    /config/ssmtp.conf /config/modern-notify.json /config/modern-acks.json \
+    /config/msmtp.conf /config/modern-oauth.json 2>/dev/null || true
 
 echo "[smokeping-modern] ready - UI at /modern/ , API at /api/"

@@ -637,7 +637,9 @@ function renderAlerts(sevFilter) {
       ul.append(el('li', {},
         el('span', { class: 'when' }, ev.time ? new Date(ev.time * 1000).toLocaleString() : '—'),
         el('span', { class: 'ev ' + ev.event }, ev.event),
-        el('span', {}, el('strong', {}, ev.alert), ' · ', ev.target)));
+        el('span', {}, el('strong', {}, ev.alert), ' · ', ev.target,
+          ev.count > 1 ? el('span', { class: 'sub', style: 'color:var(--text-faint);margin-left:8px' },
+            `×${ev.count}` + (ev.last && ev.time ? ` over ${Math.max(1, Math.round((ev.last - ev.time) / 60))} min` : '')) : null)));
     }
     hc.append(ul);
   }
@@ -807,30 +809,121 @@ function showResult(box, r, okText) {
 }
 
 function paneMail(pane) {
-  const s = settingsData.smtp, a = settingsData.alerts;
+  const s = settingsData.smtp, a = settingsData.alerts, o = s.oauth || {};
+  const method = s.authMethod || 'password';
   const f = {
+    method: el('select', { class: 'input' },
+      el('option', { value: 'password' }, 'Username + password (or app password)'),
+      el('option', { value: 'oauth-google' }, 'OAuth2 — Google / Gmail'),
+      el('option', { value: 'oauth-microsoft' }, 'OAuth2 — Microsoft 365 / Outlook')),
     host: input({ value: s.host, placeholder: 'smtp.gmail.com' }),
     port: input({ type: 'number', value: s.port, style: 'width:100px' }),
     starttls: el('input', { type: 'checkbox' }), tls: el('input', { type: 'checkbox' }),
-    authUser: input({ value: s.authUser, placeholder: 'you@example.com', autocomplete: 'off' }),
+    authUser: input({ value: s.authUser || o.account || '', placeholder: 'you@example.com', autocomplete: 'off' }),
     authPass: input({ type: 'password', placeholder: s.passSet ? '•••••••• (unchanged)' : 'app password', autocomplete: 'new-password' }),
     from: input({ value: a.from, placeholder: 'smokeping@yourdomain' }),
     to: el('textarea', { class: 'input', rows: '3', placeholder: 'one address per line' }),
     webhooks: el('input', { type: 'checkbox' }),
     testTo: input({ value: (a.to && a.to[0]) || '', placeholder: 'send test to…' }),
+    // oauth
+    clientId: input({ value: o.clientId || '', placeholder: 'client / application ID', autocomplete: 'off' }),
+    clientSecret: input({ type: 'password', placeholder: o.clientSecretSet ? '•••••••• (unchanged)' : 'client secret', autocomplete: 'new-password' }),
+    refreshToken: input({ type: 'password', placeholder: o.refreshTokenSet ? '•••••••• (unchanged)' : 'paste refresh token', autocomplete: 'off' }),
+    tenant: input({ value: o.tenant || 'common', placeholder: 'common, organizations, or your tenant ID' }),
   };
+  f.method.value = method;
   f.starttls.checked = s.starttls === true; f.tls.checked = s.tls === true;
   f.to.value = (a.to || []).join('\n'); f.webhooks.checked = a.webhooks === true;
-  const res = resultBox(), testRes = resultBox();
+  const res = resultBox(), testRes = resultBox(), oRes = resultBox();
+
+  const connected = o.refreshTokenSet
+    ? `Connected${o.account ? ' as ' + o.account : ''}${o.connectedAt ? ' · ' + new Date(o.connectedAt * 1000).toLocaleString() : ''}`
+    : 'Not connected yet';
+  const status = el('p', { class: 'sub', style: o.refreshTokenSet ? 'color:var(--ok)' : 'color:var(--warn)' }, connected);
+
+  const pwBox = el('div', { class: 'form-grid' },
+    field('Username', f.authUser), field('Password', f.authPass, 'leave blank to keep the current one'));
+
+  const googleBox = el('div', {},
+    el('p', { class: 'sub' }, 'Google has no device sign-in for Gmail, so it takes three steps once: ',
+      el('b', {}, '1.'), ' Google Cloud Console → create an OAuth client (type "Desktop app"), enable the Gmail API.  ',
+      el('b', {}, '2.'), ' Open the ', el('a', { href: 'https://developers.google.com/oauthplayground/', target: '_blank', rel: 'noopener' }, 'OAuth 2.0 Playground'),
+      ', gear icon → "Use your own OAuth credentials", scope ', el('span', { class: 'pattern' }, 'https://mail.google.com/'), ', authorize, exchange for tokens.  ',
+      el('b', {}, '3.'), ' Paste the client ID, secret and refresh token here. The mailbox is the Google account you authorized.'),
+    el('div', { class: 'form-grid' },
+      field('Client ID', f.clientId), field('Client secret', f.clientSecret),
+      field('Refresh token', f.refreshToken), field('Mailbox (user)', f.authUser)));
+
+  const msBtn = el('button', { class: 'chip on', type: 'button' }, 'Connect with Microsoft');
+  const msCode = el('div', { class: 'result ok', hidden: 'hidden' });
+  const microsoftBox = el('div', {},
+    el('p', { class: 'sub' }, 'Entra ID → App registrations → new app, "Public client" with the ',
+      el('span', { class: 'pattern' }, 'https://outlook.office365.com/SMTP.Send'), ' delegated permission, and "Allow public client flows" = Yes. ',
+      'Also make sure SMTP AUTH is enabled for the mailbox in Exchange admin. Then click Connect and sign in on the page it shows.'),
+    el('div', { class: 'form-grid' },
+      field('Application (client) ID', f.clientId), field('Tenant', f.tenant, '"common" works for most; use your tenant ID for single-tenant apps'),
+      field('Client secret', f.clientSecret, 'only if your app is confidential (usually blank)'),
+      field('Mailbox (user)', f.authUser, 'filled in automatically after connecting')),
+    el('div', { class: 'modal-actions', style: 'justify-content:flex-start' }, msBtn), msCode);
+
+  msBtn.addEventListener('click', async () => {
+    msBtn.disabled = true; msCode.hidden = false; msCode.className = 'result'; msCode.textContent = 'Requesting a sign-in code…';
+    try {
+      const st = await post('/oauth/microsoft/start', { clientId: f.clientId.value.trim(), tenant: f.tenant.value.trim(), clientSecret: f.clientSecret.value });
+      msCode.className = 'result ok';
+      msCode.innerHTML = '';
+      msCode.append(el('div', {}, 'Open ', el('a', { href: st.verificationUri, target: '_blank', rel: 'noopener' }, st.verificationUri),
+        ' and enter the code ', el('b', { style: 'font-size:18px;letter-spacing:.1em' }, st.userCode), '. Waiting for you to finish signing in…'));
+      const deadline = Date.now() + (st.expiresIn || 900) * 1000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, Math.max(5, st.interval || 5) * 1000));
+        const p = await post('/oauth/microsoft/poll', {});
+        if (p.ok) {
+          msCode.textContent = `Connected${p.account ? ' as ' + p.account : ''}. Now click "Save mail settings".`;
+          if (p.account && !f.authUser.value) f.authUser.value = p.account;
+          o.refreshTokenSet = true; status.textContent = `Connected${p.account ? ' as ' + p.account : ''}`; status.style.color = 'var(--ok)';
+          break;
+        }
+      }
+    } catch (err) { msCode.className = 'result bad'; msCode.textContent = err.message; }
+    msBtn.disabled = false;
+  });
+
+  const oauthTools = el('div', { class: 'modal-actions', style: 'justify-content:flex-start' },
+    el('button', { class: 'chip', type: 'button', onclick: async (e) => {
+      e.currentTarget.disabled = true; oRes.hidden = false; oRes.className = 'result'; oRes.textContent = 'Exchanging refresh token…';
+      try { showResult(oRes, await post('/oauth/check', {}), 'Token OK — OAuth2 credentials work.'); }
+      catch (err) { showResult(oRes, { ok: false, error: err.message, ...(err.data || {}) }); }
+      e.currentTarget.disabled = false;
+    } }, 'Check token'),
+    el('button', { class: 'chip', type: 'button', onclick: async () => {
+      if (!confirm('Forget the stored OAuth2 refresh token and client secret?')) return;
+      try { await post('/oauth/forget', {}); o.refreshTokenSet = false; status.textContent = 'Not connected yet'; status.style.color = 'var(--warn)'; toast('OAuth2 credentials removed.'); }
+      catch (err) { toast(err.message, true); }
+    } }, 'Forget OAuth2'));
+
+  const oauthWrap = el('div', {}, status, googleBox, microsoftBox, oauthTools, oRes);
+  const applyMethod = () => {
+    const m = f.method.value;
+    pwBox.hidden = m !== 'password';
+    oauthWrap.hidden = !m.startsWith('oauth');
+    googleBox.hidden = m !== 'oauth-google';
+    microsoftBox.hidden = m !== 'oauth-microsoft';
+    if (m === 'oauth-google' && !f.host.value) { f.host.value = 'smtp.gmail.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
+    if (m === 'oauth-microsoft' && !f.host.value) { f.host.value = 'smtp.office365.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
+  };
+  f.method.addEventListener('change', applyMethod);
+  applyMethod();
 
   pane.append(el('div', { class: 'card-plain' },
     el('h2', {}, 'Outgoing mail (SMTP)'),
-    el('p', { class: 'sub' }, 'SmokePing sends alert e-mails through ssmtp. Gmail: smtp.gmail.com, port 587, STARTTLS, an app password.'),
+    el('p', { class: 'sub' }, 'Alert e-mails are sent through msmtp. Gmail and Microsoft 365 both prefer OAuth2 over passwords; an app password still works for Gmail accounts with 2-step verification.'),
     el('div', { class: 'form-grid' },
+      field('Sign-in method', f.method),
       field('Mail server', f.host), field('Port', f.port),
       field('STARTTLS', f.starttls, 'usually on for port 587'), field('TLS (implicit)', f.tls, 'for port 465'),
-      field('Username', f.authUser), field('Password', f.authPass, 'leave blank to keep the current one'),
       field('From address', f.from)),
+    pwBox, oauthWrap,
     el('h2', {}, 'Alert recipients'),
     el('div', { class: 'form-grid' },
       field('E-mail alerts to', f.to),
@@ -840,11 +933,15 @@ function paneMail(pane) {
         e.currentTarget.disabled = true;
         try {
           const r = await post('/settings/smtp', {
+            authMethod: f.method.value,
             host: f.host.value, port: +f.port.value, starttls: f.starttls.checked, tls: f.tls.checked,
             authUser: f.authUser.value, authPass: f.authPass.value, from: f.from.value,
+            oauth: { clientId: f.clientId.value.trim(), clientSecret: f.clientSecret.value, refreshToken: f.refreshToken.value.trim(), tenant: f.tenant.value.trim() },
             to: f.to.value.split(/\n|,/).map(x => x.trim()).filter(Boolean), webhooks: f.webhooks.checked,
           });
-          showResult(res, r, 'Saved. SmokePing reloaded.'); f.authPass.value = '';
+          showResult(res, r, 'Saved. SmokePing reloaded.' + (r.sendmailSwitched ? ' Mail now goes through msmtp.' : ''));
+          f.authPass.value = ''; f.clientSecret.value = ''; f.refreshToken.value = '';
+          settingsData = r.settings || settingsData;
         } catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
         e.currentTarget.disabled = false;
       } }, 'Save mail settings')),

@@ -1,0 +1,69 @@
+#!/usr/bin/perl
+# Prints a fresh OAuth2 access token for SMTP (XOAUTH2). Used by msmtp via
+#   passwordeval "/app/smokeping-modern/bin/oauth-token"
+#
+# Reads /config/modern-oauth.json (written by Settings -> E-mail):
+#   { "provider": "google" | "microsoft",
+#     "clientId": "...", "clientSecret": "...",       # secret optional for MS public clients
+#     "refreshToken": "...", "tenant": "common" }     # tenant: microsoft only
+#
+# The access token is cached in /tmp until shortly before it expires, so a
+# burst of alert mails does one token exchange, not one per message.
+
+use strict;
+use warnings;
+use JSON::PP ();
+
+my $CFG   = $ENV{SPM_OAUTH_CFG} || '/config/modern-oauth.json';
+my $CACHE = $ENV{SPM_OAUTH_CACHE} || '/tmp/spm-oauth-token.json';
+my $CURL  = '/usr/bin/curl';
+my $json  = JSON::PP->new->utf8;
+
+sub fail { print STDERR "oauth-token: $_[0]\n"; exit 1 }
+sub slurp { my $f = shift; open my $h, '<', $f or return undef; local $/; my $s = <$h>; close $h; $s }
+
+my $cfg = eval { $json->decode(slurp($CFG) // '') } or fail("cannot read $CFG - configure OAuth2 in Settings -> E-mail");
+my $provider = $cfg->{provider} // '';
+fail('provider must be google or microsoft') unless $provider =~ /^(google|microsoft)$/;
+fail('clientId missing')     unless $cfg->{clientId};
+fail('refreshToken missing - complete the sign-in in Settings -> E-mail') unless $cfg->{refreshToken};
+
+# cached and still valid for >2 min?
+if (my $c = eval { $json->decode(slurp($CACHE) // '') }) {
+    if ($c->{provider} && $c->{provider} eq $provider && $c->{refresh} && $c->{refresh} eq substr($cfg->{refreshToken}, -12)
+        && $c->{exp} && $c->{exp} - time > 120 && $c->{token}) {
+        print $c->{token};
+        exit 0;
+    }
+}
+
+my ($url, @form);
+if ($provider eq 'google') {
+    $url  = 'https://oauth2.googleapis.com/token';
+    @form = (client_id => $cfg->{clientId}, client_secret => ($cfg->{clientSecret} // ''),
+             refresh_token => $cfg->{refreshToken}, grant_type => 'refresh_token');
+} else {
+    my $tenant = $cfg->{tenant} || 'common';
+    $url  = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/token";
+    @form = (client_id => $cfg->{clientId}, refresh_token => $cfg->{refreshToken},
+             grant_type => 'refresh_token', scope => 'https://outlook.office365.com/SMTP.Send offline_access');
+    push @form, client_secret => $cfg->{clientSecret} if $cfg->{clientSecret};
+}
+
+my @cmd = ($CURL, '-sS', '-m', '20', '-X', 'POST', $url);
+while (my ($k, $v) = splice @form, 0, 2) { push @cmd, '--data-urlencode', "$k=$v" }
+my $out = do { open my $p, '-|', @cmd or fail("cannot run curl: $!"); local $/; <$p> };
+my $rc = $? >> 8;
+fail("token endpoint unreachable (curl rc=$rc)") if $rc;
+my $r = eval { $json->decode($out // '') } or fail("token endpoint returned non-JSON: " . substr($out // '', 0, 200));
+fail("$r->{error}: " . ($r->{error_description} // '')) if $r->{error};
+fail('no access_token in response') unless $r->{access_token};
+
+if (open my $h, '>', "$CACHE.$$") {
+    print $h $json->encode({ provider => $provider, token => $r->{access_token},
+                             exp => time + ($r->{expires_in} || 3600), refresh => substr($cfg->{refreshToken}, -12) });
+    close $h;
+    chmod 0600, "$CACHE.$$";
+    rename "$CACHE.$$", $CACHE;
+}
+print $r->{access_token};

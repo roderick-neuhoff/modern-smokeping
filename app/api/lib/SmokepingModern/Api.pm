@@ -55,7 +55,7 @@ sub run {
 
     # everything that writes (settings, config files, acks, tests, reload)
     # lives in SmokepingModern::Admin
-    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me);
+    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me oauth);
     if ($admin{$route}) {
         my ($status, $body) = eval {
             require SmokepingModern::Admin;
@@ -683,7 +683,19 @@ sub _parse_log {
             target => $target,
         };
     }
-    @events = reverse @events;
+    # level-triggered alerts log "is active" every cycle; collapse runs of the
+    # same (alert,target,event) into one entry that keeps the first time + a count
+    my @collapsed;
+    for my $e (@events) {
+        my $last = $collapsed[-1];
+        if ($last && $last->{alert} eq $e->{alert} && $last->{target} eq $e->{target} && $last->{event} eq $e->{event}) {
+            $last->{count}++;
+            $last->{last} = $e->{time} if defined $e->{time};
+            next;
+        }
+        push @collapsed, { %$e, count => 1, last => $e->{time} };
+    }
+    @events = reverse @collapsed;
     @events = @events[ 0 .. 199 ] if @events > 200;
     return (\@events, $file);
 }

@@ -427,12 +427,58 @@ sub oauth_device_poll {
     return { ok => \1, account => $new{account}, connectedAt => $new{connectedAt} };
 }
 
-# exchange the stored refresh token once, to prove the credentials work
+# exchange the stored credentials for a token once, then read what the token
+# actually grants - this is what Exchange looks at when it says 535 5.7.3
 sub oauth_token_check {
+    unlink '/tmp/spm-oauth-token.json';                 # force a fresh exchange
     my ($out, $rc) = _capture(40, $OAUTH_BIN);
     my $token = $rc == 0 ? ($out =~ s/\s+//gr) : '';
-    return { ok => ($rc == 0 && length $token ? \1 : \0), rc => $rc,
-             output => ($rc == 0 ? 'access token obtained (' . length($token) . ' chars)' : ($out =~ s/\s+$//r)) };
+    return { ok => \0, rc => $rc, output => ($out =~ s/\s+$//r) } unless $rc == 0 && length $token;
+
+    my $o = _read_oauth();
+    my @lines = ('access token obtained (' . length($token) . ' chars)');
+    my $claims;
+    if ($token =~ /^[\w-]+\.([\w-]+)\.[\w-]+$/) {        # a JWT (Microsoft); Google tokens are opaque
+        my $mid = $1; $mid =~ tr{-_}{+/}; $mid .= '=' x ((4 - length($mid) % 4) % 4);
+        require MIME::Base64;
+        $claims = eval { $JSON->decode(MIME::Base64::decode_base64($mid)) };
+    }
+    my $verdict;
+    if ($claims) {
+        my @roles = ref $claims->{roles} eq 'ARRAY' ? @{ $claims->{roles} } : ();
+        my $scp = $claims->{scp} // '';
+        push @lines, "audience : " . ($claims->{aud} // '?'),
+                     "tenant   : " . ($claims->{tid} // '?'),
+                     "app id   : " . ($claims->{appid} // $claims->{azp} // '?'),
+                     "roles    : " . (@roles ? join(', ', @roles) : '(none)'),
+                     "scopes   : " . ($scp || '(none)'),
+                     "expires  : " . ($claims->{exp} ? scalar localtime($claims->{exp}) : '?');
+        my $aud_ok = ($claims->{aud} // '') =~ m{outlook\.office365\.com|outlook\.office\.com|00000002-0000-0ff1-ce00-000000000000};
+        if (($o->{provider} // '') eq 'microsoft-app') {
+            if (!grep { /^SMTP\.SendAsApp$/ } @roles) {
+                $verdict = "PROBLEM: the token has no SMTP.SendAsApp role. In Entra ID -> App -> API permissions add "
+                         . "'Office 365 Exchange Online' -> Application permissions -> SMTP.SendAsApp and click 'Grant admin consent'. "
+                         . "(A delegated SMTP.Send permission does not count for app-only.)";
+            } elsif (!$aud_ok) {
+                $verdict = "PROBLEM: token audience is not Exchange Online (" . ($claims->{aud} // '?') . ").";
+            } else {
+                $verdict = "Token is correct for app-only SMTP. If Exchange still answers 535 5.7.3, the remaining causes are on the Exchange side: "
+                         . "(1) the app was not granted the mailbox - run New-ServicePrincipal + Add-MailboxPermission for " . ($o->{account} || 'the mailbox') . "; "
+                         . "(2) SMTP AUTH is disabled - Set-CASMailbox -Identity " . ($o->{account} || '<mailbox>') . " -SmtpClientAuthenticationDisabled \$false "
+                         . "(and Get-TransportConfig | fl SmtpClientAuthenticationDisabled for the org default); "
+                         . "(3) the 'Send as mailbox' address differs from the mailbox that was granted. Changes can take a few minutes to apply.";
+            }
+        } else {
+            $verdict = $scp =~ /SMTP\.Send/ ? 'Token carries the SMTP.Send scope - good.'
+                     : 'PROBLEM: token has no SMTP.Send scope - re-connect and consent to SMTP.Send.';
+        }
+    } else {
+        $verdict = 'Token obtained (opaque, not a JWT) - use "Test these settings" to verify sending.';
+    }
+    push @lines, '', $verdict;
+    return { ok => ($verdict =~ /^PROBLEM/ ? \0 : \1), rc => 0, output => join("\n", @lines),
+             claims => ($claims ? { aud => $claims->{aud}, tid => $claims->{tid}, appid => ($claims->{appid} // $claims->{azp}),
+                                    roles => $claims->{roles}, scp => $claims->{scp} } : undef) };
 }
 
 sub oauth_forget {

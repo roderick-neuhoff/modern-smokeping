@@ -815,7 +815,8 @@ function paneMail(pane) {
     method: el('select', { class: 'input' },
       el('option', { value: 'password' }, 'Username + password (or app password)'),
       el('option', { value: 'oauth-google' }, 'OAuth2 — Google / Gmail'),
-      el('option', { value: 'oauth-microsoft' }, 'OAuth2 — Microsoft 365 / Outlook')),
+      el('option', { value: 'oauth-microsoft-app' }, 'OAuth2 — Microsoft 365, app-only (client ID + secret, no sign-in)'),
+      el('option', { value: 'oauth-microsoft' }, 'OAuth2 — Microsoft 365, sign in as a user (device code)')),
     host: input({ value: s.host, placeholder: 'smtp.gmail.com' }),
     port: input({ type: 'number', value: s.port, style: 'width:100px' }),
     starttls: el('input', { type: 'checkbox' }), tls: el('input', { type: 'checkbox' }),
@@ -836,10 +837,28 @@ function paneMail(pane) {
   f.to.value = (a.to || []).join('\n'); f.webhooks.checked = a.webhooks === true;
   const res = resultBox(), testRes = resultBox(), oRes = resultBox();
 
-  const connected = o.refreshTokenSet
-    ? `Connected${o.account ? ' as ' + o.account : ''}${o.connectedAt ? ' · ' + new Date(o.connectedAt * 1000).toLocaleString() : ''}`
-    : 'Not connected yet';
-  const status = el('p', { class: 'sub', style: o.refreshTokenSet ? 'color:var(--ok)' : 'color:var(--warn)' }, connected);
+  const isSet = o.configured === true || o.refreshTokenSet === true;
+  const connected = isSet
+    ? `Configured${o.account ? ' for ' + o.account : ''}${o.connectedAt ? ' · ' + new Date(o.connectedAt * 1000).toLocaleString() : ''} — use "Check token" to verify`
+    : 'Not configured yet';
+  const status = el('p', { class: 'sub', style: isSet ? 'color:var(--ok)' : 'color:var(--warn)' }, connected);
+
+  const appBox = el('div', {},
+    el('p', { class: 'sub' }, el('b', {}, 'No sign-in page: '), 'the app authenticates by itself with its secret. One-time setup by a Microsoft 365 admin:'),
+    el('ol', { class: 'sub steps' },
+      el('li', {}, 'Entra ID → App registrations → your app → ', el('b', {}, 'API permissions'), ' → Add → ', el('b', {}, 'Office 365 Exchange Online'), ' → ',
+        el('b', {}, 'Application permissions'), ' → ', el('span', { class: 'pattern' }, 'SMTP.SendAsApp'), ' → ', el('b', {}, 'Grant admin consent'), '.'),
+      el('li', {}, el('b', {}, 'Certificates & secrets'), ' → New client secret → paste it below (the ', el('i', {}, 'Value'), ', not the ID).'),
+      el('li', {}, 'Allow the app to send as the mailbox, in Exchange Online PowerShell:',
+        el('pre', { class: 'result ok', style: 'display:block;margin:6px 0' },
+          'Connect-ExchangeOnline\n' +
+          'New-ServicePrincipal -AppId <client ID> -ObjectId <object ID of the Enterprise application>\n' +
+          'Add-MailboxPermission -Identity alerts@yourdomain.com -User <client ID> -AccessRights FullAccess\n' +
+          'Set-CASMailbox -Identity alerts@yourdomain.com -SmtpClientAuthenticationDisabled $false')),
+      el('li', {}, 'Tenant must be your tenant ID or domain (e.g. ', el('span', { class: 'pattern' }, 'contoso.onmicrosoft.com'), '), not "common".')),
+    el('div', { class: 'form-grid' },
+      field('Tenant ID or domain', f.tenant), field('Application (client) ID', f.clientId),
+      field('Client secret', f.clientSecret), field('Send as mailbox (user)', f.authUser, 'the shared/user mailbox the app was granted')));
 
   const pwBox = el('div', { class: 'form-grid' },
     field('Username', f.authUser), field('Password', f.authPass, 'leave blank to keep the current one'));
@@ -902,15 +921,17 @@ function paneMail(pane) {
       catch (err) { toast(err.message, true); }
     } }, 'Forget OAuth2'));
 
-  const oauthWrap = el('div', {}, status, googleBox, microsoftBox, oauthTools, oRes);
+  const oauthWrap = el('div', {}, status, googleBox, appBox, microsoftBox, oauthTools, oRes);
   const applyMethod = () => {
     const m = f.method.value;
     pwBox.hidden = m !== 'password';
     oauthWrap.hidden = !m.startsWith('oauth');
     googleBox.hidden = m !== 'oauth-google';
+    appBox.hidden = m !== 'oauth-microsoft-app';
     microsoftBox.hidden = m !== 'oauth-microsoft';
     if (m === 'oauth-google' && !f.host.value) { f.host.value = 'smtp.gmail.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
-    if (m === 'oauth-microsoft' && !f.host.value) { f.host.value = 'smtp.office365.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
+    if (m.startsWith('oauth-microsoft') && (!f.host.value || f.host.value === 'smtp.gmail.com')) { f.host.value = 'smtp.office365.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
+    if (m === 'oauth-microsoft-app' && (!f.tenant.value || f.tenant.value === 'common')) f.tenant.value = '';
   };
   f.method.addEventListener('change', applyMethod);
   applyMethod();

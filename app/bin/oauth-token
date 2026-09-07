@@ -24,9 +24,17 @@ sub slurp { my $f = shift; open my $h, '<', $f or return undef; local $/; my $s 
 
 my $cfg = eval { $json->decode(slurp($CFG) // '') } or fail("cannot read $CFG - configure OAuth2 in Settings -> E-mail");
 my $provider = $cfg->{provider} // '';
-fail('provider must be google or microsoft') unless $provider =~ /^(google|microsoft)$/;
+fail('provider must be google, microsoft or microsoft-app') unless $provider =~ /^(google|microsoft|microsoft-app)$/;
 fail('clientId missing')     unless $cfg->{clientId};
-fail('refreshToken missing - complete the sign-in in Settings -> E-mail') unless $cfg->{refreshToken};
+if ($provider eq 'microsoft-app') {
+    # app-only (client credentials): no user sign-in, no refresh token
+    fail('clientSecret missing') unless $cfg->{clientSecret};
+    fail('tenant must be your tenant ID or domain (not "common") for app-only auth')
+        if !$cfg->{tenant} || $cfg->{tenant} =~ /^(common|organizations|consumers)$/;
+    $cfg->{refreshToken} = 'app:' . substr($cfg->{clientSecret}, -8);   # cache key only
+} else {
+    fail('refreshToken missing - complete the sign-in in Settings -> E-mail') unless $cfg->{refreshToken};
+}
 
 # cached and still valid for >2 min?
 if (my $c = eval { $json->decode(slurp($CACHE) // '') }) {
@@ -42,6 +50,10 @@ if ($provider eq 'google') {
     $url  = 'https://oauth2.googleapis.com/token';
     @form = (client_id => $cfg->{clientId}, client_secret => ($cfg->{clientSecret} // ''),
              refresh_token => $cfg->{refreshToken}, grant_type => 'refresh_token');
+} elsif ($provider eq 'microsoft-app') {
+    $url  = "https://login.microsoftonline.com/$cfg->{tenant}/oauth2/v2.0/token";
+    @form = (client_id => $cfg->{clientId}, client_secret => $cfg->{clientSecret},
+             grant_type => 'client_credentials', scope => 'https://outlook.office365.com/.default');
 } else {
     my $tenant = $cfg->{tenant} || 'common';
     $url  = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/token";

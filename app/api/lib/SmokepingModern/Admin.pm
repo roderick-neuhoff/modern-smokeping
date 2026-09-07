@@ -261,6 +261,7 @@ sub settings_get {
         clientId        => $o->{clientId} // '',
         clientSecretSet => (length($o->{clientSecret} // '') ? \1 : \0),
         refreshTokenSet => (length($o->{refreshToken} // '') ? \1 : \0),
+        configured      => ((length($o->{refreshToken} // '') || (($o->{provider} // '') eq 'microsoft-app' && length($o->{clientSecret} // ''))) ? \1 : \0),
         tenant          => $o->{tenant} // 'common',
         account         => $o->{account} // '',
         connectedAt     => $o->{connectedAt},
@@ -281,11 +282,11 @@ sub settings_smtp {
     my $b = shift || {};
     my $cur = _read_ssmtp();
     my $method = $b->{authMethod} // 'password';
-    die { status => 422, error => 'authMethod must be password, oauth-google or oauth-microsoft' }
-        unless $method =~ /^(password|oauth-google|oauth-microsoft)$/;
+    die { status => 422, error => 'authMethod must be password, oauth-google, oauth-microsoft or oauth-microsoft-app' }
+        unless $method =~ /^(password|oauth-google|oauth-microsoft|oauth-microsoft-app)$/;
     my $host = $b->{host} // '';
     $host =~ s/\s//g;
-    $host ||= $method eq 'oauth-google' ? 'smtp.gmail.com' : $method eq 'oauth-microsoft' ? 'smtp.office365.com' : '';
+    $host ||= $method eq 'oauth-google' ? 'smtp.gmail.com' : $method =~ /^oauth-microsoft/ ? 'smtp.office365.com' : '';
     die { status => 422, error => 'mail server host is required' } unless length $host;
     my $port = int($b->{port} || 587);
     my $pass = defined $b->{authPass} && length $b->{authPass} ? $b->{authPass} : $cur->{_pass};
@@ -296,7 +297,7 @@ sub settings_smtp {
     my @emails = grep { length } map { s/\s//gr } @{ $b->{to} || [] };
     for (@emails) { die { status => 422, error => "invalid recipient '$_'" } unless /^[^\s@]+@[^\s@]+$/ }
 
-    if ($method =~ /^oauth-(\w+)$/) {
+    if ($method =~ /^oauth-([\w-]+)$/) {
         my $provider = $1;
         my $o = _read_oauth();
         my $oi = $b->{oauth} || {};
@@ -311,9 +312,18 @@ sub settings_smtp {
             account      => ($user || ($same ? $o->{account} : '') || ''),
             connectedAt  => ($same ? $o->{connectedAt} : undef),
         );
-        $new{connectedAt} //= time if $new{refreshToken};
         for (qw(clientId clientSecret refreshToken tenant account)) { $new{$_} =~ s/[\r\n]//g if defined $new{$_} }
         die { status => 422, error => 'OAuth client ID is required' } unless length $new{clientId};
+        if ($provider eq 'microsoft-app') {
+            # app-only: secret + a real tenant are the whole credential; nothing to "connect"
+            die { status => 422, error => 'client secret is required for app-only (client credentials) auth' } unless length $new{clientSecret};
+            die { status => 422, error => 'tenant must be your tenant ID or domain, not "common", for app-only auth' }
+                if $new{tenant} =~ /^(common|organizations|consumers)$/i;
+            $new{refreshToken} = '';
+            $new{connectedAt} //= time;
+        } else {
+            $new{connectedAt} //= time if $new{refreshToken};
+        }
         $user ||= $new{account};
         die { status => 422, error => 'mailbox address (user) is required for OAuth2' } unless $user =~ /^[^\s@]+@[^\s@]+$/;
         $new{account} = $user;
@@ -372,10 +382,17 @@ sub oauth_device_start {
     die { status => 422, error => 'Microsoft application (client) ID is required' } unless length $client;
     my $tenant = $b->{tenant} || 'common';
     $tenant =~ s/[^A-Za-z0-9.-]//g;
-    my $d = _curl_form_json("https://login.microsoftonline.com/$tenant/oauth2/v2.0/devicecode",
-        client_id => $client, scope => 'https://outlook.office365.com/SMTP.Send offline_access openid email');
+    # secret: from the form, else the one already stored for this same app
+    my $secret = $b->{clientSecret} // '';
+    if (!length $secret) {
+        my $o = _read_oauth();
+        $secret = $o->{clientSecret} // '' if ($o->{provider} // '') eq 'microsoft' && ($o->{clientId} // '') eq $client;
+    }
+    my %form = (client_id => $client, scope => 'https://outlook.office365.com/SMTP.Send offline_access openid email');
+    $form{client_secret} = $secret if length $secret;   # confidential apps need it here too
+    my $d = _curl_form_json("https://login.microsoftonline.com/$tenant/oauth2/v2.0/devicecode", %form);
     die { status => 422, error => _ms_hint($d) } if $d->{error};
-    _spew($DEVICE_STATE, $JSON->encode({ clientId => $client, clientSecret => ($b->{clientSecret} // ''), tenant => $tenant,
+    _spew($DEVICE_STATE, $JSON->encode({ clientId => $client, clientSecret => $secret, tenant => $tenant,
         deviceCode => $d->{device_code}, interval => ($d->{interval} || 5), expires => time + ($d->{expires_in} || 900) }), 0600);
     return { ok => \1, userCode => $d->{user_code}, verificationUri => $d->{verification_uri},
              message => $d->{message}, expiresIn => $d->{expires_in}, interval => ($d->{interval} || 5) };

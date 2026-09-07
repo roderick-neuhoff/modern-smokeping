@@ -354,7 +354,8 @@ function render(fromRefresh) {
   decorateTree();
   closeDrawer();
 }
-window.addEventListener('hashchange', render);
+// note: not `render` directly - the Event would land in the fromRefresh flag
+window.addEventListener('hashchange', () => render(false));
 
 // --- dashboard view --------------------------------------------
 

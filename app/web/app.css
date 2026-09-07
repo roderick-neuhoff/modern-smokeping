@@ -82,6 +82,8 @@
 }
 
 * { box-sizing: border-box; }
+/* the hidden attribute must beat any display: set by a class below */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;

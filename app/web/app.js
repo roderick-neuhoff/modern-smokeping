@@ -72,8 +72,11 @@ async function api(path, { retries = 1 } = {}) {
 // --- data refresh -------------------------------------------------
 
 let refreshing = null;   // in-flight refresh promise, so overlapping triggers coalesce
+let lastRefreshAt = 0;
 async function refresh() {
   if (refreshing) return refreshing;
+  if (Date.now() - lastRefreshAt < 1500) return;   // burst guard (Retry mashing, focus+visibility together)
+  lastRefreshAt = Date.now();
   refreshing = (async () => {
     let failed = null;
     try {

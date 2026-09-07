@@ -18,8 +18,8 @@ priority = 2
 
 +lossdetect
 type = matcher
-pattern = ConsecutiveLoss(pctlossraise=>5,stepsraise=>3,pctlossclear=>2,stepsclear=>5)
-comment = Sustained packet loss - 5%+ for three cycles in a row
+pattern = ConsecutiveLoss(pctlossraise=>10,stepsraise=>3,pctlossclear=>3,stepsclear=>5)
+comment = Sustained packet loss - 10%+ for three cycles in a row
 priority = 6
 
 # --- latency --------------------------------------------------------

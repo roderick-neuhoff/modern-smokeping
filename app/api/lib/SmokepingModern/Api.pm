@@ -364,12 +364,14 @@ sub summary {
             $stddev  = _rrd_stddev($rrd, $secs);
         }
 
+        # loss is a fraction 0..1. a single dropped ping (~1/20) is noise;
+        # escalate only at sustained loss, and call it down at ~total loss.
         my $sev = 'unknown';
         if (defined $lossNow || defined $medNow) {
             $sev = 'ok';
             if (defined $lossNow) {
-                $sev = 'warning'  if $lossNow > 0;
-                $sev = 'down'     if $lossNow >= 0.999;
+                $sev = 'warning' if $lossNow >= 0.10;
+                $sev = 'down'    if $lossNow >= 0.90;
             }
         }
         if (my $as = $alert_state->{$p}) {

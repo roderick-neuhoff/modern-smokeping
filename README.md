@@ -102,7 +102,7 @@ issues out of the top-bar counts.
 |-------|-----------|----------|
 | `hostdown` | >90 % loss for 2 cycles in a row | 1 (critical) |
 | `majorloss` | ≥25 % loss in a single cycle | 2 (critical) |
-| `lossdetect` | ≥5 % loss for 3 cycles in a row | 6 (warning) |
+| `lossdetect` | ≥10 % loss for 3 cycles in a row | 6 (warning) |
 | `latencyhigh` | RTT > 300 ms for 3+ cycles (`CheckLatency`) | 10 (warning) |
 | `latencyshift` | current latency > 2× the recent baseline (`Avgratio`) | 15 (warning) |
 

@@ -1,0 +1,5 @@
+# Keep LF everywhere - these run inside a Linux container.
+* text=auto eol=lf
+*.png binary
+*.gif binary
+*.ico binary

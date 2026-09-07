@@ -1,0 +1,19 @@
+#!/usr/bin/with-contenv bash
+# Wire the SmokePing Modern UI into the base image on every start.
+set -e
+
+echo "[smokeping-modern] installing UI + API"
+
+mkdir -p /config/site-confs /config/log
+install -m 0644 /app/smokeping-modern/apache/smokeping-modern.conf \
+    /config/site-confs/smokeping-modern.conf
+
+# alert history log (SmokePing has no alert db - see svc-smokeping override)
+touch /config/log/smokeping.log
+
+chmod +x /app/smokeping-modern/api/smokeping-api.cgi
+
+lsiown -R abc:abc /app/smokeping-modern /config/log /config/site-confs 2>/dev/null || \
+    chown -R abc:abc /app/smokeping-modern /config/log /config/site-confs || true
+
+echo "[smokeping-modern] ready - UI at /modern/ , API at /api/"

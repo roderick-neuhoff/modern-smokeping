@@ -1,0 +1,36 @@
+*** Alerts ***
+to = root@localhost
+from = smokeping@localhost
+
+# --- host reachability -------------------------------------------------
++hostdown
+type = loss
+pattern = >90%,>90%
+comment = Host unreachable - >90% packet loss for two consecutive cycles
+priority = 1
+
+# --- packet loss ------------------------------------------------------
++majorloss
+type = matcher
+pattern = ConsecutiveLoss(pctlossraise=>25,stepsraise=>1,pctlossclear=>3,stepsclear=>3)
+comment = Major packet loss - 25%+ in a single cycle
+priority = 2
+
++lossdetect
+type = matcher
+pattern = ConsecutiveLoss(pctlossraise=>5,stepsraise=>3,pctlossclear=>2,stepsclear=>5)
+comment = Sustained packet loss - 5%+ for three cycles in a row
+priority = 6
+
+# --- latency --------------------------------------------------------
++latencyhigh
+type = matcher
+pattern = CheckLatency(l=>300,x=>3)
+comment = Round-trip latency above 300 ms for three or more cycles
+priority = 10
+
++latencyshift
+type = matcher
+pattern = Avgratio(historic=>12,current=>3,comparator=>'>',percentage=>200)
+comment = Latency has more than doubled versus the recent baseline
+priority = 15

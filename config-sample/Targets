@@ -1,0 +1,61 @@
+*** Targets ***
+
+probe = FPing
+
+menu = Top
+title = Network Latency
+remark = SmokePing - modern UI demo configuration.
+
+alerts = hostdown,majorloss,lossdetect,latencyhigh,latencyshift
+
++ Local
+menu = Local network
+title = Local network
+
+++ Gateway
+menu = Gateway
+title = LAN gateway (172.16.70.1)
+host = 172.16.70.1
+
+++ Unraid
+menu = Unraid host
+title = Unraid host (172.16.70.112)
+host = 172.16.70.112
+
++ WAN
+menu = Internet
+title = Internet connectivity
+
+++ CloudflareDNS
+menu = Cloudflare 1.1.1.1
+title = Cloudflare DNS
+host = 1.1.1.1
+
+++ GoogleDNS
+menu = Google 8.8.8.8
+title = Google DNS
+host = 8.8.8.8
+
+++ Quad9
+menu = Quad9 9.9.9.9
+title = Quad9 DNS
+host = 9.9.9.9
+
++ Sites
+menu = Web sites
+title = Web sites
+
+++ Google
+menu = google.com
+title = google.com
+host = google.com
+
+++ GitHub
+menu = github.com
+title = github.com
+host = github.com
+
+++ Cloudflare
+menu = cloudflare.com
+title = cloudflare.com
+host = cloudflare.com

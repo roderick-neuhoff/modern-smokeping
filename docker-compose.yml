@@ -1,0 +1,25 @@
+# modern-smokeping - drop-in replacement for the LinuxServer.io SmokePing
+# container. Same volumes, same behaviour, plus a modern UI at / and /modern/
+# and a JSON API at /api/.
+
+services:
+  smokeping:
+    build:
+      context: .
+      args:
+        BASE_TAG: ${BASE_TAG:-latest}
+    image: modern-smokeping:latest
+    container_name: smokeping
+    environment:
+      - PUID=${PUID:-99}
+      - PGID=${PGID:-100}
+      - TZ=${TZ:-Europe/Amsterdam}
+      # Optional: point the alerts "history" panel at a specific log file.
+      # Defaults to /config/log/smokeping.log which the bundled svc override fills.
+      # - SMOKEPING_LOG=/config/log/smokeping.log
+    volumes:
+      - ${CONFIG_DIR:-./data/config}:/config
+      - ${DATA_DIR:-./data/data}:/data
+    ports:
+      - ${HTTP_PORT:-8480}:80
+    restart: unless-stopped

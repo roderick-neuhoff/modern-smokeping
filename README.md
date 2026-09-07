@@ -96,6 +96,40 @@ the authoritative raise/clear record.
 Rows can be **silenced** (client-side, stored in your browser) to drop known
 issues out of the top-bar counts.
 
+## Settings page, login, notifications
+
+`#/settings` (also in the sidebar) is the write side of the UI. Every change is
+validated with `smokeping --check` **before** it is written, a `.bak` of the previous
+file is kept, and the daemon is reloaded with `SIGHUP` — no container restart.
+
+| Tab | What it does |
+|-----|--------------|
+| **E-mail** | SMTP server / port / STARTTLS / credentials (writes `ssmtp.conf`), the alert `from` address and recipient list, and a **Send test e-mail** button |
+| **Notifications** | Discord, Slack, Telegram, ntfy, Gotify and a generic JSON webhook — each with a **Save & send test** button. Turn on *Webhook notifications* under E-mail → Alert recipients to route alerts there (SmokePing pipes them to `bin/notify`) |
+| **Add target** | form that appends a target block under a chosen group, validates, reloads |
+| **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves` with validate-and-save |
+| **Access** | shows who you are and how the login is configured |
+
+**Login.** The UI, the API and the classic CGI sit behind one HTTP Basic login:
+
+```
+WEBUI_AUTH=on        # off disables it entirely
+WEBUI_USER=admin
+WEBUI_PASS=          # blank = a password is generated on first start,
+                     # printed in the container log and kept in
+                     # /config/modern-auth/password.txt
+```
+
+Mutating API calls additionally require the `X-Requested-With: modern-smokeping`
+header, so a cross-site form can't ride on cached credentials.
+
+**Acknowledgements.** *Acknowledge* on the Alerts page silences an alert
+server-side (1 h / 8 h / 24 h / 7 d / until cleared, with a note and the user
+who did it) — shared by everyone, stored in `/config/modern-acks.json`.
+
+**Wall display.** `#/wall` is a chrome-less tile view for a TV: every target as a
+coloured tile with current median, loss and a sparkline, plus a status header.
+
 ## What alerts should I configure?
 
 `config-sample/Alerts` is a sensible starting set — copy it into your `/config`

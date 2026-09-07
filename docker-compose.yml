@@ -14,6 +14,12 @@ services:
       - PUID=${PUID:-99}
       - PGID=${PGID:-100}
       - TZ=${TZ:-Europe/Amsterdam}
+      # Login for the UI + API (+ classic CGI). WEBUI_AUTH=off disables it.
+      # Leave WEBUI_PASS empty to have one generated on first start - it is
+      # printed in the container log and kept in /config/modern-auth/password.txt
+      - WEBUI_AUTH=${WEBUI_AUTH:-on}
+      - WEBUI_USER=${WEBUI_USER:-admin}
+      - WEBUI_PASS=${WEBUI_PASS:-}
       # Optional: point the alerts "history" panel at a specific log file.
       # Defaults to /config/log/smokeping.log which the bundled svc override fills.
       # - SMOKEPING_LOG=/config/log/smokeping.log

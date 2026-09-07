@@ -1,0 +1,144 @@
+#!/usr/bin/perl
+# modern-smokeping notifier: SmokePing pipes alerts here when the Alerts "to"
+# list contains  |/app/smokeping-modern/bin/notify
+#
+# argv (from Smokeping::check_alerts):
+#   <alert> <target> "<loss: ...>" "<rtt: ...>" <host> [raised 1|0  (edge-triggered only)]
+#
+# Channels are configured in /config/modern-notify.json via the Settings page:
+#   discord  { enabled, url }
+#   slack    { enabled, url }                       (incoming webhook)
+#   telegram { enabled, token, chatId }
+#   ntfy     { enabled, url, topic, token }         (url = https://ntfy.sh)
+#   gotify   { enabled, url, token, priority }
+#   webhook  { enabled, url, secret }               (generic JSON POST)
+
+use strict;
+use warnings;
+use JSON::PP ();
+use POSIX qw(strftime);
+
+my $CFG = $ENV{SPM_NOTIFY_CFG} || '/config/modern-notify.json';
+my $LOG = $ENV{SPM_NOTIFY_LOG} || '/config/log/notify.log';
+my $CURL = '/usr/bin/curl';
+
+my ($alert, $target, $loss, $rtt, $host, $raised) = @ARGV;
+$alert  //= 'unknown';
+$target //= 'unknown';
+$loss   //= '';
+$rtt    //= '';
+$host   //= '';
+my $state = defined $raised ? ($raised ? 'RAISED' : 'CLEARED') : 'ACTIVE';
+my $test  = $ENV{SPM_TEST} ? 1 : 0;
+my $only  = $ENV{SPM_ONLY} || '';
+
+my $json = JSON::PP->new->utf8->canonical;
+my $cfg  = do {
+    local $/;
+    open my $fh, '<', $CFG or exit_with("no notify config at $CFG (nothing to do)", 0);
+    my $raw = <$fh>;
+    close $fh;
+    eval { $json->decode($raw) } || {};
+};
+
+my $when  = strftime('%Y-%m-%d %H:%M:%S', localtime);
+my $short = "$target: $alert $state" . ($test ? ' (TEST)' : '');
+my $body  = join "\n",
+    ($test ? "This is a TEST notification from modern-smokeping." : ()),
+    "Target: $target" . ($host ? " ($host)" : ''),
+    "Alert:  $alert",
+    "State:  $state",
+    ($loss ? "Loss:   $loss" : ()),
+    ($rtt  ? "RTT:    $rtt"  : ()),
+    "Time:   $when";
+my $emoji = $state eq 'CLEARED' ? "\x{2705}" : "\x{1F6A8}";
+my $title = "$emoji SmokePing $state: $target";
+
+my @results;
+for my $ch (sort keys %$cfg) {
+    my $c = $cfg->{$ch};
+    next unless ref $c eq 'HASH' && $c->{enabled};
+    next if $only && $ch ne $only;
+    my ($ok, $msg) = eval { send_channel($ch, $c) };
+    ($ok, $msg) = (0, "error: $@") if $@;
+    push @results, sprintf('%-8s %s %s', $ch, ($ok ? 'ok  ' : 'FAIL'), $msg // '');
+}
+push @results, 'no channels enabled' unless @results;
+
+logline("$short -> " . join(' | ', @results));
+print join("\n", @results), "\n";
+exit((grep { /FAIL/ } @results) ? 1 : 0);
+
+# ---------------------------------------------------------------------------
+
+sub send_channel {
+    my ($ch, $c) = @_;
+    if ($ch eq 'discord') {
+        return curl_json($c->{url}, { content => "**$title**\n```\n$body\n```" });
+    }
+    if ($ch eq 'slack') {
+        return curl_json($c->{url}, { text => "*$title*\n```$body```" });
+    }
+    if ($ch eq 'telegram') {
+        die "token/chatId missing\n" unless $c->{token} && $c->{chatId};
+        return curl_json("https://api.telegram.org/bot$c->{token}/sendMessage",
+            { chat_id => $c->{chatId}, text => "$title\n$body", disable_web_page_preview => JSON::PP::true });
+    }
+    if ($ch eq 'ntfy') {
+        my $base = ($c->{url} || 'https://ntfy.sh') =~ s{/+$}{}r;
+        die "topic missing\n" unless $c->{topic};
+        my @h = ('-H', "Title: $title", '-H', 'Priority: ' . ($state eq 'CLEARED' ? 'default' : 'high'),
+                 '-H', 'Tags: ' . ($state eq 'CLEARED' ? 'white_check_mark' : 'rotating_light'));
+        push @h, '-H', "Authorization: Bearer $c->{token}" if $c->{token};
+        return curl_raw("$base/$c->{topic}", $body, @h);
+    }
+    if ($ch eq 'gotify') {
+        my $base = ($c->{url} || '') =~ s{/+$}{}r;
+        die "url/token missing\n" unless $base && $c->{token};
+        return curl_json("$base/message?token=$c->{token}",
+            { title => $title, message => $body, priority => int($c->{priority} // ($state eq 'CLEARED' ? 4 : 8)) });
+    }
+    if ($ch eq 'webhook') {
+        die "url missing\n" unless $c->{url};
+        my @h = $c->{secret} ? ('-H', "X-Webhook-Secret: $c->{secret}") : ();
+        return curl_json($c->{url}, {
+            source => 'modern-smokeping', test => ($test ? JSON::PP::true : JSON::PP::false),
+            alert => $alert, target => $target, host => $host, state => $state,
+            loss => $loss, rtt => $rtt, time => $when, title => $title, message => $body,
+        }, @h);
+    }
+    die "unknown channel\n";
+}
+
+sub curl_json {
+    my ($url, $payload, @extra) = @_;
+    die "url missing\n" unless $url;
+    return curl_raw($url, $json->encode($payload), '-H', 'Content-Type: application/json', @extra);
+}
+
+sub curl_raw {
+    my ($url, $data, @extra) = @_;
+    die "url must be http(s)\n" unless $url =~ m{^https?://};
+    my @cmd = ($CURL, '-sS', '-m', '20', '-o', '/dev/null', '-w', '%{http_code}',
+               '-X', 'POST', '--data-binary', '@-', @extra, $url);
+    my $pid = open(my $out, '-|') // die "fork: $!\n";
+    if (!$pid) {
+        # child: feed data on stdin
+        my $cpid = open(my $to, '|-', @cmd) or die "curl: $!\n";
+        print $to $data;
+        close $to;
+        exit($? >> 8);
+    }
+    my $code = <$out> // '';
+    close $out;
+    my $rc = $? >> 8;
+    $code =~ s/\D//g;
+    return ($rc == 0 && $code =~ /^2\d\d$/ ? 1 : 0, "HTTP $code" . ($rc ? " (curl rc=$rc)" : ''));
+}
+
+sub logline {
+    my $l = shift;
+    if (open my $fh, '>>', $LOG) { print $fh "$when $l\n"; close $fh }
+}
+
+sub exit_with { my ($m, $rc) = @_; print "$m\n"; exit $rc }

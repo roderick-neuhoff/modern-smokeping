@@ -4,18 +4,73 @@ set -e
 
 echo "[smokeping-modern] installing UI + API"
 
-mkdir -p /config/site-confs /config/log
+mkdir -p /config/site-confs /config/log /config/modern-auth
 # remove the pre-rename filename if upgrading
 rm -f /config/site-confs/smokeping-modern.conf
 install -m 0644 /app/smokeping-modern/apache/zz-smokeping-modern.conf \
     /config/site-confs/zz-smokeping-modern.conf
 
+# --- login ------------------------------------------------------------
+# WEBUI_AUTH=off disables it. WEBUI_USER / WEBUI_PASS set the credentials;
+# with no WEBUI_PASS a random one is generated once and kept in
+# /config/modern-auth/password.txt
+AUTH_INC=/config/site-confs/modern-auth.inc
+HTPASSWD=/config/modern-auth/htpasswd
+if [[ "${WEBUI_AUTH:-on}" == "off" ]]; then
+    rm -f "$AUTH_INC"
+    echo "[smokeping-modern] WEBUI_AUTH=off - no login required"
+else
+    WEBUI_USER="${WEBUI_USER:-admin}"
+    if [[ -n "${WEBUI_PASS}" ]]; then
+        htpasswd -bB -c "$HTPASSWD" "$WEBUI_USER" "$WEBUI_PASS" >/dev/null 2>&1
+        rm -f /config/modern-auth/password.txt
+    elif [[ ! -s "$HTPASSWD" ]]; then
+        GEN=$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 14)
+        htpasswd -bB -c "$HTPASSWD" "$WEBUI_USER" "$GEN" >/dev/null 2>&1
+        printf '%s\n' "$GEN" > /config/modern-auth/password.txt
+        echo "[smokeping-modern] generated login: user=$WEBUI_USER password=$GEN (saved to /config/modern-auth/password.txt)"
+    fi
+    cat > "$AUTH_INC" <<EOF
+# written by modern-smokeping init - do not edit (set WEBUI_USER/WEBUI_PASS/WEBUI_AUTH instead)
+<Location /modern>
+    AuthType Basic
+    AuthName "SmokePing"
+    AuthUserFile $HTPASSWD
+    Require valid-user
+</Location>
+<Location /api>
+    AuthType Basic
+    AuthName "SmokePing"
+    AuthUserFile $HTPASSWD
+    Require valid-user
+</Location>
+<Location /smokeping>
+    AuthType Basic
+    AuthName "SmokePing"
+    AuthUserFile $HTPASSWD
+    Require valid-user
+</Location>
+EOF
+    echo "[smokeping-modern] login enabled for user '$WEBUI_USER'"
+fi
+
+# --- mail: let the Settings page edit ssmtp live --------------------------
+[[ -e /config/ssmtp.conf ]] || cp /defaults/smoke-conf/ssmtp.conf /config/ssmtp.conf 2>/dev/null || true
+ln -sf /config/ssmtp.conf /etc/ssmtp/ssmtp.conf
+
+# --- state files used by the UI ----------------------------------------------
+[[ -s /config/modern-notify.json ]] || echo '{}' > /config/modern-notify.json
+[[ -s /config/modern-acks.json ]]   || echo '{}' > /config/modern-acks.json
+
 # alert history log (SmokePing has no alert db - see svc-smokeping override)
-touch /config/log/smokeping.log
+touch /config/log/smokeping.log /config/log/notify.log
 
-chmod +x /app/smokeping-modern/api/smokeping-api.cgi
+chmod +x /app/smokeping-modern/api/smokeping-api.cgi /app/smokeping-modern/bin/notify
+chmod 0640 /config/ssmtp.conf /config/modern-notify.json 2>/dev/null || true
 
-lsiown -R abc:abc /app/smokeping-modern /config/log /config/site-confs 2>/dev/null || \
-    chown -R abc:abc /app/smokeping-modern /config/log /config/site-confs || true
+lsiown -R abc:abc /app/smokeping-modern /config/log /config/site-confs /config/modern-auth \
+    /config/ssmtp.conf /config/modern-notify.json /config/modern-acks.json 2>/dev/null || \
+    chown -R abc:abc /app/smokeping-modern /config/log /config/site-confs /config/modern-auth \
+    /config/ssmtp.conf /config/modern-notify.json /config/modern-acks.json || true
 
 echo "[smokeping-modern] ready - UI at /modern/ , API at /api/"

@@ -48,9 +48,28 @@ my $JSON = JSON::PP->new->utf8->canonical(0)->allow_blessed(1)->convert_blessed(
 sub run {
     my $path = $ENV{PATH_INFO} || '';
     $path =~ s{^/+}{};
-    my ($route) = split m{/}, $path;
+    my ($route, @rest) = split m{/}, $path;
     $route ||= 'health';
     my $q = _query();
+    my $method = uc($ENV{REQUEST_METHOD} || 'GET');
+
+    # everything that writes (settings, config files, acks, tests, reload)
+    # lives in SmokepingModern::Admin
+    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me);
+    if ($admin{$route}) {
+        my ($status, $body) = eval {
+            require SmokepingModern::Admin;
+            SmokepingModern::Admin::handle($method, $route, \@rest, $q, _read_body(), $JSON);
+        };
+        if ($@) {
+            my $e = $@;
+            ($status, $body) = ref $e eq 'HASH' ? ($e->{status} || 500, { error => $e->{error} || 'error' })
+                                                : (500, { error => "$e" });
+        }
+        _invalidate_cache() if $status == 200 && $method ne 'GET';
+        _emit($status, $body);
+        return;
+    }
 
     my %ttl = (tree => 20, summary => 25, alerts => 25);
     my $data = eval {
@@ -79,14 +98,30 @@ sub run {
 
 sub _emit {
     my ($status, $body) = @_;
-    my %text = (200 => 'OK', 404 => 'Not Found', 500 => 'Internal Server Error');
+    my %text = (200 => 'OK', 400 => 'Bad Request', 403 => 'Forbidden', 404 => 'Not Found',
+                405 => 'Method Not Allowed', 422 => 'Unprocessable Entity', 500 => 'Internal Server Error');
     print "Status: $status " . ($text{$status} || 'OK') . "\r\n";
     print "Content-Type: application/json; charset=utf-8\r\n";
     print "Cache-Control: no-store\r\n";
-    print "Access-Control-Allow-Origin: *\r\n";
     print "\r\n";
     print $JSON->encode($body);
 }
+
+# JSON request body (POST/PUT/DELETE). Under FCGI, STDIN is bound per request.
+sub _read_body {
+    my $len = $ENV{CONTENT_LENGTH} || 0;
+    return undef unless $len > 0;
+    die { status => 400, error => 'body too large' } if $len > 1_000_000;
+    my $raw = '';
+    my $got = read(STDIN, $raw, $len);
+    return undef unless defined $got && length $raw;
+    my $d = eval { $JSON->decode($raw) };
+    die { status => 400, error => 'invalid JSON body' } unless $d;
+    return $d;
+}
+
+# after a config write the cached tree/summary/alerts are stale
+sub _invalidate_cache { unlink glob('/tmp/spm-cache-*.json'); }
 
 # tiny on-disk response cache so a room full of dashboards does not stampede
 # the rrd files. keyed by route; node detail is never cached.

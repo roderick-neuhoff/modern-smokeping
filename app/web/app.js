@@ -11,7 +11,7 @@ const state = {
   alerts: null,
   bySeverity: {},      // path -> severity (from summary)
   collapsed: loadSet('sp.collapsed'),
-  silenced: loadSet('sp.silenced'),
+  acks: {},             // server-side acknowledgements: key -> {until, note, by}
   filter: '',
   sort: localStorage.getItem('sp.sort') || 'severity',
   online: true,
@@ -50,16 +50,26 @@ function ago(ts) {
   return Math.round(s / 86400) + 'd ago';
 }
 
-async function api(path, { retries = 1 } = {}) {
+async function api(path, { retries = 1, method = 'GET', body = null, timeout = FETCH_TIMEOUT_MS } = {}) {
   let lastErr;
+  const write = method !== 'GET';
+  if (write) retries = 0;                       // never replay a write
   for (let attempt = 0; attempt <= retries; attempt++) {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    const timer = setTimeout(() => ctrl.abort(), timeout);
     try {
-      const r = await fetch(API + path, { headers: { accept: 'application/json' }, signal: ctrl.signal });
+      const headers = { accept: 'application/json' };
+      if (write) { headers['content-type'] = 'application/json'; headers['x-requested-with'] = 'modern-smokeping'; }
+      const r = await fetch(API + path, { method, headers, body: body == null ? undefined : JSON.stringify(body), signal: ctrl.signal });
       clearTimeout(timer);
-      if (!r.ok) throw new Error(`${path} -> ${r.status}`);
-      return await r.json();
+      let data = null;
+      try { data = await r.json(); } catch { /* non-JSON error page */ }
+      if (!r.ok) {
+        const err = new Error((data && data.error) || `${path} -> ${r.status}`);
+        err.status = r.status; err.data = data;
+        throw err;
+      }
+      return data;
     } catch (e) {
       clearTimeout(timer);
       lastErr = e;
@@ -68,6 +78,7 @@ async function api(path, { retries = 1 } = {}) {
   }
   throw lastErr;
 }
+const post = (path, body, opts = {}) => api(path, { method: 'POST', body, timeout: 90_000, ...opts });
 
 // --- data refresh -------------------------------------------------
 
@@ -80,12 +91,14 @@ async function refresh() {
   refreshing = (async () => {
     let failed = null;
     try {
-      const [summary, alerts] = await Promise.all([
+      const [summary, alerts, acks] = await Promise.all([
         api('/summary', { retries: 2 }).catch(e => { throw tag(e, '/api/summary'); }),
         api('/alerts',  { retries: 2 }).catch(e => { throw tag(e, '/api/alerts'); }),
+        api('/acks').catch(() => null),          // optional - older API or auth hiccup
       ]);
       state.summary = summary;
       state.alerts = alerts;
+      if (acks && acks.acks) state.acks = acks.acks;
       state.bySeverity = {};
       for (const n of summary.nodes) state.bySeverity[n.path] = n.severity;
       setOnline(true);
@@ -152,7 +165,7 @@ function renderStatusPills() {
   const host = document.getElementById('statusPills');
   const c = (state.summary && state.summary.counts) || {};
   const alertCount = (state.alerts && state.alerts.active || [])
-    .filter(a => !state.silenced.has(a.path + '::' + a.alert)).length;
+    .filter(a => !isAcked(a)).length;
   host.innerHTML = '';
   const defs = [
     ['ok', c.ok || 0, '#/'],
@@ -180,6 +193,8 @@ function renderTree() {
   if (!state.tree) return;
   host.append(treeRow({ name: 'Dashboard', path: '#/', menu: 'Dashboard', _link: '#/' }, 0, true));
   host.append(treeRow({ name: 'Alerts', path: '#/alerts', menu: 'Alerts', _link: '#/alerts' }, 0, true));
+  host.append(treeRow({ name: 'Wall', path: '#/wall', menu: 'Wall display', _link: '#/wall' }, 0, true));
+  host.append(treeRow({ name: 'Settings', path: '#/settings', menu: 'Settings', _link: '#/settings' }, 0, true));
   host.append(el('div', { class: 'tree-children', style: 'margin:6px 0;border:0' },
     ...state.tree.root.children.map(c => treeNode(c, 0))));
   decorateTree();
@@ -261,9 +276,10 @@ function decorateTree() {
 
   const cur = location.hash.startsWith('#/node/') ? location.hash.slice(6) : null;
   document.querySelectorAll('.tree-row').forEach(r => {
+    const nav = r.dataset.navlink;
     r.classList.toggle('is-current',
       (cur && r.dataset.path === cur) ||
-      (r.dataset.navlink && r.dataset.navlink === location.hash));
+      (nav && (nav === '#/' ? (location.hash === '' || location.hash === '#/') : location.hash.startsWith(nav))));
   });
 }
 function cssEsc(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/["\\]/g, '\\$&'); }
@@ -295,13 +311,18 @@ function currentRoute() {
     const qs = new URLSearchParams(h.split('?')[1] || '');
     return { name: 'alerts', sev: qs.get('sev') || 'all' };
   }
+  if (h.startsWith('#/settings')) return { name: 'settings', tab: (h.split('/')[2] || 'mail').split('?')[0] };
+  if (h.startsWith('#/wall')) return { name: 'wall' };
   return { name: 'dashboard' };
 }
 
 function render() {
   const r = currentRoute();
+  document.body.classList.toggle('wall-mode', r.name === 'wall');
   if (r.name === 'node') renderNode(r.path);
   else if (r.name === 'alerts') renderAlerts(r.sev);
+  else if (r.name === 'settings') renderSettings(r.tab);
+  else if (r.name === 'wall') renderWall();
   else renderDashboard();
   decorateTree();
   closeDrawer();
@@ -539,26 +560,24 @@ function renderAlerts(sevFilter) {
     const sparks = [];
     rows.forEach((r, i) => {
       const key = r.path + '::' + r.alert;
-      const muted = state.silenced.has(key);
+      const ack = ackFor(r);
       const cv = el('canvas', { class: 'minispark' });
       sparks.push([cv, r]);
-      tb.append(el('tr', { class: muted ? 'row-muted' : '' },
+      tb.append(el('tr', { class: ack ? 'row-muted' : '' },
         el('td', {}, el('span', { class: `statusbadge ${r.severity}` }, el('span', { class: 'dot' }), SEV_LABEL[r.severity] || r.severity)),
         el('td', {}, el('a', { href: '#/node' + r.path }, r.target),
-          r.comment ? el('div', { style: 'color:var(--text-faint);font-size:12px' }, r.comment) : null),
+          r.comment ? el('div', { style: 'color:var(--text-faint);font-size:12px' }, r.comment) : null,
+          ack ? el('div', { style: 'color:var(--text-faint);font-size:12px' },
+            `acked by ${ack.by}${ack.until ? ' until ' + new Date(ack.until * 1000).toLocaleString() : ' (no expiry)'}${ack.note ? ' — ' + ack.note : ''}`) : null),
         el('td', {}, r.alert),
         el('td', {}, r.type),
         el('td', { class: 'num' }, fmtPct(r.currentLossPct)),
         el('td', { class: 'num' }, fmtMs(r.currentRttMs)),
         el('td', {}, cv),
         el('td', {}, r.pattern ? el('span', { class: 'pattern' }, r.pattern) : '–'),
-        el('td', {}, el('button', {
-          class: 'chip', onclick: () => {
-            if (muted) state.silenced.delete(key); else state.silenced.add(key);
-            saveSet('sp.silenced', state.silenced);
-            renderAlerts(sevFilter); renderStatusPills();
-          },
-        }, muted ? 'Unsilence' : 'Silence')),
+        el('td', {}, ack
+          ? el('button', { class: 'chip', onclick: () => unack(key).then(() => renderAlerts(sevFilter)) }, 'Un-ack')
+          : el('button', { class: 'chip', onclick: () => ackDialog(key, r.target + ' · ' + r.alert).then(ok => ok && renderAlerts(sevFilter)) }, 'Acknowledge')),
       ));
     });
     tbl.append(tb);
@@ -607,6 +626,303 @@ function seriesFromSamples(r) {
   const rtt = r.rttSamples || [];
   const t = loss.map((_, i) => i);
   return { t, median: rtt, loss, p20: rtt, p50: rtt, p80: rtt, pmax: rtt };
+}
+
+// --- acknowledgements (server-side, shared by everyone) --------------
+
+function ackFor(a) {
+  const now = Date.now() / 1000;
+  const k1 = state.acks[a.path + '::' + a.alert], k2 = state.acks[a.path];
+  const live = (x) => x && (!x.until || x.until > now) ? x : null;
+  return live(k1) || live(k2);
+}
+function isAcked(a) { return !!ackFor(a); }
+
+async function unack(key) {
+  try { const r = await post('/acks/delete', { key }); state.acks = r.acks || {}; renderStatusPills(); }
+  catch (e) { toast('Could not remove ack: ' + e.message, true); }
+}
+
+function ackDialog(key, label) {
+  return new Promise(resolve => {
+    const box = el('div', { class: 'modal-scrim' });
+    let hours = 8, note = '';
+    const opts = [[1, '1 h'], [8, '8 h'], [24, '24 h'], [168, '7 d'], [0, 'until cleared manually']];
+    const seg = el('div', { class: 'seg', style: 'flex-wrap:wrap' }, ...opts.map(([h, l]) => el('button', {
+      class: h === hours ? 'on' : '', onclick: (e) => { hours = h; [...seg.children].forEach(b => b.classList.toggle('on', b === e.currentTarget)); },
+    }, l)));
+    const noteEl = el('input', { type: 'text', placeholder: 'note (optional) — e.g. ISP maintenance', maxlength: '200', oninput: e => note = e.target.value });
+    const close = (ok) => { box.remove(); resolve(ok); };
+    box.append(el('div', { class: 'modal' },
+      el('h3', {}, 'Acknowledge alert'),
+      el('p', { class: 'sub' }, label),
+      el('label', {}, 'Silence for'), seg,
+      noteEl,
+      el('div', { class: 'modal-actions' },
+        el('button', { class: 'chip', onclick: () => close(false) }, 'Cancel'),
+        el('button', { class: 'chip on', onclick: async () => {
+          try { const r = await post('/acks', { key, hours, note }); state.acks = r.acks || {}; renderStatusPills(); close(true); }
+          catch (e) { toast('Ack failed: ' + e.message, true); }
+        } }, 'Acknowledge'))));
+    document.body.append(box);
+    noteEl.focus();
+  });
+}
+
+function toast(msg, bad) {
+  const t = el('div', { class: 'toast' + (bad ? ' bad' : '') }, msg);
+  document.body.append(t);
+  setTimeout(() => t.classList.add('show'), 10);
+  setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, bad ? 6000 : 3000);
+}
+
+// --- settings view --------------------------------------------------
+
+const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Add target'], ['config', 'Config files'], ['access', 'Access']];
+let settingsData = null;
+
+async function renderSettings(tab) {
+  const main = document.getElementById('main');
+  main.innerHTML = '<div class="loading">Loading settings…</div>';
+  try { settingsData = await api('/settings'); }
+  catch (e) {
+    main.innerHTML = `<div class="empty">Settings unavailable: ${e.message}${e.status === 403 || e.status === 401 ? '<br>Log in to change settings.' : ''}</div>`;
+    return;
+  }
+  main.innerHTML = '';
+  main.append(el('div', { class: 'page-head' }, el('h1', {}, 'Settings'),
+    settingsData.user ? el('span', { class: 'sub' }, 'signed in as ' + settingsData.user) : null));
+  main.append(el('div', { class: 'seg', style: 'margin-bottom:16px' }, ...SETTINGS_TABS.map(([k, l]) =>
+    el('a', { class: 'segbtn' + (tab === k ? ' on' : ''), href: '#/settings/' + k }, l))));
+  const pane = el('div', { class: 'settings-pane' });
+  main.append(pane);
+  ({ mail: paneMail, notify: paneNotify, targets: paneTargets, config: paneConfig, access: paneAccess }[tab] || paneMail)(pane);
+}
+
+function field(label, input, help) {
+  return el('label', { class: 'field' }, el('span', { class: 'field-label' }, label), input,
+    help ? el('span', { class: 'field-help' }, help) : null);
+}
+function input(attrs) { return el('input', { class: 'input', ...attrs }); }
+function resultBox() { return el('pre', { class: 'result', hidden: 'hidden' }); }
+function showResult(box, r, okText) {
+  box.hidden = false;
+  const chk = r.check ? `\ncheck: ${r.check.ok ? 'OK' : 'FAILED'}${r.check.output ? '\n' + r.check.output : ''}` : '';
+  const rl = r.reload ? `\nreload: ${r.reload.note || (r.reload.ok ? 'ok' : 'failed')}` : '';
+  box.className = 'result ' + (r.ok ? 'ok' : 'bad');
+  box.textContent = (r.ok ? (okText || 'Saved.') : (r.error || 'Failed.')) + chk + rl + (r.output ? '\n' + r.output : '');
+}
+
+function paneMail(pane) {
+  const s = settingsData.smtp, a = settingsData.alerts;
+  const f = {
+    host: input({ value: s.host, placeholder: 'smtp.gmail.com' }),
+    port: input({ type: 'number', value: s.port, style: 'width:100px' }),
+    starttls: el('input', { type: 'checkbox' }), tls: el('input', { type: 'checkbox' }),
+    authUser: input({ value: s.authUser, placeholder: 'you@example.com', autocomplete: 'off' }),
+    authPass: input({ type: 'password', placeholder: s.passSet ? '•••••••• (unchanged)' : 'app password', autocomplete: 'new-password' }),
+    from: input({ value: a.from, placeholder: 'smokeping@yourdomain' }),
+    to: el('textarea', { class: 'input', rows: '3', placeholder: 'one address per line' }),
+    webhooks: el('input', { type: 'checkbox' }),
+    testTo: input({ value: (a.to && a.to[0]) || '', placeholder: 'send test to…' }),
+  };
+  f.starttls.checked = s.starttls === true; f.tls.checked = s.tls === true;
+  f.to.value = (a.to || []).join('\n'); f.webhooks.checked = a.webhooks === true;
+  const res = resultBox(), testRes = resultBox();
+
+  pane.append(el('div', { class: 'card-plain' },
+    el('h2', {}, 'Outgoing mail (SMTP)'),
+    el('p', { class: 'sub' }, 'SmokePing sends alert e-mails through ssmtp. Gmail: smtp.gmail.com, port 587, STARTTLS, an app password.'),
+    el('div', { class: 'form-grid' },
+      field('Mail server', f.host), field('Port', f.port),
+      field('STARTTLS', f.starttls, 'usually on for port 587'), field('TLS (implicit)', f.tls, 'for port 465'),
+      field('Username', f.authUser), field('Password', f.authPass, 'leave blank to keep the current one'),
+      field('From address', f.from)),
+    el('h2', {}, 'Alert recipients'),
+    el('div', { class: 'form-grid' },
+      field('E-mail alerts to', f.to),
+      field('Webhook notifications', f.webhooks, 'also pipe every alert to the Notifications channels')),
+    el('div', { class: 'modal-actions' },
+      el('button', { class: 'chip on', onclick: async (e) => {
+        e.currentTarget.disabled = true;
+        try {
+          const r = await post('/settings/smtp', {
+            host: f.host.value, port: +f.port.value, starttls: f.starttls.checked, tls: f.tls.checked,
+            authUser: f.authUser.value, authPass: f.authPass.value, from: f.from.value,
+            to: f.to.value.split(/\n|,/).map(x => x.trim()).filter(Boolean), webhooks: f.webhooks.checked,
+          });
+          showResult(res, r, 'Saved. SmokePing reloaded.'); f.authPass.value = '';
+        } catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
+        e.currentTarget.disabled = false;
+      } }, 'Save mail settings')),
+    res,
+    el('h2', {}, 'Send a test e-mail'),
+    el('div', { class: 'form-grid' }, field('To', f.testTo)),
+    el('div', { class: 'modal-actions' }, el('button', { class: 'chip', onclick: async (e) => {
+      e.currentTarget.disabled = true; testRes.hidden = false; testRes.textContent = 'Sending…'; testRes.className = 'result';
+      try { showResult(testRes, await post('/test/mail', { to: f.testTo.value }), 'Test mail handed to the mail server.'); }
+      catch (err) { showResult(testRes, { ok: false, error: err.message, ...(err.data || {}) }); }
+      e.currentTarget.disabled = false;
+    } }, 'Send test')),
+    testRes));
+}
+
+const CHANNELS = [
+  ['discord',  'Discord',  [['url', 'Webhook URL', 'https://discord.com/api/webhooks/…']]],
+  ['slack',    'Slack',    [['url', 'Incoming webhook URL', 'https://hooks.slack.com/services/…']]],
+  ['telegram', 'Telegram', [['token', 'Bot token', '123456:ABC…'], ['chatId', 'Chat ID', '-100123…']]],
+  ['ntfy',     'ntfy',     [['url', 'Server', 'https://ntfy.sh'], ['topic', 'Topic', 'smokeping-alerts'], ['token', 'Access token (optional)', '']]],
+  ['gotify',   'Gotify',   [['url', 'Server', 'https://gotify.example.com'], ['token', 'App token', ''], ['priority', 'Priority (1-10)', '8']]],
+  ['webhook',  'Generic webhook', [['url', 'URL (JSON POST)', 'https://…'], ['secret', 'X-Webhook-Secret header (optional)', '']]],
+];
+
+function paneNotify(pane) {
+  const n = settingsData.notify || {};
+  const res = resultBox();
+  const forms = {};
+  const cards = CHANNELS.map(([key, label, fields]) => {
+    const c = n[key] || {};
+    const en = el('input', { type: 'checkbox' }); en.checked = c.enabled === true;
+    const inputs = {};
+    const tRes = resultBox();
+    for (const [fk, fl, ph] of fields) inputs[fk] = input({ value: c[fk] ?? '', placeholder: ph, type: /token|secret/.test(fk) ? 'password' : 'text', autocomplete: 'off' });
+    forms[key] = { en, inputs };
+    return el('div', { class: 'card-plain' },
+      el('div', { class: 'card-top' }, el('h2', { style: 'margin:0' }, label), el('span', { class: 'spacer', style: 'flex:1' }),
+        el('label', { class: 'switch' }, en, ' enabled')),
+      el('div', { class: 'form-grid' }, ...fields.map(([fk, fl]) => field(fl, inputs[fk]))),
+      el('div', { class: 'modal-actions' }, el('button', { class: 'chip', onclick: async (e) => {
+        e.currentTarget.disabled = true; tRes.hidden = false; tRes.className = 'result'; tRes.textContent = 'Saving + sending test…';
+        try {
+          await saveNotify();
+          showResult(tRes, await post('/test/notify', { channel: key }), 'Test sent.');
+        } catch (err) { showResult(tRes, { ok: false, error: err.message, ...(err.data || {}) }); }
+        e.currentTarget.disabled = false;
+      } }, 'Save & send test')),
+      tRes);
+  });
+  const saveNotify = async () => {
+    const body = {};
+    for (const [key] of CHANNELS) {
+      const f = forms[key]; const o = { enabled: f.en.checked };
+      for (const [fk, v] of Object.entries(f.inputs)) o[fk] = v.value.trim();
+      body[key] = o;
+    }
+    const r = await post('/settings/notify', body);
+    settingsData.notify = r.notify;
+    return r;
+  };
+  pane.append(el('p', { class: 'sub' },
+    'Alerts are pushed to every enabled channel when "Webhook notifications" is on under E-mail → Alert recipients. ',
+    settingsData.alerts.webhooks ? el('b', {}, 'Currently ON.') : el('b', { style: 'color:var(--warn)' }, 'Currently OFF — enable it there.')),
+    ...cards,
+    el('div', { class: 'modal-actions' }, el('button', { class: 'chip on', onclick: async (e) => {
+      e.currentTarget.disabled = true;
+      try { showResult(res, await saveNotify(), 'Notification settings saved.'); }
+      catch (err) { showResult(res, { ok: false, error: err.message }); }
+      e.currentTarget.disabled = false;
+    } }, 'Save all channels')), res);
+}
+
+function paneTargets(pane) {
+  const groups = [];
+  const walk = (node, depth) => { for (const c of (node.children || [])) { if (!c.isLeaf) { groups.push(c.path); walk(c, depth + 1); } } };
+  if (state.tree) walk(state.tree.root, 0);
+  const sel = el('select', { class: 'input' }, el('option', { value: '' }, '(top level)'), ...groups.map(g => el('option', { value: g }, g)));
+  const alertNames = ((state.alerts && state.alerts.active) || []).map(a => a.alert);
+  const f = {
+    parent: sel, key: input({ placeholder: 'MyRouter  (letters, digits, - _)' }),
+    menu: input({ placeholder: 'Menu label' }), title: input({ placeholder: 'Title shown on the page' }),
+    host: input({ placeholder: '192.168.1.1 or host.example.com' }),
+    probe: input({ placeholder: 'FPing (blank = inherit)' }),
+    alerts: input({ placeholder: 'hostdown,majorloss,… (blank = inherit)' }),
+  };
+  const res = resultBox();
+  pane.append(el('div', { class: 'card-plain' },
+    el('h2', {}, 'Add a target'),
+    el('p', { class: 'sub' }, 'Appends a target block to the Targets file, validates it with smokeping --check, then reloads. New targets start collecting within one poll cycle.'),
+    el('div', { class: 'form-grid' },
+      field('Group', f.parent), field('Key', f.key, 'becomes part of the path and the rrd filename'),
+      field('Menu', f.menu), field('Title', f.title), field('Host', f.host),
+      field('Probe', f.probe), field('Alerts', f.alerts)),
+    el('div', { class: 'modal-actions' }, el('button', { class: 'chip on', onclick: async (e) => {
+      e.currentTarget.disabled = true;
+      try {
+        const r = await post('/targets/add', {
+          parent: f.parent.value, key: f.key.value.trim(), menu: f.menu.value.trim(), title: f.title.value.trim(),
+          host: f.host.value.trim(), probe: f.probe.value.trim(),
+          alerts: f.alerts.value.split(',').map(x => x.trim()).filter(Boolean),
+        });
+        showResult(res, r, `Added ${r.path}. Reloading tree…`);
+        state.tree = await api('/tree'); renderTree();
+      } catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
+      e.currentTarget.disabled = false;
+    } }, 'Add target')), res));
+}
+
+function paneConfig(pane) {
+  const files = settingsData.editable || ['Targets', 'Alerts', 'Probes', 'Database', 'General', 'Presentation'];
+  const sel = el('select', { class: 'input', style: 'width:auto' }, ...files.map(f => el('option', { value: f }, f)));
+  const ta = el('textarea', { class: 'input code', rows: '24', spellcheck: 'false' });
+  const meta = el('span', { class: 'sub' });
+  const res = resultBox();
+  const load = async () => {
+    ta.value = 'loading…';
+    try { const r = await api('/config/' + sel.value); ta.value = r.text; meta.textContent = r.exists ? 'last modified ' + new Date(r.mtime * 1000).toLocaleString() : 'file does not exist yet'; }
+    catch (e) { ta.value = ''; meta.textContent = e.message; }
+  };
+  sel.addEventListener('change', load);
+  pane.append(el('div', { class: 'card-plain' },
+    el('div', { class: 'card-top' }, el('h2', { style: 'margin:0' }, 'Config file'), sel, meta),
+    el('p', { class: 'sub' }, 'Raw SmokePing config. On save the file is validated with smokeping --check; nothing is written if the check fails. A .bak copy of the previous version is kept next to it.'),
+    ta,
+    el('div', { class: 'modal-actions' },
+      el('button', { class: 'chip', onclick: load }, 'Revert'),
+      el('button', { class: 'chip on', onclick: async (e) => {
+        e.currentTarget.disabled = true; res.hidden = false; res.className = 'result'; res.textContent = 'Validating…';
+        try { showResult(res, await post('/config/' + sel.value, { text: ta.value }), 'Saved and reloaded.'); }
+        catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
+        e.currentTarget.disabled = false;
+      } }, 'Validate & save')),
+    res));
+  load();
+}
+
+function paneAccess(pane) {
+  pane.append(el('div', { class: 'card-plain' },
+    el('h2', {}, 'Login'),
+    el('p', {}, settingsData.user ? `You are signed in as ${settingsData.user}.` : 'Login is disabled (WEBUI_AUTH=off).'),
+    el('p', { class: 'sub' }, 'The UI, the API and the classic CGI share one HTTP Basic login. It is set from the container environment, not from here:'),
+    el('pre', { class: 'result ok', style: 'display:block' }, 'WEBUI_AUTH=on        # off disables the login\nWEBUI_USER=admin\nWEBUI_PASS=…          # blank = generated once, see /config/modern-auth/password.txt'),
+    el('p', { class: 'sub' }, 'Change the values in .env and restart the container. Sign out by closing the browser (Basic auth has no logout).')));
+}
+
+// --- wall display ---------------------------------------------------
+
+function renderWall() {
+  const main = document.getElementById('main');
+  const s = state.summary;
+  if (!s) { main.innerHTML = '<div class="loading">Loading…</div>'; return; }
+  const nodes = s.nodes.slice().sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity] || a.path.localeCompare(b.path));
+  const worst = nodes.length ? nodes[0].severity : 'unknown';
+  main.innerHTML = '';
+  main.append(el('div', { class: 'wall-head ' + worst },
+    el('span', { class: 'wall-title' }, state.tree && state.tree.title || 'SmokePing'),
+    el('span', { class: 'wall-counts' },
+      ...['ok', 'warning', 'critical', 'down'].map(k => el('span', { class: 'pill', 'data-sev': k }, el('span', { class: 'dot' }), `${SEV_LABEL[k]} ${s.counts[k] || 0}`))),
+    el('span', { class: 'wall-clock' }, new Date().toLocaleTimeString()),
+    el('a', { class: 'chip', href: '#/' }, 'exit')));
+  const grid = el('div', { class: 'wall-grid' });
+  const draws = [];
+  for (const n of nodes) {
+    const t = el('a', { class: 'wall-tile ' + n.severity, href: '#/node' + n.path },
+      el('div', { class: 'wall-tile-title' }, n.title),
+      el('div', { class: 'wall-tile-val' }, fmtMs(n.medianNowMs), el('small', {}, ' ' + fmtPct(n.lossNowPct) + ' loss')));
+    const cv = el('canvas', { class: 'spark', style: 'height:38px' });
+    t.append(cv); draws.push([cv, n.spark]); grid.append(t);
+  }
+  main.append(grid);
+  requestAnimationFrame(() => { for (const [cv, sp] of draws) if (sp) drawSpark(cv, sp); });
 }
 
 // --- drawer / theme -----------------------------------------

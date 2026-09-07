@@ -896,9 +896,12 @@ function paneMail(pane) {
       const st = await post('/oauth/authorize', { provider, clientId: f.clientId.value.trim(), tenant: f.tenant.value.trim(),
         clientSecret: f.clientSecret.value, publicBase: f.publicBase.value.trim() });
       window.open(st.url, '_blank', 'noopener');
+      const regHint = st.viaCallback
+        ? `If Microsoft says "AADSTS500113: No reply address is registered", add ${st.redirectUri} under Authentication → Add a platform → Web, save, and click Sign in again.`
+        : `If Microsoft says "AADSTS500113: No reply address is registered", add ${st.redirectUri} under Authentication → Add a platform → Mobile and desktop applications, save, and click Sign in again.`;
       if (st.viaCallback) {
         signInRes.className = 'result ok';
-        signInRes.textContent = `Sign-in page opened in a new tab. Sign in, review the permissions, click Accept. You will be sent back to ${st.redirectUri} and this page updates by itself…`;
+        signInRes.textContent = `Sign-in page opened in a new tab. Sign in, review the permissions, click Accept. You will be sent back to ${st.redirectUri} and this page updates by itself… ${regHint}`;
         const t0 = Date.now();
         statusPoll = setInterval(async () => {
           try {
@@ -909,7 +912,7 @@ function paneMail(pane) {
         }, 3000);
       } else {
         signInRes.className = 'result ok';
-        signInRes.textContent = `Sign-in page opened in a new tab. Sign in, review the permissions, click Accept. Because this SmokePing has no public https address, Microsoft lands on its own blank page (${st.redirectUri}) — paste that page's address below.`;
+        signInRes.textContent = `Sign-in page opened in a new tab. Sign in, review the permissions, click Accept. Because this SmokePing has no public https address, Microsoft lands on its own blank page (${st.redirectUri}) — paste that page's address below. ${regHint}`;
         pasteBox.hidden = false; pasteTa.value = ''; pasteTa.focus(); signInBtn.disabled = false;
       }
     } catch (err) { signInRes.className = 'result bad'; signInRes.textContent = err.message; signInBtn.disabled = false; }

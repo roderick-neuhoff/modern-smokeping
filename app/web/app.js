@@ -820,7 +820,8 @@ function paneMail(pane) {
     host: input({ value: s.host, placeholder: 'smtp.gmail.com' }),
     port: input({ type: 'number', value: s.port, style: 'width:100px' }),
     starttls: el('input', { type: 'checkbox' }), tls: el('input', { type: 'checkbox' }),
-    authUser: input({ value: s.authUser || o.account || '', placeholder: 'you@example.com', autocomplete: 'off' }),
+    authUser: input({ value: s.authUser || '', placeholder: 'you@example.com', autocomplete: 'off' }),
+    oauthUser: input({ value: o.account || s.authUser || '', placeholder: 'alerts@yourdomain.com', autocomplete: 'off' }),
     authPass: input({ type: 'password', placeholder: s.passSet ? '•••••••• (unchanged)' : 'app password', autocomplete: 'new-password' }),
     from: input({ value: a.from, placeholder: 'smokeping@yourdomain' }),
     to: el('textarea', { class: 'input', rows: '3', placeholder: 'one address per line' }),
@@ -855,10 +856,7 @@ function paneMail(pane) {
           'New-ServicePrincipal -AppId <client ID> -ObjectId <object ID of the Enterprise application>\n' +
           'Add-MailboxPermission -Identity alerts@yourdomain.com -User <client ID> -AccessRights FullAccess\n' +
           'Set-CASMailbox -Identity alerts@yourdomain.com -SmtpClientAuthenticationDisabled $false')),
-      el('li', {}, 'Tenant must be your tenant ID or domain (e.g. ', el('span', { class: 'pattern' }, 'contoso.onmicrosoft.com'), '), not "common".')),
-    el('div', { class: 'form-grid' },
-      field('Tenant ID or domain', f.tenant), field('Application (client) ID', f.clientId),
-      field('Client secret', f.clientSecret), field('Send as mailbox (user)', f.authUser, 'the shared/user mailbox the app was granted')));
+      el('li', {}, 'Tenant must be your tenant ID or domain (e.g. ', el('span', { class: 'pattern' }, 'contoso.onmicrosoft.com'), '), not "common".')));
 
   const pwBox = el('div', { class: 'form-grid' },
     field('Username', f.authUser), field('Password', f.authPass, 'leave blank to keep the current one'));
@@ -868,22 +866,27 @@ function paneMail(pane) {
       el('b', {}, '1.'), ' Google Cloud Console → create an OAuth client (type "Desktop app"), enable the Gmail API.  ',
       el('b', {}, '2.'), ' Open the ', el('a', { href: 'https://developers.google.com/oauthplayground/', target: '_blank', rel: 'noopener' }, 'OAuth 2.0 Playground'),
       ', gear icon → "Use your own OAuth credentials", scope ', el('span', { class: 'pattern' }, 'https://mail.google.com/'), ', authorize, exchange for tokens.  ',
-      el('b', {}, '3.'), ' Paste the client ID, secret and refresh token here. The mailbox is the Google account you authorized.'),
-    el('div', { class: 'form-grid' },
-      field('Client ID', f.clientId), field('Client secret', f.clientSecret),
-      field('Refresh token', f.refreshToken), field('Mailbox (user)', f.authUser)));
+      el('b', {}, '3.'), ' Paste the client ID, secret and refresh token below. The mailbox is the Google account you authorized.'));
 
   const msBtn = el('button', { class: 'chip on', type: 'button' }, 'Connect with Microsoft');
   const msCode = el('div', { class: 'result ok', hidden: 'hidden' });
   const microsoftBox = el('div', {},
     el('p', { class: 'sub' }, 'Entra ID → App registrations → new app, "Public client" with the ',
       el('span', { class: 'pattern' }, 'https://outlook.office365.com/SMTP.Send'), ' delegated permission, and "Allow public client flows" = Yes. ',
-      'Also make sure SMTP AUTH is enabled for the mailbox in Exchange admin. Then click Connect and sign in on the page it shows.'),
-    el('div', { class: 'form-grid' },
-      field('Application (client) ID', f.clientId), field('Tenant', f.tenant, '"common" works for most; use your tenant ID for single-tenant apps'),
-      field('Client secret', f.clientSecret, 'only if your app is confidential (usually blank)'),
-      field('Mailbox (user)', f.authUser, 'filled in automatically after connecting')),
+      'Also make sure SMTP AUTH is enabled for the mailbox in Exchange admin. Fill in the fields below, then click Connect and sign in on the page it shows.'),
     el('div', { class: 'modal-actions', style: 'justify-content:flex-start' }, msBtn), msCode);
+
+  // the OAuth inputs exist exactly once; labels/visibility change per method
+  const oauthFields = el('div', { class: 'form-grid' },
+    field('Tenant', f.tenant), field('Client ID', f.clientId), field('Client secret', f.clientSecret),
+    field('Refresh token', f.refreshToken), field('Mailbox (user)', f.oauthUser));
+  const [oTenant, oClient, oSecret, oRefresh, oUser] = [...oauthFields.children];
+  const setLabel = (fieldEl, label, help) => {
+    fieldEl.querySelector('.field-label').textContent = label;
+    let h = fieldEl.querySelector('.field-help');
+    if (help) { if (!h) { h = el('span', { class: 'field-help' }); fieldEl.append(h); } h.textContent = help; }
+    else if (h) h.remove();
+  };
 
   msBtn.addEventListener('click', async () => {
     msBtn.disabled = true; msCode.hidden = false; msCode.className = 'result'; msCode.textContent = 'Requesting a sign-in code…';
@@ -899,7 +902,7 @@ function paneMail(pane) {
         const p = await post('/oauth/microsoft/poll', {});
         if (p.ok) {
           msCode.textContent = `Connected${p.account ? ' as ' + p.account : ''}. Now click "Save mail settings".`;
-          if (p.account && !f.authUser.value) f.authUser.value = p.account;
+          if (p.account && !f.oauthUser.value) f.oauthUser.value = p.account;
           o.refreshTokenSet = true; status.textContent = `Connected${p.account ? ' as ' + p.account : ''}`; status.style.color = 'var(--ok)';
           break;
         }
@@ -921,7 +924,7 @@ function paneMail(pane) {
       catch (err) { toast(err.message, true); }
     } }, 'Forget OAuth2'));
 
-  const oauthWrap = el('div', {}, status, googleBox, appBox, microsoftBox, oauthTools, oRes);
+  const oauthWrap = el('div', {}, status, googleBox, appBox, microsoftBox, oauthFields, oauthTools, oRes);
   const applyMethod = () => {
     const m = f.method.value;
     pwBox.hidden = m !== 'password';
@@ -929,6 +932,18 @@ function paneMail(pane) {
     googleBox.hidden = m !== 'oauth-google';
     appBox.hidden = m !== 'oauth-microsoft-app';
     microsoftBox.hidden = m !== 'oauth-microsoft';
+    oTenant.hidden = m === 'oauth-google';
+    oRefresh.hidden = m !== 'oauth-google';
+    if (m === 'oauth-google') {
+      setLabel(oClient, 'Client ID'); setLabel(oSecret, 'Client secret');
+      setLabel(oRefresh, 'Refresh token', 'from the OAuth 2.0 Playground'); setLabel(oUser, 'Mailbox (user)', 'the Google account you authorized');
+    } else if (m === 'oauth-microsoft-app') {
+      setLabel(oTenant, 'Tenant ID or domain', 'not "common"'); setLabel(oClient, 'Application (client) ID');
+      setLabel(oSecret, 'Client secret', 'the secret Value, not its ID'); setLabel(oUser, 'Send as mailbox (user)', 'the shared/user mailbox the app was granted');
+    } else if (m === 'oauth-microsoft') {
+      setLabel(oTenant, 'Tenant', '"common" works for most; tenant ID for single-tenant apps'); setLabel(oClient, 'Application (client) ID');
+      setLabel(oSecret, 'Client secret', 'only if the app is confidential (usually blank)'); setLabel(oUser, 'Mailbox (user)', 'filled in automatically after connecting');
+    }
     if (m === 'oauth-google' && !f.host.value) { f.host.value = 'smtp.gmail.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
     if (m.startsWith('oauth-microsoft') && (!f.host.value || f.host.value === 'smtp.gmail.com')) { f.host.value = 'smtp.office365.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
     if (m === 'oauth-microsoft-app' && (!f.tenant.value || f.tenant.value === 'common')) f.tenant.value = '';
@@ -956,7 +971,8 @@ function paneMail(pane) {
           const r = await post('/settings/smtp', {
             authMethod: f.method.value,
             host: f.host.value, port: +f.port.value, starttls: f.starttls.checked, tls: f.tls.checked,
-            authUser: f.authUser.value, authPass: f.authPass.value, from: f.from.value,
+            authUser: f.method.value === 'password' ? f.authUser.value : f.oauthUser.value,
+            authPass: f.authPass.value, from: f.from.value,
             oauth: { clientId: f.clientId.value.trim(), clientSecret: f.clientSecret.value, refreshToken: f.refreshToken.value.trim(), tenant: f.tenant.value.trim() },
             to: f.to.value.split(/\n|,/).map(x => x.trim()).filter(Boolean), webhooks: f.webhooks.checked,
           });
@@ -982,7 +998,7 @@ function paneMail(pane) {
     const body = { to };
     if (useForm) body.smtp = {
       authMethod: f.method.value, host: f.host.value, port: +f.port.value, starttls: f.starttls.checked, tls: f.tls.checked,
-      authUser: f.authUser.value, authPass: f.authPass.value, from: f.from.value,
+      authUser: f.method.value === 'password' ? f.authUser.value : f.oauthUser.value, authPass: f.authPass.value, from: f.from.value,
     };
     try {
       const r = await post('/test/mail', body);

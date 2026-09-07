@@ -1,200 +1,323 @@
 # modern-smokeping
 
-A modern, responsive web UI — **with a real alerts page** — for
-[LinuxServer.io SmokePing](https://github.com/linuxserver/docker-smokeping).
+A modern, responsive web UI for [SmokePing](https://oetiker.github.io/SmokePing/) —
+with a **real alerts page**, a **settings page** (SMTP, webhooks, targets, config
+editor), server-side acknowledgements and a wall display — packaged as a thin
+Docker layer on top of the official
+[LinuxServer.io SmokePing image](https://github.com/linuxserver/docker-smokeping).
 
-It ships as a thin Docker layer on top of `lscr.io/linuxserver/smokeping`. The
-SmokePing daemon, its config format, its rrd files and its alert matchers are
-untouched — this only adds a new front end and a small JSON API that reads the
-same data.
+The SmokePing daemon, its config format, its `.rrd` files and its alert matchers
+are untouched. This adds a front end and a small JSON API that read (and, behind a
+password, write) the same files. The classic CGI stays reachable at
+`/smokeping/smokeping.cgi`.
 
-|              | classic SmokePing CGI            | modern-smokeping                         |
-|--------------|----------------------------------|-----------------------------------------|
-| Layout       | frameset, fixed width            | responsive, mobile drawer               |
-| Theme        | one light theme                  | light / dark / auto, remembered         |
-| Graphs       | pre-rendered RRD PNGs            | live canvas smoke charts, hover readout  |
-| Alerts       | e-mail / log only, nothing in UI | **dedicated alerts page**, live state    |
-| Navigation   | full page reload per click       | single-page app, 60 s auto-refresh       |
+|              | classic SmokePing CGI            | modern-smokeping                                    |
+|--------------|----------------------------------|-----------------------------------------------------|
+| Layout       | frameset, fixed width            | responsive, mobile drawer, light / dark / auto      |
+| Graphs       | pre-rendered PNGs                | live canvas smoke charts, hover readout, drag-zoom  |
+| Alerts       | e-mail / log only                | **alerts page**: live state, history, acknowledgements |
+| Config       | edit files by hand               | **settings page**: SMTP, Discord/Telegram/ntfy/…, add & remove targets, validated config editor |
+| Navigation   | full page reload per click       | single-page app, 15 s auto-refresh, wall display    |
 
-The classic interface is still there at `/smokeping/smokeping.cgi`
-(shortcut: `/smokeping/legacy`).
+---
 
-## Quick start
+## Deploy
+
+### Requirements
+
+* Docker with the `docker compose` plugin (v2). `docker buildx` is **not** needed —
+  the deploy script uses the legacy builder, which matters on Unraid.
+* Outbound network from the host to pull `lscr.io/linuxserver/smokeping`.
+* One free TCP port (default `8480`). On Unraid, 80 and 443 belong to the web UI.
+
+### 1. Get the code
 
 ```bash
 git clone https://github.com/roderick-neuhoff/modern-smokeping
 cd modern-smokeping
-cp .env.example .env         # set CONFIG_DIR, DATA_DIR, HTTP_PORT, TZ
-./deploy.sh                  # build image + docker compose up -d
+cp .env.example .env
 ```
 
-Then open `http://<host>:<HTTP_PORT>/` — it redirects to the dashboard.
+### 2. Edit `.env`
 
-### Replacing an existing LinuxServer SmokePing container
+```ini
+# where SmokePing keeps its config and its rrd data on the host
+CONFIG_DIR=/mnt/user/appdata/smokeping/config
+DATA_DIR=/mnt/user/appdata/smokeping/data
 
-Point `CONFIG_DIR` / `DATA_DIR` in `.env` at the volumes your current
-`linuxserver/smokeping` container already uses, stop that container, and run
-`./deploy.sh`. Same config, same history, same port mapping (adjust `HTTP_PORT`).
+HTTP_PORT=8480            # host port; the container listens on 80
+PUID=99                   # user/group the files are owned by (99/100 = Unraid "nobody:users")
+PGID=100
+TZ=Europe/Amsterdam
 
-Rollback is just starting your old container again — nothing in `/config` or
-`/data` is modified in an incompatible way.
-
-## How it works
-
-```
-Dockerfile            FROM lscr.io/linuxserver/smokeping  + the files below
-app/web/              the single-page UI            -> served at /modern/  (and /)
-app/api/              smokeping-api.cgi (Perl)       -> served at /api/
-app/apache/           Apache alias / fcgid / rewrite snippet
-root/custom-cont-init.d/50-smokeping-modern
-                      drops the Apache snippet into /config/site-confs on boot
-root/etc/s6-overlay/s6-rc.d/svc-smokeping/run
-                      upstream run script + `--logfile` so alert history is kept
-config-sample/        starter Targets / Alerts / Database / Probes (10 s step)
-```
-
-### The API
-
-Everything the API needs already lives in the base image (`perl`, `RRDs`,
-`JSON::PP`, `FCGI`, the `Smokeping::*` modules). It runs under **mod_fcgid**, so
-each worker parses the SmokePing config once and then serves many requests
-(re-reading only when a file under `/config` changes); it falls back to plain CGI
-if `mod_fcgid` is absent. It **reuses** SmokePing's own code
-rather than reimplementing it:
-
-* `Smokeping::Info` — config parsing and numeric stats from the rrd files
-* `Smokeping::init_alerts` — compiles each `*** Alerts ***` entry into a coderef
-  and loads the `Smokeping::matchers::*` classes
-* `rrdtool` / `RRDs` — the smoke time series
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /api/health` | liveness + config sanity |
-| `GET /api/tree` | full target hierarchy |
-| `GET /api/summary` | status counts + worst offenders + per-target now/avg |
-| `GET /api/node?path=/A/B&range=3h` | stats + smoke series (`3h/30h/10d/360d`) |
-| `GET /api/alerts` | **live** alert state + history parsed from the log |
-
-### The alerts page
-
-SmokePing has no alert database — alerts only ever existed as e-mail and log
-lines. This page reconstructs the picture two ways:
-
-1. **Active alerts** — for every target that has `alerts = …`, the API pulls the
-   last *N* samples from its rrd, builds the exact data structure
-   `Smokeping::check_alerts` uses (`{ loss => [%], rtt => [s] }`) and runs the
-   compiled matcher. What you see is the *current* level state.
-2. **History** — raise/clear events parsed from `/config/log/smokeping.log`
-   (enabled by the bundled `svc-smokeping` override). Set `SMOKEPING_LOG` to
-   point somewhere else.
-
-Edge-triggered matchers (`edgetrigger = yes`) and the stateful "hold until
-cleared" behaviour can't be reproduced perfectly without the daemon's in-memory
-state, so treat *Active alerts* as "is this true right now", and *History* as
-the authoritative raise/clear record.
-
-Rows can be **silenced** (client-side, stored in your browser) to drop known
-issues out of the top-bar counts.
-
-## Settings page, login, notifications
-
-`#/settings` (also in the sidebar) is the write side of the UI. Every change is
-validated with `smokeping --check` **before** it is written, a `.bak` of the previous
-file is kept, and the daemon is reloaded with `SIGHUP` — no container restart.
-
-| Tab | What it does |
-|-----|--------------|
-| **E-mail** | SMTP server / port / STARTTLS / credentials (writes `ssmtp.conf`), the alert `from` address and recipient list, and a **Send test e-mail** button |
-| **Notifications** | Discord, Slack, Telegram, ntfy, Gotify and a generic JSON webhook — each with a **Save & send test** button. Turn on *Webhook notifications* under E-mail → Alert recipients to route alerts there (SmokePing pipes them to `bin/notify`) |
-| **Add target** | form that appends a target block under a chosen group, validates, reloads |
-| **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves` with validate-and-save |
-| **Access** | shows who you are and how the login is configured |
-
-**Login.** Viewing is open — dashboard, alerts, wall, the classic CGI and every
-read-only API route. One HTTP Basic password guards only what *changes* things
-(the Settings page, config files, add-target, test mail/notify, reload, and
-acknowledging alerts); the browser prompts the first time you open Settings:
-
-```
-WEBUI_AUTH=on        # off disables it entirely
+# password for the Settings page and every write (viewing stays open)
+WEBUI_AUTH=on             # off = no login anywhere
 WEBUI_USER=admin
-WEBUI_PASS=          # blank = a password is generated on first start,
-                     # printed in the container log and kept in
-                     # /config/modern-auth/password.txt
+WEBUI_PASS=               # blank = generated on first start (see step 4)
+
+BASE_TAG=latest           # lscr.io/linuxserver/smokeping tag to build on
 ```
 
-Mutating API calls additionally require the `X-Requested-With: modern-smokeping`
-header, so a cross-site form can't ride on cached credentials.
+`CONFIG_DIR` and `DATA_DIR` are created if missing. If you already run
+`linuxserver/smokeping`, point them at **its** volumes — see
+[Migrating](#migrating-from-linuxserversmokeping).
 
-**Acknowledgements.** *Acknowledge* on the Alerts page silences an alert
-server-side (1 h / 8 h / 24 h / 7 d / until cleared, with a note and the user
-who did it) — shared by everyone, stored in `/config/modern-acks.json`.
+### 3. Build and start
 
-**Wall display.** `#/wall` is a chrome-less tile view for a TV: every target as a
-coloured tile with current median, loss and a sparkline, plus a status header.
+```bash
+./deploy.sh
+```
 
-## What alerts should I configure?
+The script:
 
-`config-sample/Alerts` is a sensible starting set — copy it into your `/config`
-(the deploy script seeds it on first run only):
+1. creates the two directories,
+2. seeds `config-sample/*` (Targets, Alerts, Database, Probes) into `CONFIG_DIR` —
+   **only for files that don't exist yet**, it never overwrites,
+3. builds the image with the legacy builder (`DOCKER_BUILDKIT=0 docker build`),
+4. runs `docker compose up -d`.
+
+Without the script:
+
+```bash
+DOCKER_BUILDKIT=0 docker build -t modern-smokeping:latest .
+docker compose up -d
+```
+
+### 4. First login
+
+Open `http://<host>:8480/` — it redirects to the dashboard. Everything is viewable
+without a password. The first time you open **Settings** (or acknowledge an
+alert) you're asked for one:
+
+```bash
+docker logs smokeping 2>&1 | grep "generated login"
+# [smokeping-modern] generated login: user=admin password=XXXXXXXXXXXXXX
+#   (saved to /config/modern-auth/password.txt)
+```
+
+or `cat $CONFIG_DIR/modern-auth/password.txt`. To choose your own, set
+`WEBUI_PASS` in `.env` and `docker compose up -d`.
+
+First data points appear one poll cycle (10 s) after start; the `30h / 10d / 360d`
+ranges fill in over time.
+
+### 5. Verify
+
+```bash
+curl -s http://<host>:8480/api/health          # {"ok":true, "targets":8, ...}
+curl -s http://<host>:8480/api/summary | head -c 300
+docker exec smokeping tail -f /config/log/smokeping.log
+```
+
+---
+
+## Upgrading
+
+```bash
+cd modern-smokeping
+git pull
+./deploy.sh
+```
+
+`deploy.sh` rebuilds the image and `docker compose up -d` **recreates** the
+container (a plain `docker restart` would keep running the old image). Your
+`/config` and `/data` are volumes and survive; the Apache snippet and the
+`svc-smokeping` override are reinstalled from the image on every start.
+
+To follow a newer SmokePing base, bump `BASE_TAG` and redeploy.
+
+## Rollback
+
+Nothing in `/config` or `/data` is changed in a way the stock image can't read.
+To go back to plain LinuxServer SmokePing:
+
+```bash
+docker compose down
+docker run -d --name smokeping -p 8480:80 -e PUID=99 -e PGID=100 -e TZ=Europe/Amsterdam \
+  -v $CONFIG_DIR:/config -v $DATA_DIR:/data lscr.io/linuxserver/smokeping:latest
+```
+
+The extra files this project leaves in `/config` are harmless to the stock
+image: `site-confs/zz-smokeping-modern.conf`, `site-confs/modern-auth.inc`,
+`modern-auth/`, `modern-notify.json`, `modern-acks.json`, `log/`. Remove
+`site-confs/zz-smokeping-modern.conf` and `site-confs/modern-auth.inc` if you
+want the stock Apache config back exactly.
+
+## Migrating from linuxserver/smokeping
+
+1. Stop the old container (`docker stop <name>`).
+2. Set `CONFIG_DIR` / `DATA_DIR` in `.env` to the paths it used for `/config` and
+   `/data`, and `HTTP_PORT` to the port you had.
+3. `./deploy.sh`.
+
+Your targets, alerts, and all rrd history carry over unchanged. The sample
+config is **not** applied because your files already exist.
+
+> **Polling interval.** The bundled sample uses `step = 10` (poll every 10 s).
+> A migrated install keeps whatever `step` it had. Changing `step` later requires
+> deleting the `.rrd` files (rrdtool cannot re-step them) — see
+> [Polling interval](#polling-interval).
+
+## Backups
+
+Back up **`CONFIG_DIR`** (targets, alerts, SMTP settings, notification channels,
+acks, the login hash) and **`DATA_DIR`** (the rrd history). Both are plain
+directories — `tar`/`rsync` them; stop the container first if you want the rrd
+files quiescent, otherwise expect the last few seconds to be missing.
+
+---
+
+## Using it
+
+### Dashboard / target pages
+
+Cards per target with a loss-coloured sparkline; click one for the full smoke
+chart (median coloured by loss, symmetric min–max / p10–p90 / p20–p80 smoke).
+**Drag** on the chart to zoom into any window, **double-click** to reset. Ranges
+`3h / 30h / 10d / 360d`. The ⏸ button in the top bar pauses auto-refresh per
+browser; the refresh button always works.
+
+### Alerts page
+
+SmokePing has no alert database — alerts only exist as e-mail and log lines. This
+page reconstructs both:
+
+* **Active** — every target's `alerts = …` matchers are run against the latest
+  rrd samples exactly the way `Smokeping::check_alerts` does. "Is it true right now."
+* **History** — raise/clear events parsed from `/config/log/smokeping.log`
+  (the bundled `svc-smokeping` override adds `--logfile`).
+* **Acknowledge** — silence for 1 h / 8 h / 24 h / 7 d / until cleared, with a note
+  and who did it. Server-side, shared by everyone (`/config/modern-acks.json`).
+
+### Settings page (`#/settings`, password)
+
+Every change is validated with `smokeping --check` **before** it is written, a
+`.bak` of the previous file is kept, and the daemon is reloaded with `SIGHUP`. No
+container restart.
+
+| Tab | |
+|-----|---|
+| **E-mail** | SMTP server / port / STARTTLS / TLS / credentials (writes `ssmtp.conf`), alert *from* + recipient list, **Send test e-mail** |
+| **Notifications** | Discord, Slack, Telegram, ntfy, Gotify, generic JSON webhook — each with **Save & send test**. Enable *Webhook notifications* on the E-mail tab to route alerts there |
+| **Targets** | **Add** a target under any group. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
+| **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves`; nothing is saved if the check fails |
+| **Access** | who you are, how the login is set, **Sign out** |
+
+Auto-refresh is off on this page so it can never wipe a half-filled form.
+
+### Wall display (`#/wall`)
+
+Chrome-less tile view for a TV: every target as a coloured tile with median,
+loss and sparkline, plus a status header and clock. Always live (ignores pause).
+
+---
+
+## Configuration reference
+
+### Environment (`.env`)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `HTTP_PORT` | `8480` | host port (container listens on 80) |
+| `CONFIG_DIR` | `/mnt/user/appdata/smokeping/config` | mounted at `/config` |
+| `DATA_DIR` | `/mnt/user/appdata/smokeping/data` | mounted at `/data` |
+| `PUID` / `PGID` | `99` / `100` | file ownership inside the volumes |
+| `TZ` | `Europe/Amsterdam` | container timezone |
+| `WEBUI_AUTH` | `on` | `off` disables the login entirely |
+| `WEBUI_USER` | `admin` | login user |
+| `WEBUI_PASS` | *(blank)* | login password; blank = generated once |
+| `BASE_TAG` | `latest` | `lscr.io/linuxserver/smokeping` tag |
+| `SMOKEPING_LOG` | `/config/log/smokeping.log` | alert-history log the API parses |
+
+### Files in `/config` this project adds or manages
+
+| Path | Purpose |
+|------|---------|
+| `site-confs/zz-smokeping-modern.conf` | Apache: `/modern`, `/api`, redirects (reinstalled every start) |
+| `site-confs/modern-auth.inc` | Apache: which routes need the password (regenerated every start) |
+| `modern-auth/htpasswd`, `modern-auth/password.txt` | login hash; generated password |
+| `ssmtp.conf` | SMTP (edited by Settings → E-mail; symlinked to `/etc/ssmtp/ssmtp.conf`) |
+| `modern-notify.json` | webhook channels (Settings → Notifications) |
+| `modern-acks.json` | acknowledgements |
+| `log/smokeping.log`, `log/notify.log` | alert history; notifier log |
+| `Targets.bak`, `Alerts.bak`, … | previous version of any file saved through the UI |
+
+### Sample alerts (`config-sample/Alerts`)
+
+Written for the 10 s step (6 cycles = 1 minute):
 
 | Alert | Fires when | Priority |
 |-------|-----------|----------|
 | `hostdown` | >90 % loss for ~1 min | 1 (critical) |
 | `majorloss` | ≥25 % loss sustained ~1 min | 2 (critical) |
 | `lossdetect` | ≥10 % loss for ~3 min | 6 (warning) |
-| `latencyhigh` | RTT > 300 ms for ~3 min (`CheckLatency`) | 10 (warning) |
+| `latencyhigh` | RTT > 300 ms for ~3 min (`CheckLatency`, `l` in ms) | 10 (warning) |
 | `latencyshift` | latency > 2× the last ~10 min baseline (`Avgratio`) | 15 (warning) |
 
-The windows in `config-sample/Alerts` are written for the **10 s step** in
-`config-sample/Database` (6 cycles = 1 minute). If you raise `step`, widen the
-`*N*` / `stepsraise` / `x` counts to keep the same wall-clock sensitivity.
+Attach per target or once at the top of `Targets`:
+`alerts = hostdown,majorloss,lossdetect,latencyhigh,latencyshift`.
+The UI maps priority ≤ 2 to *critical*, the rest to *warning*; 100 % loss with no
+matching alert still shows *down*. If you raise `step`, widen the cycle counts.
 
-Attach them per target (or once at the top of `Targets`):
+### Polling interval
+
+`config-sample/Database` sets `step = 10` with an RRA layout sized for it
+(24 h @ 10 s, then 5 min / 1 h / 1 day rollups); the FPing probe uses
+`hostinterval = 0.1` so 20 pings fit the window. **`step` cannot be changed on
+existing `.rrd` files** — to change it: stop the container, delete
+`DATA_DIR/**/*.rrd`, edit `Database`, start. You lose history, not config.
+
+---
+
+## Security notes
+
+* Viewing is intentionally open; the password guards writes only. If the port is
+  reachable from anywhere you don't trust, put it behind a reverse proxy with TLS
+  and its own auth — HTTP Basic over plain HTTP is not secure on a hostile network.
+* Mutating API calls need the `X-Requested-With: modern-smokeping` header, so a
+  cross-site form can't ride on cached credentials.
+* Removing a target re-verifies the password against the htpasswd file for that
+  request, independent of the session.
+* The SMTP password is stored in `/config/ssmtp.conf` (mode 0640) — that's how
+  ssmtp works; back it up accordingly.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---------|-------|
+| Dashboard empty / "collecting…" | data starts one `step` after boot; `docker exec smokeping tail /config/log/smokeping.log` should show `probing N targets` |
+| "API unreachable" banner | the line under it names the endpoint + error; `curl http://<host>:8480/api/health` |
+| Settings says the check failed | the output shows the exact line SmokePing rejected; nothing was written |
+| Lost the password | `cat $CONFIG_DIR/modern-auth/password.txt`, or set `WEBUI_PASS` and `docker compose up -d` |
+| Test e-mail fails | the ssmtp error is shown verbatim (e.g. Gmail needs an app password with 2FA) |
+| Notification test fails | `docker exec smokeping tail /config/log/notify.log` |
+| Changed a file by hand, UI not reflecting it | the API re-reads automatically when a file under `/config` changes. The daemon does not — reload it with `curl -u admin:PASS -H 'X-Requested-With: modern-smokeping' -X POST http://<host>:8480/api/reload` (validates first), or re-save the file in Settings → Config files. (`smokeping --reload` does **not** work in this image: the daemon writes no pid file.) |
+| Rebuilt but nothing changed | `docker restart` keeps the old image — use `./deploy.sh` / `docker compose up -d` |
+
+## How it works
 
 ```
-+ WAN
-alerts = hostdown,majorloss,lossdetect,latencyhigh,latencyshift
+Dockerfile                      FROM lscr.io/linuxserver/smokeping + the files below
+app/web/                        single-page UI (plain ES modules, canvas charts, no build step)  -> /modern/ and /
+app/api/smokeping-api.cgi       JSON API, runs under mod_fcgid                                -> /api/
+app/api/lib/SmokepingModern/    Api.pm (read: tree, summary, node, alerts)  Admin.pm (write: settings, config, targets, acks)
+app/bin/notify                  webhook notifier, invoked by SmokePing as a |script alertee
+app/apache/                     Apache alias / fcgid / rewrite snippet
+root/custom-cont-init.d/        installs the snippet + login on every start
+root/etc/s6-overlay/.../svc-smokeping/run   upstream run script + --logfile
+config-sample/                  starter Targets / Alerts / Database / Probes (10 s step)
 ```
 
-`CheckLatency`'s `l` is in **milliseconds**. The modern UI maps priority ≤ 2 to
-*critical*, everything else to *warning*; a target at 100 % loss with no matching
-alert still shows as *down*.
+The API reuses SmokePing's own Perl — `Smokeping::Info` for config parsing and rrd
+stats, `Smokeping::init_alerts` for the compiled matchers, `RRDs` for the series —
+rather than reimplementing any of it.
 
-## Configuration
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `HTTP_PORT` | `8480` | host port (container listens on 80) |
-| `CONFIG_DIR` | `/mnt/user/appdata/smokeping/config` | → `/config` |
-| `DATA_DIR` | `/mnt/user/appdata/smokeping/data` | → `/data` |
-| `PUID` / `PGID` | `99` / `100` | LinuxServer user mapping (Unraid defaults) |
-| `TZ` | `Europe/Amsterdam` | container timezone |
-| `BASE_TAG` | `latest` | `lscr.io/linuxserver/smokeping` tag to build on |
-| `SMOKEPING_LOG` | `/config/log/smokeping.log` | alert-history log the API reads |
-
-## Polling interval
-
-`config-sample/Database` sets **`step = 10`** (poll every 10 s) with an RRA layout
-sized for it (24 h @ 10 s, then 5 min / 1 h / 1 day rollups). The UI auto-refreshes
-every 15 s.
-
-`step` **cannot be changed on existing `.rrd` files** — if you switch it later,
-stop the container, delete `/data/**/*.rrd`, and restart (you lose history, not
-config). The bundled FPing probe sets `hostinterval = 0.1` so 20 pings finish
-well inside a 10 s window. To go easier on the network, raise `step` (and widen
-the alert windows to match).
-
-## Notes
-
-* First data points appear one `step` (10 s) after the container starts;
-  `30h / 10d / 360d` ranges fill in over time.
-* No build step for the front end — plain ES modules and hand-rolled canvas
-  charts, no npm, no CDN.
-* Dashboard sparklines are embedded in `/api/summary`, so the whole grid is one
-  request regardless of target count.
-* `docker buildx` is not required (`deploy.sh` uses the legacy builder), which
-  matters on Unraid.
+| Endpoint | |
+|----------|---|
+| `GET /api/health` `tree` `summary` `alerts` `acks` | open |
+| `GET /api/node?path=&range=` or `&start=&end=` | open |
+| `GET /api/settings` `me` `config/<file>` | password |
+| `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |
 
 ## License
 

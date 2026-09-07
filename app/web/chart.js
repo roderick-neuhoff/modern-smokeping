@@ -50,6 +50,8 @@ export function drawSmoke(canvas, series, opts = {}) {
   const plotW = w - pad.l - pad.r;
   const plotH = h - pad.t - pad.b;
   const { t, median, loss, p20, p50, p80, pmax } = series;
+  // older API responses lack pmin/p10/p90 - fall back so the chart still draws
+  const pmin = series.pmin || p20, p10 = series.p10 || p20, p90 = series.p90 || p80;
   if (!t || t.length < 2) {
     ctx.fillStyle = css('--text-faint');
     ctx.font = `13px ${css('--sans') || 'sans-serif'}`;
@@ -95,25 +97,28 @@ export function drawSmoke(canvas, series, opts = {}) {
     ctx.fillText(fmtTimeAxis(ts, spanSec), x, pad.t + plotH + 6);
   }
 
+  // one closed polygon per contiguous run of samples, so a gap never gets
+  // bridged by the return path
   const band = (lo, hi, color) => {
-    ctx.beginPath();
-    let started = false;
-    for (let i = 0; i < t.length; i++) {
-      if (hi[i] == null) { started = false; continue; }
-      const x = X(t[i]);
-      if (!started) { ctx.moveTo(x, Y(hi[i])); started = true; }
-      else ctx.lineTo(x, Y(hi[i]));
-    }
-    for (let i = t.length - 1; i >= 0; i--) {
-      if (lo[i] == null) continue;
-      ctx.lineTo(X(t[i]), Y(lo[i]));
-    }
-    ctx.closePath();
     ctx.fillStyle = color;
-    ctx.fill();
+    let i = 0;
+    while (i < t.length) {
+      if (hi[i] == null || lo[i] == null) { i++; continue; }
+      let j = i;
+      while (j + 1 < t.length && hi[j + 1] != null && lo[j + 1] != null) j++;
+      ctx.beginPath();
+      ctx.moveTo(X(t[i]), Y(hi[i]));
+      for (let k = i + 1; k <= j; k++) ctx.lineTo(X(t[k]), Y(hi[k]));
+      for (let k = j; k >= i; k--) ctx.lineTo(X(t[k]), Y(lo[k]));
+      ctx.closePath();
+      ctx.fill();
+      i = j + 1;
+    }
   };
-  band(p20, pmax, css('--smoke-outer'));
-  band(p20, p80, css('--smoke-inner'));
+  // classic SmokePing smoke: symmetric around the median, densest near it
+  band(pmin, pmax, css('--smoke-outer'));
+  band(p10,  p90,  css('--smoke-outer'));
+  band(p20,  p80,  css('--smoke-inner'));
 
   // median line, coloured by packet loss per segment (classic SmokePing look)
   ctx.lineWidth = 2.2;
@@ -230,7 +235,7 @@ export function attachSmokeHover(canvas, geom, tooltipEl) {
     tooltipEl.innerHTML =
       `<b>${d.toLocaleString()}</b><br>` +
       `median ${fmtMs(series.median[i])}<br>` +
-      `band ${fmtMs(series.p20[i])} – ${fmtMs(series.pmax[i])}<br>` +
+      `pings ${fmtMs((series.pmin || series.p20)[i])} – ${fmtMs(series.pmax[i])}<br>` +
       `loss ${lp == null ? '–' : lp.toFixed(0) + ' %'}`;
     const px = Math.min(X(series.t[i]) + 12, rect.width - 160);
     tooltipEl.style.left = (canvas.offsetLeft + Math.max(4, px)) + 'px';

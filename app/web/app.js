@@ -435,8 +435,8 @@ async function renderNode(path) {
     ...[0, 1, 2, 3, 4, 5].map(i => el('i', { style: `background:var(--loss-${i})` })));
   wrap.append(el('div', { class: 'chart-legend' },
     el('span', {}, 'median, coloured by loss: ', ramp, '0 % → 100 %'),
-    el('span', {}, el('i', { style: 'background:var(--smoke-inner)' }), 'p20–p80'),
-    el('span', {}, el('i', { style: 'background:var(--smoke-outer)' }), 'p20–max'),
+    el('span', {}, el('i', { style: 'background:var(--smoke-inner)' }), 'smoke: p20–p80'),
+    el('span', {}, el('i', { style: 'background:var(--smoke-outer)' }), 'p10–p90 / min–max'),
     el('span', { class: 'zoom-hint' }, zoomed
       ? `${new Date(d.window.start * 1000).toLocaleString()} – ${new Date(d.window.end * 1000).toLocaleString()}`
       : 'drag on the chart to zoom · double-click to reset'),

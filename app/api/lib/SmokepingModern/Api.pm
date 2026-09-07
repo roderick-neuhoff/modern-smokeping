@@ -321,7 +321,7 @@ sub _smoke_series {
     $col{ $names->[$_] } = $_ for 0 .. $#$names;
     my @ping_cols = map { $col{"ping$_"} } grep { defined $col{"ping$_"} } 1 .. $pings;
 
-    my (@t, @median, @loss, @p20, @p50, @p80, @pmax);
+    my (@t, @median, @loss, @pmin, @p10, @p20, @p50, @p80, @p90, @pmax);
     my $ts = $start;
     for my $row (@$data) {
         push @t, $ts * 1;
@@ -337,12 +337,16 @@ sub _smoke_series {
                    grep { defined $_ }
                    map  { $row->[$_] } @ping_cols;
         if (@vals) {
-            push @p20,  $vals[ int(0.2 * $#vals) ] * 1000;
-            push @p50,  $vals[ int(0.5 * $#vals) ] * 1000;
-            push @p80,  $vals[ int(0.8 * $#vals) ] * 1000;
+            my $q = sub { $vals[ int($_[0] * $#vals + 0.5) ] * 1000 };
+            push @pmin, $vals[0] * 1000;
+            push @p10,  $q->(0.1);
+            push @p20,  $q->(0.2);
+            push @p50,  $q->(0.5);
+            push @p80,  $q->(0.8);
+            push @p90,  $q->(0.9);
             push @pmax, $vals[-1] * 1000;
         } else {
-            push @p20, undef; push @p50, undef; push @p80, undef; push @pmax, undef;
+            push @$_, undef for \@pmin, \@p10, \@p20, \@p50, \@p80, \@p90, \@pmax;
         }
     }
 
@@ -351,9 +355,12 @@ sub _smoke_series {
         t      => \@t,
         median => \@median,
         loss   => \@loss,
+        pmin   => \@pmin,
+        p10    => \@p10,
         p20    => \@p20,
         p50    => \@p50,
         p80    => \@p80,
+        p90    => \@p90,
         pmax   => \@pmax,
     };
 }

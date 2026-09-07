@@ -457,7 +457,8 @@ sub oauth_token_check {
         if (($o->{provider} // '') eq 'microsoft-app') {
             if (!grep { /^SMTP\.SendAsApp$/ } @roles) {
                 $verdict = "PROBLEM: the token has no SMTP.SendAsApp role. In Entra ID -> App -> API permissions add "
-                         . "'Office 365 Exchange Online' -> Application permissions -> SMTP.SendAsApp and click 'Grant admin consent'. "
+                         . "'Office 365 Exchange Online' -> Application permissions -> SMTP.SendAsApp, then consent: "
+                         . "click 'Request admin consent' here (or 'Grant admin consent' in the portal) and run Check token again. "
                          . "(A delegated SMTP.Send permission does not count for app-only.)";
             } elsif (!$aud_ok) {
                 $verdict = "PROBLEM: token audience is not Exchange Online (" . ($claims->{aud} // '?') . ").";

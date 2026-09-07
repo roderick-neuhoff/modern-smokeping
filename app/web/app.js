@@ -848,7 +848,8 @@ function paneMail(pane) {
     el('p', { class: 'sub' }, el('b', {}, 'No sign-in page: '), 'the app authenticates by itself with its secret. One-time setup by a Microsoft 365 admin:'),
     el('ol', { class: 'sub steps' },
       el('li', {}, 'Entra ID → App registrations → your app → ', el('b', {}, 'API permissions'), ' → Add → ', el('b', {}, 'Office 365 Exchange Online'), ' → ',
-        el('b', {}, 'Application permissions'), ' → ', el('span', { class: 'pattern' }, 'SMTP.SendAsApp'), ' → ', el('b', {}, 'Grant admin consent'), '.'),
+        el('b', {}, 'Application permissions'), ' → ', el('span', { class: 'pattern' }, 'SMTP.SendAsApp'), ' → Add. Then consent: either the portal\'s ',
+        el('b', {}, 'Grant admin consent'), ' button, or ', el('b', {}, 'Request admin consent'), ' below (opens Microsoft\'s consent page for this app).'),
       el('li', {}, el('b', {}, 'Certificates & secrets'), ' → New client secret → paste it below (the ', el('i', {}, 'Value'), ', not the ID).'),
       el('li', {}, 'Allow the app to send as the mailbox, in Exchange Online PowerShell:',
         el('pre', { class: 'result ok', style: 'display:block;margin:6px 0' },
@@ -911,7 +912,29 @@ function paneMail(pane) {
     msBtn.disabled = false;
   });
 
+  // Microsoft admin consent: one screen that approves every permission on the app.
+  // Must land on a redirect URI registered on the app; Microsoft's own nativeclient
+  // page is the https one every app can register.
+  const NATIVE_REDIRECT = 'https://login.microsoftonline.com/common/oauth2/nativeclient';
+  const consentBtn = el('button', { class: 'chip', type: 'button', title: 'Opens Microsoft\'s admin consent page for this app', onclick: () => {
+    const cid = f.clientId.value.trim();
+    if (!cid) { toast('Enter the application (client) ID first.', true); return; }
+    const tenant = (f.tenant.value.trim() || 'common');
+    const u = new URL(`https://login.microsoftonline.com/${encodeURIComponent(tenant)}/v2.0/adminconsent`);
+    u.searchParams.set('client_id', cid);
+    u.searchParams.set('scope', 'https://outlook.office365.com/.default');
+    u.searchParams.set('redirect_uri', NATIVE_REDIRECT);
+    u.searchParams.set('state', 'modern-smokeping');
+    window.open(u.toString(), '_blank', 'noopener');
+    oRes.hidden = false; oRes.className = 'result';
+    oRes.textContent = 'Admin consent page opened in a new tab. Sign in as a Global/Application admin and click Accept. '
+      + 'If Microsoft shows "redirect URI mismatch", add ' + NATIVE_REDIRECT
+      + ' under Authentication -> Add a platform -> Mobile and desktop applications, then try again. '
+      + 'Afterwards click "Check token" - it should list the role/scope.';
+  } }, 'Request admin consent');
+
   const oauthTools = el('div', { class: 'modal-actions', style: 'justify-content:flex-start' },
+    consentBtn,
     el('button', { class: 'chip', type: 'button', onclick: async (e) => {
       e.currentTarget.disabled = true; oRes.hidden = false; oRes.className = 'result'; oRes.textContent = 'Exchanging refresh token…';
       try { showResult(oRes, await post('/oauth/check', {}), 'Token OK — OAuth2 credentials work.'); }
@@ -934,6 +957,7 @@ function paneMail(pane) {
     microsoftBox.hidden = m !== 'oauth-microsoft';
     oTenant.hidden = m === 'oauth-google';
     oRefresh.hidden = m !== 'oauth-google';
+    consentBtn.hidden = !m.startsWith('oauth-microsoft');
     if (m === 'oauth-google') {
       setLabel(oClient, 'Client ID'); setLabel(oSecret, 'Client secret');
       setLabel(oRefresh, 'Refresh token', 'from the OAuth 2.0 Playground'); setLabel(oUser, 'Mailbox (user)', 'the Google account you authorized');

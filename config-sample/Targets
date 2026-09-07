@@ -12,15 +12,16 @@ alerts = hostdown,majorloss,lossdetect,latencyhigh,latencyshift
 menu = Local network
 title = Local network
 
+# Replace these with your own LAN addresses.
 ++ Gateway
 menu = Gateway
-title = LAN gateway (172.16.70.1)
-host = 172.16.70.1
+title = LAN gateway
+host = 192.168.1.1
 
-++ Unraid
-menu = Unraid host
-title = Unraid host (172.16.70.112)
-host = 172.16.70.112
+++ NAS
+menu = NAS / server
+title = Home server
+host = 192.168.1.10
 
 + WAN
 menu = Internet

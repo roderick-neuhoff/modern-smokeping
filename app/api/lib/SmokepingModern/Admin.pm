@@ -175,8 +175,10 @@ sub _read_ssmtp {
     };
 }
 
-sub _write_msmtp {
-    my ($h) = @_;      # host port starttls tls user pass from method
+sub _write_msmtp { _write_msmtp_to($MSMTP_CONF, @_) }
+
+sub _write_msmtp_to {
+    my ($path, $h) = @_;      # host port starttls tls user pass from method
     my $starttls = $h->{tls} ? 'off' : ($h->{starttls} ? 'on' : 'off');
     my $tls      = ($h->{tls} || $h->{starttls}) ? 'on' : 'off';
     my @l = (
@@ -200,7 +202,7 @@ sub _write_msmtp {
     } else {
         push @l, 'auth off';
     }
-    _spew($MSMTP_CONF, join("\n", @l) . "\n", 0600);
+    _spew($path, join("\n", @l) . "\n", 0600);
 }
 
 # point SmokePing at the msmtp wrapper (pathnames: sendmail = ...)
@@ -633,29 +635,69 @@ sub acks_delete {
 # tests + reload
 # ---------------------------------------------------------------------------
 
+# Send a test message.
+#   to:    address, comma-separated list, or "recipients" = the saved alert list
+#   smtp:  optional - the E-mail form's *unsaved* values; when present the test
+#          goes through a temporary msmtp config so you can test before saving
 sub test_mail {
     my $b = shift || {};
-    my $to = $b->{to} // '';
-    $to =~ s/\s//g;
-    die { status => 422, error => 'recipient address required' } unless $to =~ /^[^\s@]+@[^\s@]+$/;
-    my $from = _read_ssmtp()->{root} || 'smokeping@localhost';
+    my $cur = _read_ssmtp();
+    my @to;
+    if (($b->{to} // '') eq 'recipients') {
+        @to = @{ _read_alert_header()->{emails} };
+        die { status => 422, error => 'no e-mail recipients are configured yet' } unless @to;
+    } else {
+        @to = grep { length } map { s/\s//gr } split /[,;\n]/, ($b->{to} // '');
+    }
+    die { status => 422, error => 'recipient address required' } unless @to;
+    for (@to) { die { status => 422, error => "invalid address '$_'" } unless /^[^\s@]+@[^\s@]+$/ }
+
+    my ($conf, $from, $engine, $tmpdir) = ($MSMTP_CONF, $cur->{root} || 'smokeping@localhost', 'msmtp', undef);
+    if (ref $b->{smtp} eq 'HASH') {
+        my $s = $b->{smtp};
+        my $method = $s->{authMethod} // 'password';
+        my $host = ($s->{host} // '') =~ s/\s//gr;
+        $host ||= $method eq 'oauth-google' ? 'smtp.gmail.com' : $method eq 'oauth-microsoft' ? 'smtp.office365.com' : '';
+        die { status => 422, error => 'mail server host is required' } unless length $host;
+        die { status => 422, error => 'save the OAuth2 credentials first, then test' }
+            if $method =~ /^oauth/ && !-s $OAUTH_CFG;
+        $from = $s->{from} || $from;
+        my $pass = length($s->{authPass} // '') ? $s->{authPass} : $cur->{_pass};
+        $tmpdir = File::Temp::tempdir('spm-mailtest-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+        $conf = "$tmpdir/msmtp.conf";
+        _write_msmtp_to($conf, { host => $host, port => int($s->{port} || 587), starttls => $s->{starttls} ? 1 : 0,
+                                 tls => $s->{tls} ? 1 : 0, user => ($s->{authUser} // '') =~ s/\s//gr, pass => $pass,
+                                 from => $from, method => $method });
+        $engine = 'msmtp (unsaved form values)';
+    } elsif (!-s $MSMTP_CONF) {
+        $conf = undef; $engine = 'ssmtp';                 # legacy install, nothing saved through the UI yet
+    }
+    die { status => 422, error => 'from must be an e-mail address' } unless $from =~ /^[^\s@]+@[^\s@]+$/;
+
     my $host = (POSIX::uname())[1];
+    my $when = scalar localtime;
     my $msg = join "\r\n",
-        "To: $to", "From: $from", "Subject: [SmokePing] test message",
+        "To: " . join(', ', @to), "From: $from",
+        "Subject: [SmokeAlert] TEST hostdown was raised on Demo.Target",
         "Content-Type: text/plain; charset=utf-8", "",
-        "This is a test message from modern-smokeping on $host.",
-        "If you can read this, SMTP is configured correctly.",
-        "", "Sent " . scalar(localtime), "";
-    my $bin = -s $MSMTP_CONF ? $SENDMAIL : $SSMTP_BIN;   # msmtp once configured, else legacy ssmtp
-    my ($out, $rc) = _capture_in(60, $msg, $bin, '-t');
-    return { ok => ($rc == 0 ? \1 : \0), rc => $rc, engine => ($bin eq $SENDMAIL ? 'msmtp' : 'ssmtp'),
-             output => ($out =~ s/\s+$//r) || ($rc == 0 ? 'sent' : "exit code $rc") };
+        "This is a TEST from modern-smokeping on $host - no target is actually down.",
+        "A real alert mail from SmokePing looks like this:", "",
+        "Alert \"hostdown\" was raised for Demo.Target",
+        "Pattern: >90%,>90%,>90%,>90%,>90%,>90%",
+        "Data (old -> now): loss: 0%, 0%, 100%, 100%, 100%, 100%, 100%, 100%",
+        "                   rtt: 15ms, 15ms, U, U, U, U, U, U",
+        "Comment: Host unreachable - >90% packet loss for ~1 minute", "",
+        "Sent $when", "";
+
+    my @cmd = defined $conf ? ('/usr/bin/msmtp', '-C', $conf, '-t') : ($SSMTP_BIN, '-t');
+    my ($out, $rc) = _capture_in(60, $msg, @cmd);
+    return { ok => ($rc == 0 ? \1 : \0), rc => $rc, engine => $engine, to => \@to, from => $from,
+             output => ($out =~ s/\s+$//r) || ($rc == 0 ? 'accepted by the mail server' : "exit code $rc") };
 }
 
 # run a command feeding $stdin; returns (output, exit code)
 sub _capture_in {
     my ($timeout, $stdin, @cmd) = @_;
-    return _capture($timeout, $SSMTP_BIN, @cmd[1 .. $#cmd], $stdin) if $cmd[0] eq $SSMTP_BIN;
     my ($in, $out) = (Symbol::gensym(), Symbol::gensym());
     my $pid = eval { IPC::Open3::open3($in, $out, undef, @cmd) };
     return ("cannot run $cmd[0]: $@", 127) unless $pid;

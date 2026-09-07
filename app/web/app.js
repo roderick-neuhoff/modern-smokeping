@@ -946,15 +946,29 @@ function paneMail(pane) {
         e.currentTarget.disabled = false;
       } }, 'Save mail settings')),
     res,
-    el('h2', {}, 'Send a test e-mail'),
-    el('div', { class: 'form-grid' }, field('To', f.testTo)),
-    el('div', { class: 'modal-actions' }, el('button', { class: 'chip', onclick: async (e) => {
-      e.currentTarget.disabled = true; testRes.hidden = false; testRes.textContent = 'Sending…'; testRes.className = 'result';
-      try { showResult(testRes, await post('/test/mail', { to: f.testTo.value }), 'Test mail handed to the mail server.'); }
-      catch (err) { showResult(testRes, { ok: false, error: err.message, ...(err.data || {}) }); }
-      e.currentTarget.disabled = false;
-    } }, 'Send test')),
+    el('h2', {}, 'Test'),
+    el('p', { class: 'sub' }, 'Sends a message formatted like a real SmokePing alert. "Test these settings" uses what is in the form right now, saved or not — for OAuth2 the stored token is used, so connect/save that first.'),
+    el('div', { class: 'form-grid' }, field('Send to', f.testTo, 'one address or a comma-separated list')),
+    el('div', { class: 'modal-actions', style: 'justify-content:flex-start' },
+      el('button', { class: 'chip on', onclick: (e) => runMailTest(e, f.testTo.value, true) }, 'Test these settings'),
+      el('button', { class: 'chip', onclick: (e) => runMailTest(e, f.testTo.value, false) }, 'Test saved settings'),
+      el('button', { class: 'chip', onclick: (e) => runMailTest(e, 'recipients', false) }, 'Send to all alert recipients')),
     testRes));
+
+  async function runMailTest(e, to, useForm) {
+    const btn = e.currentTarget;
+    btn.disabled = true; testRes.hidden = false; testRes.className = 'result'; testRes.textContent = 'Sending…';
+    const body = { to };
+    if (useForm) body.smtp = {
+      authMethod: f.method.value, host: f.host.value, port: +f.port.value, starttls: f.starttls.checked, tls: f.tls.checked,
+      authUser: f.authUser.value, authPass: f.authPass.value, from: f.from.value,
+    };
+    try {
+      const r = await post('/test/mail', body);
+      showResult(testRes, r, `Accepted by the mail server for ${(r.to || []).join(', ')} (via ${r.engine}). Check the inbox — and the spam folder.`);
+    } catch (err) { showResult(testRes, { ok: false, error: err.message, ...(err.data || {}) }); }
+    btn.disabled = false;
+  }
 }
 
 const CHANNELS = [

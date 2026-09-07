@@ -114,7 +114,7 @@ sub _read_ssmtp {
     my ($host, $port) = ($c{mailhub} // '') =~ /^([^:]*)(?::(\d+))?$/;
     return {
         host      => $host // '',
-        port      => $port // 587,
+        port      => ($port // 587) + 0,
         starttls  => (($c{UseSTARTTLS} // 'no') =~ /yes/i ? \1 : \0),
         tls       => (($c{UseTLS} // 'no') =~ /yes/i ? \1 : \0),
         authUser  => $c{AuthUser} // '',
@@ -205,7 +205,7 @@ sub settings_smtp {
     _write_alert_header(\@emails, $from, $b->{webhooks} ? 1 : 0);
 
     my $chk = _check_config();
-    my $rl = $chk->{ok} ? _hup() : { ok => \0, note => 'not reloaded - config check failed' };
+    my $rl = _passed($chk) ? _hup() : { ok => \0, note => 'not reloaded - config check failed' };
     return { ok => \1, check => $chk, reload => $rl, settings => settings_get() };
 }
 
@@ -254,6 +254,10 @@ sub _run_check {
     return { ok => ($rc == 0 ? \1 : \0), rc => $rc, output => $out };
 }
 
+# NB: $chk->{ok} is a JSON boolean *reference* (\1 / \0) - both are TRUE in
+# Perl. Always test the exit code, never the ok field.
+sub _passed { my $chk = shift; return defined $chk->{rc} && $chk->{rc} == 0 }
+
 sub _check_config { _run_check($MASTER) }
 
 sub config_put {
@@ -263,7 +267,7 @@ sub config_put {
     $text =~ s/\r\n?/\n/g;
     $text .= "\n" unless $text =~ /\n\z/;
     my $chk = _check_candidate($name, $text);
-    return (422, { ok => \0, check => $chk, error => 'config check failed - nothing was written' }) unless $chk->{ok};
+    return (422, { ok => \0, check => $chk, error => 'config check failed - nothing was written' }) unless _passed($chk);
     my $f = "$CONFIG_DIR/$name";
     _spew("$f.bak", _slurp($f) // '') if -f $f;
     _spew($f, $text, 0644);
@@ -311,7 +315,7 @@ sub target_add {
     my $text = join("\n", @lines) . "\n";
 
     my $chk = _check_candidate('Targets', $text);
-    return (422, { ok => \0, check => $chk, error => 'config check failed - target not added' }) unless $chk->{ok};
+    return (422, { ok => \0, check => $chk, error => 'config check failed - target not added' }) unless _passed($chk);
     _spew("$file.bak", $s);
     _spew($file, $text, 0644);
     my $rl = _hup();
@@ -386,7 +390,7 @@ sub test_notify {
 
 sub reload {
     my $chk = _check_config();
-    return { ok => \0, check => $chk, error => 'config check failed - not reloading' } unless $chk->{ok};
+    return { ok => \0, check => $chk, error => 'config check failed - not reloading' } unless _passed($chk);
     return { ok => \1, check => $chk, reload => _hup() };
 }
 

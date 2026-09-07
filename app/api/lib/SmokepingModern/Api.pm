@@ -67,6 +67,10 @@ sub run {
                                                 : (500, { error => "$e" });
         }
         _invalidate_cache() if $status == 200 && $method ne 'GET';
+        if (ref $body eq 'HASH' && defined $body->{html}) {      # e.g. the OAuth callback landing page
+            print "Status: $status OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n", $body->{html};
+            return;
+        }
         _emit($status, $body);
         return;
     }

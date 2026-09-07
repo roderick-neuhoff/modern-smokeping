@@ -77,6 +77,10 @@ sub handle {
         my $act = $rest->[1] // '';
         return (200, oauth_device_start($body))     if $sub eq 'microsoft' && $act eq 'start' && $method eq 'POST';
         return (200, oauth_device_poll($body))      if $sub eq 'microsoft' && $act eq 'poll'  && $method eq 'POST';
+        return (200, oauth_authorize($body))        if $sub eq 'authorize' && $method eq 'POST';
+        return (200, oauth_paste($body))            if $sub eq 'paste' && $method eq 'POST';
+        return (200, oauth_status())                if $sub eq 'status';
+        return oauth_callback($q)                   if $sub eq 'callback';      # GET from the provider, returns HTML
         return (200, oauth_token_check())           if $sub eq 'check' && $method eq 'POST';
         return (200, oauth_forget())                if $sub eq 'forget' && $method eq 'POST';
     }
@@ -425,6 +429,161 @@ sub oauth_device_poll {
     _spew($OAUTH_CFG, $JSON->canonical->encode(\%new) . "\n", 0600);
     unlink $DEVICE_STATE, '/tmp/spm-oauth-token.json';
     return { ok => \1, account => $new{account}, connectedAt => $new{connectedAt} };
+}
+
+# ---------------------------------------------------------------------------
+# Authorization-code + PKCE ("Sign in with Microsoft/Google"): the provider
+# shows its own login + permissions screen, then returns a code either to our
+# https callback (publicBase set) or to the provider's hosted landing page,
+# whose address the user pastes back.
+# ---------------------------------------------------------------------------
+my $AUTHCODE_STATE = '/tmp/spm-oauth-authcode.json';
+my $NATIVE_LANDING = 'https://login.microsoftonline.com/common/oauth2/nativeclient';
+
+sub _b64url { my $s = MIME::Base64::encode_base64($_[0], ''); $s =~ tr{+/}{-_}; $s =~ s/=+$//; $s }
+
+sub _rand_str {
+    my $n = shift || 48;
+    open my $r, '<', '/dev/urandom' or die { status => 500, error => 'no urandom' };
+    read $r, my $buf, $n; close $r;
+    return _b64url($buf);
+}
+
+sub _redirect_uri {
+    my $base = shift // '';
+    $base =~ s{/+$}{};
+    return length $base ? "$base/api/oauth/callback" : $NATIVE_LANDING;
+}
+
+sub oauth_authorize {
+    my $b = shift || {};
+    require MIME::Base64; require Digest::SHA;
+    my $provider = $b->{provider} // 'microsoft';
+    die { status => 422, error => 'provider must be microsoft or google' } unless $provider =~ /^(microsoft|google)$/;
+    my $client = ($b->{clientId} // '') =~ s/\s//gr;
+    die { status => 422, error => 'client ID is required' } unless length $client;
+    my $base = ($b->{publicBase} // '') =~ s/\s//gr;
+    die { status => 422, error => 'public URL must start with https:// (Microsoft/Google only accept https redirect URIs)' }
+        if length $base && $base !~ m{^https://};
+    die { status => 422, error => 'Google needs the public https URL of this SmokePing as the redirect (no hosted landing page exists)' }
+        if $provider eq 'google' && !length $base;
+
+    my $o = _read_oauth();
+    my $secret = length($b->{clientSecret} // '') ? $b->{clientSecret}
+               : (($o->{provider} // '') eq $provider && ($o->{clientId} // '') eq $client) ? ($o->{clientSecret} // '') : '';
+    my $tenant = ($b->{tenant} || 'common') =~ s/[^A-Za-z0-9.-]//gr;
+    my $verifier  = _rand_str(64);
+    my $challenge = _b64url(Digest::SHA::sha256($verifier));
+    my $state     = _rand_str(24);
+    my $redirect  = _redirect_uri($base);
+
+    my ($url, %p);
+    if ($provider eq 'microsoft') {
+        $url = "https://login.microsoftonline.com/$tenant/oauth2/v2.0/authorize";
+        %p = (client_id => $client, response_type => 'code', redirect_uri => $redirect, response_mode => 'query',
+              scope => 'openid email offline_access https://outlook.office365.com/SMTP.Send',
+              state => $state, code_challenge => $challenge, code_challenge_method => 'S256', prompt => 'consent');
+    } else {
+        $url = 'https://accounts.google.com/o/oauth2/v2/auth';
+        %p = (client_id => $client, response_type => 'code', redirect_uri => $redirect,
+              scope => 'https://mail.google.com/ openid email', access_type => 'offline', prompt => 'consent',
+              state => $state, code_challenge => $challenge, code_challenge_method => 'S256');
+    }
+    my $qs = join '&', map { $_ . '=' . _urlenc($p{$_}) } sort keys %p;
+    _spew($AUTHCODE_STATE, $JSON->encode({ provider => $provider, clientId => $client, clientSecret => $secret, tenant => $tenant,
+        verifier => $verifier, state => $state, redirect => $redirect, publicBase => $base, started => time, expires => time + 900 }), 0600);
+    return { ok => \1, url => "$url?$qs", redirectUri => $redirect, viaCallback => (length $base ? \1 : \0), state => $state };
+}
+
+sub _urlenc { my $s = shift // ''; $s =~ s/([^A-Za-z0-9_.~-])/sprintf('%%%02X', ord $1)/ge; $s }
+
+# turn an authorization code into tokens and store them
+sub _authcode_exchange {
+    my ($st, $code) = @_;
+    my ($url, %form);
+    if ($st->{provider} eq 'microsoft') {
+        $url  = "https://login.microsoftonline.com/$st->{tenant}/oauth2/v2.0/token";
+        %form = (client_id => $st->{clientId}, grant_type => 'authorization_code', code => $code,
+                 redirect_uri => $st->{redirect}, code_verifier => $st->{verifier},
+                 scope => 'openid email offline_access https://outlook.office365.com/SMTP.Send');
+    } else {
+        $url  = 'https://oauth2.googleapis.com/token';
+        %form = (client_id => $st->{clientId}, grant_type => 'authorization_code', code => $code,
+                 redirect_uri => $st->{redirect}, code_verifier => $st->{verifier});
+    }
+    $form{client_secret} = $st->{clientSecret} if length($st->{clientSecret} // '');
+    my $d = _curl_form_json($url, %form);
+    if ($d->{error}) {
+        die { status => 422, error => ($st->{provider} eq 'microsoft' ? _ms_hint($d) : "$d->{error}: " . ($d->{error_description} // '')) };
+    }
+    die { status => 502, error => 'no refresh_token returned - the consent screen must include "maintain access" / offline access' }
+        unless $d->{refresh_token};
+    my $account = '';
+    if ($d->{id_token} && (my ($mid) = (split /\./, $d->{id_token})[1])) {
+        $mid =~ tr{-_}{+/}; $mid .= '=' x ((4 - length($mid) % 4) % 4);
+        require MIME::Base64;
+        my $claims = eval { $JSON->decode(MIME::Base64::decode_base64($mid)) } || {};
+        $account = $claims->{preferred_username} || $claims->{email} || '';
+    }
+    my $o = _read_oauth();
+    my %new = (provider => $st->{provider}, clientId => $st->{clientId}, clientSecret => ($st->{clientSecret} // ''),
+               refreshToken => $d->{refresh_token}, tenant => ($st->{tenant} // 'common'),
+               account => ($account || $o->{account} || ''), connectedAt => time, publicBase => ($st->{publicBase} // ''));
+    _spew($OAUTH_CFG, $JSON->canonical->encode(\%new) . "\n", 0600);
+    unlink $AUTHCODE_STATE, '/tmp/spm-oauth-token.json';
+    return \%new;
+}
+
+sub _authcode_state {
+    my $st = eval { $JSON->decode(_slurp($AUTHCODE_STATE) // '') } or die { status => 409, error => 'no sign-in in progress - click Sign in first' };
+    die { status => 410, error => 'sign-in expired - start again' } if time > $st->{expires};
+    return $st;
+}
+
+# GET /api/oauth/callback?code=&state=   (from the provider; no password - the state is the proof)
+sub oauth_callback {
+    my $q = shift || {};
+    my $html = sub {
+        my ($ok, $title, $body) = @_;
+        my $esc = sub { my $s = shift // ''; $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g; $s =~ s/>/&gt;/g; $s };
+        return (200, { html => '<!doctype html><meta charset="utf-8"><title>' . $esc->($title) . '</title>'
+            . '<body style="font:15px system-ui;margin:0;display:grid;place-items:center;height:100vh;background:#0f141b;color:#e4e9f0">'
+            . '<div style="max-width:520px;padding:28px;border-radius:12px;background:#171e28;border:1px solid ' . ($ok ? '#1f9d57' : '#d93a3a') . '">'
+            . '<h2 style="margin:0 0 10px">' . $esc->($title) . '</h2><p>' . $esc->($body) . '</p>'
+            . ($ok ? '<p>You can close this tab and go back to SmokePing → Settings → E-mail, then click <b>Save mail settings</b>.</p>' : '')
+            . '</div></body>' });
+    };
+    return $html->(0, 'Sign-in failed', ($q->{error} // 'error') . ': ' . ($q->{error_description} // '')) if $q->{error};
+    my $st = eval { _authcode_state() };
+    return $html->(0, 'No sign-in in progress', ref $@ ? $@->{error} : "$@") unless $st;
+    return $html->(0, 'State mismatch', 'This response does not belong to the sign-in that was started. Start again from Settings.')
+        unless ($q->{state} // '') eq $st->{state};
+    my $new = eval { _authcode_exchange($st, $q->{code} // '') };
+    return $html->(0, 'Token exchange failed', ref $@ ? $@->{error} : "$@") unless $new;
+    return $html->(1, 'Connected', 'Signed in' . ($new->{account} ? " as $new->{account}" : '') . '. Permissions granted.');
+}
+
+# fallback: the user pastes the address of the landing page (…?code=…&state=…)
+sub oauth_paste {
+    my $b = shift || {};
+    my $u = $b->{url} // '';
+    my ($code)  = $u =~ /[?&#]code=([^&#\s]+)/;
+    my ($state) = $u =~ /[?&#]state=([^&#\s]+)/;
+    my ($err)   = $u =~ /[?&#]error=([^&#\s]+)/;
+    die { status => 422, error => "the provider reported: $err" } if $err && !$code;
+    die { status => 422, error => 'no code= found in that address - paste the full URL of the page you landed on' } unless $code;
+    $code =~ s/%([0-9A-Fa-f]{2})/chr hex $1/ge;
+    my $st = _authcode_state();
+    die { status => 422, error => 'state mismatch - start the sign-in again and paste the new address' } unless ($state // '') eq $st->{state};
+    my $new = _authcode_exchange($st, $code);
+    return { ok => \1, account => $new->{account}, connectedAt => $new->{connectedAt} };
+}
+
+sub oauth_status {
+    my $o = _read_oauth();
+    my $pending = -f $AUTHCODE_STATE ? 1 : 0;
+    return { connected => (length($o->{refreshToken} // '') ? \1 : \0), account => $o->{account}, provider => $o->{provider},
+             connectedAt => $o->{connectedAt}, pending => ($pending ? \1 : \0), publicBase => $o->{publicBase} };
 }
 
 # exchange the stored credentials for a token once, then read what the token

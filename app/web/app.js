@@ -863,25 +863,86 @@ function paneMail(pane) {
     field('Username', f.authUser), field('Password', f.authPass, 'leave blank to keep the current one'));
 
   const googleBox = el('div', {},
-    el('p', { class: 'sub' }, 'Google has no device sign-in for Gmail, so it takes three steps once: ',
-      el('b', {}, '1.'), ' Google Cloud Console → create an OAuth client (type "Desktop app"), enable the Gmail API.  ',
-      el('b', {}, '2.'), ' Open the ', el('a', { href: 'https://developers.google.com/oauthplayground/', target: '_blank', rel: 'noopener' }, 'OAuth 2.0 Playground'),
-      ', gear icon → "Use your own OAuth credentials", scope ', el('span', { class: 'pattern' }, 'https://mail.google.com/'), ', authorize, exchange for tokens.  ',
-      el('b', {}, '3.'), ' Paste the client ID, secret and refresh token below. The mailbox is the Google account you authorized.'));
+    el('p', { class: 'sub' }, el('b', {}, 'Easiest: '), 'Google Cloud Console → enable the Gmail API → create an OAuth client of type ',
+      el('b', {}, 'Web application'), ' with redirect URI ', el('span', { class: 'pattern' }, '<public https address>/api/oauth/callback'),
+      '. Enter the client ID, secret and that public address below, click ', el('b', {}, 'Sign in with Google'),
+      ' — Google shows its login and the permission "Read, compose, send and permanently delete all your email" — click Allow.'),
+    el('p', { class: 'sub' }, el('b', {}, 'No public https address? '), 'Use the ',
+      el('a', { href: 'https://developers.google.com/oauthplayground/', target: '_blank', rel: 'noopener' }, 'OAuth 2.0 Playground'),
+      ' (gear → "Use your own OAuth credentials", scope ', el('span', { class: 'pattern' }, 'https://mail.google.com/'),
+      ', authorize, exchange) and paste the refresh token into the field below instead.'));
 
-  const msBtn = el('button', { class: 'chip on', type: 'button' }, 'Connect with Microsoft');
+  // --- "Sign in with …": the provider's own login + permissions screen -----------
+  f.publicBase = input({ value: o.publicBase || '', placeholder: 'https://smokeping.yourdomain.com  (optional)', autocomplete: 'off' });
+  const signInBtn = el('button', { class: 'chip on', type: 'button' }, 'Sign in with Microsoft');
+  const signInRes = el('div', { class: 'result', hidden: 'hidden' });
+  const pasteBox = el('div', { hidden: 'hidden' },
+    el('p', { class: 'sub', style: 'margin-top:10px' }, 'After you click Accept, Microsoft sends you to a blank page. Copy that page\'s address from the browser bar and paste it here:'),
+    el('textarea', { class: 'input code', rows: '3', placeholder: 'https://login.microsoftonline.com/common/oauth2/nativeclient?code=…&state=…' }),
+    el('div', { class: 'modal-actions', style: 'justify-content:flex-start' }, el('button', { class: 'chip on', type: 'button' }, 'Finish sign-in')));
+  const pasteTa = pasteBox.querySelector('textarea'), pasteBtn = pasteBox.querySelector('button');
+  let statusPoll = null;
+
+  const markConnected = (acct) => {
+    o.refreshTokenSet = true; o.configured = true;
+    status.textContent = `Configured${acct ? ' for ' + acct : ''} — use "Check token" to verify`; status.style.color = 'var(--ok)';
+    if (acct && !f.oauthUser.value) f.oauthUser.value = acct;
+  };
+  signInBtn.addEventListener('click', async () => {
+    const provider = f.method.value === 'oauth-google' ? 'google' : 'microsoft';
+    signInBtn.disabled = true; signInRes.hidden = false; signInRes.className = 'result'; signInRes.textContent = 'Preparing sign-in…';
+    pasteBox.hidden = true; if (statusPoll) { clearInterval(statusPoll); statusPoll = null; }
+    try {
+      const st = await post('/oauth/authorize', { provider, clientId: f.clientId.value.trim(), tenant: f.tenant.value.trim(),
+        clientSecret: f.clientSecret.value, publicBase: f.publicBase.value.trim() });
+      window.open(st.url, '_blank', 'noopener');
+      if (st.viaCallback) {
+        signInRes.className = 'result ok';
+        signInRes.textContent = `Sign-in page opened in a new tab. Sign in, review the permissions, click Accept. You will be sent back to ${st.redirectUri} and this page updates by itself…`;
+        const t0 = Date.now();
+        statusPoll = setInterval(async () => {
+          try {
+            const s = await api('/oauth/status');
+            if (s.connected && !s.pending) { clearInterval(statusPoll); statusPoll = null; markConnected(s.account); signInRes.textContent = `Connected${s.account ? ' as ' + s.account : ''}. Now click "Save mail settings".`; signInBtn.disabled = false; }
+            else if (Date.now() - t0 > 15 * 60_000) { clearInterval(statusPoll); statusPoll = null; signInRes.className = 'result bad'; signInRes.textContent = 'Timed out waiting for the sign-in. Start again.'; signInBtn.disabled = false; }
+          } catch { /* keep polling */ }
+        }, 3000);
+      } else {
+        signInRes.className = 'result ok';
+        signInRes.textContent = `Sign-in page opened in a new tab. Sign in, review the permissions, click Accept. Because this SmokePing has no public https address, Microsoft lands on its own blank page (${st.redirectUri}) — paste that page's address below.`;
+        pasteBox.hidden = false; pasteTa.value = ''; pasteTa.focus(); signInBtn.disabled = false;
+      }
+    } catch (err) { signInRes.className = 'result bad'; signInRes.textContent = err.message; signInBtn.disabled = false; }
+  });
+  pasteBtn.addEventListener('click', async () => {
+    pasteBtn.disabled = true;
+    try {
+      const r = await post('/oauth/paste', { url: pasteTa.value.trim() });
+      markConnected(r.account); pasteBox.hidden = true;
+      signInRes.className = 'result ok'; signInRes.textContent = `Connected${r.account ? ' as ' + r.account : ''}. Now click "Save mail settings".`;
+    } catch (err) { signInRes.className = 'result bad'; signInRes.textContent = err.message; }
+    pasteBtn.disabled = false;
+  });
+
+  // device code stays as the fallback for machines without a browser
+  const msBtn = el('button', { class: 'chip', type: 'button' }, 'Use a device code instead');
   const msCode = el('div', { class: 'result ok', hidden: 'hidden' });
   const microsoftBox = el('div', {},
-    el('p', { class: 'sub' }, 'Entra ID → App registrations → new app, "Public client" with the ',
-      el('span', { class: 'pattern' }, 'https://outlook.office365.com/SMTP.Send'), ' delegated permission, and "Allow public client flows" = Yes. ',
-      'Also make sure SMTP AUTH is enabled for the mailbox in Exchange admin. Fill in the fields below, then click Connect and sign in on the page it shows.'),
-    el('div', { class: 'modal-actions', style: 'justify-content:flex-start' }, msBtn), msCode);
+    el('p', { class: 'sub' }, 'Entra ID → App registrations → your app: add the delegated permission ',
+      el('span', { class: 'pattern' }, 'https://outlook.office365.com/SMTP.Send'), ' (Office 365 Exchange Online), set "Allow public client flows" = Yes, and under Authentication add the redirect URI shown below. ',
+      'Then click Sign in — Microsoft shows its login and a screen listing exactly what SmokePing asks for (send mail as you, keep access) — click Accept.'),
+    msCode);
 
   // the OAuth inputs exist exactly once; labels/visibility change per method
   const oauthFields = el('div', { class: 'form-grid' },
     field('Tenant', f.tenant), field('Client ID', f.clientId), field('Client secret', f.clientSecret),
-    field('Refresh token', f.refreshToken), field('Mailbox (user)', f.oauthUser));
-  const [oTenant, oClient, oSecret, oRefresh, oUser] = [...oauthFields.children];
+    field('Refresh token', f.refreshToken), field('Mailbox (user)', f.oauthUser),
+    field('Public https address of this SmokePing', f.publicBase,
+      'optional. If set, the sign-in returns straight here — register <address>/api/oauth/callback as a Web redirect URI on the app. Blank = Microsoft\'s landing page (register https://login.microsoftonline.com/common/oauth2/nativeclient under "Mobile and desktop applications"); Google requires it.'));
+  const [oTenant, oClient, oSecret, oRefresh, oUser, oBase] = [...oauthFields.children];
+  // sign-in controls, once, for the two user-delegated methods
+  const signInRow = el('div', {},
+    el('div', { class: 'modal-actions', style: 'justify-content:flex-start' }, signInBtn, msBtn), signInRes, pasteBox);
   const setLabel = (fieldEl, label, help) => {
     fieldEl.querySelector('.field-label').textContent = label;
     let h = fieldEl.querySelector('.field-help');
@@ -947,7 +1008,7 @@ function paneMail(pane) {
       catch (err) { toast(err.message, true); }
     } }, 'Forget OAuth2'));
 
-  const oauthWrap = el('div', {}, status, googleBox, appBox, microsoftBox, oauthFields, oauthTools, oRes);
+  const oauthWrap = el('div', {}, status, googleBox, appBox, microsoftBox, oauthFields, signInRow, oauthTools, oRes);
   const applyMethod = () => {
     const m = f.method.value;
     pwBox.hidden = m !== 'password';
@@ -957,6 +1018,10 @@ function paneMail(pane) {
     microsoftBox.hidden = m !== 'oauth-microsoft';
     oTenant.hidden = m === 'oauth-google';
     oRefresh.hidden = m !== 'oauth-google';
+    oBase.hidden = m === 'oauth-microsoft-app';
+    signInRow.hidden = !(m === 'oauth-google' || m === 'oauth-microsoft');
+    msBtn.hidden = m !== 'oauth-microsoft';
+    signInBtn.textContent = m === 'oauth-google' ? 'Sign in with Google' : 'Sign in with Microsoft';
     consentBtn.hidden = !m.startsWith('oauth-microsoft');
     if (m === 'oauth-google') {
       setLabel(oClient, 'Client ID'); setLabel(oSecret, 'Client secret');

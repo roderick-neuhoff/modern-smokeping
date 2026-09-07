@@ -49,6 +49,12 @@ else
         Require valid-user
     </LimitExcept>
 </Location>
+# the OAuth provider redirects the browser here after sign-in; a one-time
+# state token in the request is the proof, so no password prompt
+<Location /api/oauth/callback>
+    AuthType None
+    Require all granted
+</Location>
 EOF
     echo "[smokeping-modern] login enabled for user '$WEBUI_USER' (settings + writes only)"
 fi

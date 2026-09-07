@@ -1,0 +1,34 @@
+*** Probes ***
+
++ FPing
+binary = /usr/sbin/fping
+# fit 20 pings comfortably inside a 10 s step:
+#   -p (hostinterval)  time between successive packets to one target
+#   -i (mininterval)   minimum time between packets to any target
+hostinterval = 0.1
+mininterval  = 0.01
+
++ FPing6
+binary = /usr/sbin/fping
+protocol = 6
+hostinterval = 0.1
+mininterval  = 0.01
+
++ DNS
+binary = /usr/bin/dig
+lookup = google.com
+pings = 5
+
++ TCPPing
+binary = /usr/bin/tcpping
+forks = 10
+offset = random
+pings = 5
+port = 80
+
++ Curl
+binary = /usr/bin/curl
+forks = 5
+offset = 50%
+pings = 5
+urlformat = http://%host%/

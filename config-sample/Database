@@ -1,0 +1,18 @@
+*** Database ***
+
+# Poll every 10 seconds.
+step     = 10
+pings    = 20
+
+# RRA layout, tuned for a 10 s step.
+# consfn  xff  steps   rows        -> span            resolution
+AVERAGE   0.5   1       8640        #  24 hours       10 s
+AVERAGE   0.5   30      5760        #  20 days         5 min
+    MIN   0.5   30      5760
+    MAX   0.5   30      5760
+AVERAGE   0.5   360     2160        #  90 days         1 hour
+    MIN   0.5   360     2160
+    MAX   0.5   360     2160
+AVERAGE   0.5   8640    1095        #   3 years        1 day
+    MIN   0.5   8640    1095
+    MAX   0.5   8640    1095

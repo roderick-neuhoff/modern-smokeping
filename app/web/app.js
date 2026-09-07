@@ -2,7 +2,8 @@
 import { drawSmoke, attachSmokeHover, drawSpark, fmtMs } from './chart.js';
 
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
-const REFRESH_MS = 60_000;
+const REFRESH_MS = 15_000;
+const FETCH_TIMEOUT_MS = 25_000;
 
 const state = {
   tree: null,
@@ -49,10 +50,23 @@ function ago(ts) {
   return Math.round(s / 86400) + 'd ago';
 }
 
-async function api(path) {
-  const r = await fetch(API + path, { headers: { accept: 'application/json' } });
-  if (!r.ok) throw new Error(`${path} -> ${r.status}`);
-  return r.json();
+async function api(path, { retries = 1 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const r = await fetch(API + path, { headers: { accept: 'application/json' }, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!r.ok) throw new Error(`${path} -> ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (attempt < retries) await new Promise(res => setTimeout(res, 1200 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
 }
 
 // --- data refresh -------------------------------------------------
@@ -284,14 +298,15 @@ function renderDashboard() {
   if (!nodes.length) { main.append(el('div', { class: 'empty' }, 'No targets match your filter.')); return; }
 
   const grid = el('div', { class: 'grid' });
-  for (const n of nodes) grid.append(card(n));
+  const draws = [];
+  for (const n of nodes) {
+    const c = card(n);
+    draws.push([c.querySelector('canvas'), n.spark]);
+    grid.append(c);
+  }
   main.append(grid);
-
   requestAnimationFrame(() => {
-    for (const n of nodes) {
-      const cv = grid.querySelector(`canvas[data-sp="${cssEsc(n.path)}"]`);
-      if (cv && n.hasData) loadSpark(cv, n.path);
-    }
+    for (const [cv, spark] of draws) if (cv && spark) drawSpark(cv, spark);
   });
 }
 
@@ -322,30 +337,23 @@ function card(n) {
   return c;
 }
 
-const sparkCache = new Map();
-async function loadSpark(canvas, path) {
-  try {
-    let d = sparkCache.get(path);
-    if (!d || Date.now() - d._at > 55_000) {
-      d = await api('/node?range=3h&path=' + encodeURIComponent(path));
-      d._at = Date.now();
-      sparkCache.set(path, d);
-    }
-    drawSpark(canvas, d.series);
-  } catch { /* leave blank */ }
-}
-
 // --- node detail view -----------------------------------------
 
 const RANGES = ['3h', '30h', '10d', '360d'];
 let nodeRange = localStorage.getItem('sp.range') || '3h';
+let nodeRO = null;
 
 async function renderNode(path) {
   const main = document.getElementById('main');
-  main.innerHTML = '<div class="loading">Loading ' + path + ' …</div>';
+  if (nodeRO) { nodeRO.disconnect(); nodeRO = null; }
+  const fresh = !main.querySelector('.smokechart');
+  if (fresh) main.innerHTML = '<div class="loading">Loading ' + path + ' …</div>';
   let d;
   try { d = await api(`/node?range=${nodeRange}&path=` + encodeURIComponent(path)); }
-  catch (e) { main.innerHTML = `<div class="empty">Could not load <code>${path}</code>.<br>${e.message}</div>`; return; }
+  catch (e) {
+    if (fresh) main.innerHTML = `<div class="empty">Could not load <code>${path}</code>.<br>${e.message}</div>`;
+    return;
+  }
 
   const st = d.stats;
   main.innerHTML = '';
@@ -376,8 +384,8 @@ async function renderNode(path) {
     attachSmokeHover(cv, geom, tip);
   };
   requestAnimationFrame(drawNow);
-  const ro = new ResizeObserver(() => drawNow());
-  ro.observe(cv);
+  nodeRO = new ResizeObserver(() => drawNow());
+  nodeRO.observe(cv);
 
   main.append(el('div', { class: 'statgrid' },
     stat('Median now', fmtMs(st.medianNowMs)),
@@ -567,17 +575,24 @@ themeBtn.addEventListener('click', () => {
 
 // --- boot ---------------------------------------------------
 
+let booted = false;
 async function boot() {
   try {
-    state.tree = await api('/tree');
+    state.tree = await api('/tree', { retries: 4 });
     document.getElementById('brandOwner').textContent = state.tree.owner || '';
     renderTree();
     setOnline(true);
+    booted = true;
   } catch (e) {
-    document.getElementById('main').innerHTML =
-      `<div class="empty">Cannot reach the SmokePing API.<br><code>${API}/tree</code> failed: ${e.message}<br><br>` +
-      `<button class="chip" onclick="location.reload()">Reload</button></div>`;
     setOnline(false);
+    if (!booted) {
+      document.getElementById('main').innerHTML =
+        `<div class="empty">Waiting for the SmokePing API…<br>` +
+        `<code>${API}/tree</code>: ${e.message}<br><br>` +
+        `<button class="chip" id="bootRetry">Retry now</button></div>`;
+      document.getElementById('bootRetry')?.addEventListener('click', boot);
+    }
+    setTimeout(boot, 5000);   // keep trying - the container may still be starting
     return;
   }
   await refresh();

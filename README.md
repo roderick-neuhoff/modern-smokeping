@@ -45,18 +45,21 @@ Rollback is just starting your old container again — nothing in `/config` or
 Dockerfile            FROM lscr.io/linuxserver/smokeping  + the files below
 app/web/              the single-page UI            -> served at /modern/  (and /)
 app/api/              smokeping-api.cgi (Perl)       -> served at /api/
-app/apache/           Apache alias/rewrite snippet
+app/apache/           Apache alias / fcgid / rewrite snippet
 root/custom-cont-init.d/50-smokeping-modern
                       drops the Apache snippet into /config/site-confs on boot
-root/s6-overlay/.../svc-smokeping/run
+root/etc/s6-overlay/s6-rc.d/svc-smokeping/run
                       upstream run script + `--logfile` so alert history is kept
-config-sample/        an optional starter Targets + Alerts set
+config-sample/        starter Targets / Alerts / Database / Probes (10 s step)
 ```
 
 ### The API
 
 Everything the API needs already lives in the base image (`perl`, `RRDs`,
-`JSON::PP`, the `Smokeping::*` modules). It **reuses** SmokePing's own code
+`JSON::PP`, `FCGI`, the `Smokeping::*` modules). It runs under **mod_fcgid**, so
+each worker parses the SmokePing config once and then serves many requests
+(re-reading only when a file under `/config` changes); it falls back to plain CGI
+if `mod_fcgid` is absent. It **reuses** SmokePing's own code
 rather than reimplementing it:
 
 * `Smokeping::Info` — config parsing and numeric stats from the rrd files
@@ -100,11 +103,15 @@ issues out of the top-bar counts.
 
 | Alert | Fires when | Priority |
 |-------|-----------|----------|
-| `hostdown` | >90 % loss for 2 cycles in a row | 1 (critical) |
-| `majorloss` | ≥25 % loss in a single cycle | 2 (critical) |
-| `lossdetect` | ≥10 % loss for 3 cycles in a row | 6 (warning) |
-| `latencyhigh` | RTT > 300 ms for 3+ cycles (`CheckLatency`) | 10 (warning) |
-| `latencyshift` | current latency > 2× the recent baseline (`Avgratio`) | 15 (warning) |
+| `hostdown` | >90 % loss for ~1 min | 1 (critical) |
+| `majorloss` | ≥25 % loss sustained ~1 min | 2 (critical) |
+| `lossdetect` | ≥10 % loss for ~3 min | 6 (warning) |
+| `latencyhigh` | RTT > 300 ms for ~3 min (`CheckLatency`) | 10 (warning) |
+| `latencyshift` | latency > 2× the last ~10 min baseline (`Avgratio`) | 15 (warning) |
+
+The windows in `config-sample/Alerts` are written for the **10 s step** in
+`config-sample/Database` (6 cycles = 1 minute). If you raise `step`, widen the
+`*N*` / `stepsraise` / `x` counts to keep the same wall-clock sensitivity.
 
 Attach them per target (or once at the top of `Targets`):
 
@@ -129,12 +136,26 @@ alert still shows as *down*.
 | `BASE_TAG` | `latest` | `lscr.io/linuxserver/smokeping` tag to build on |
 | `SMOKEPING_LOG` | `/config/log/smokeping.log` | alert-history log the API reads |
 
+## Polling interval
+
+`config-sample/Database` sets **`step = 10`** (poll every 10 s) with an RRA layout
+sized for it (24 h @ 10 s, then 5 min / 1 h / 1 day rollups). The UI auto-refreshes
+every 15 s.
+
+`step` **cannot be changed on existing `.rrd` files** — if you switch it later,
+stop the container, delete `/data/**/*.rrd`, and restart (you lose history, not
+config). The bundled FPing probe sets `hostinterval = 0.1` so 20 pings finish
+well inside a 10 s window. To go easier on the network, raise `step` (and widen
+the alert windows to match).
+
 ## Notes
 
-* First data points appear one `step` (default 5 min) after the container
-  starts; `30h/10d/360d` ranges fill in over time.
+* First data points appear one `step` (10 s) after the container starts;
+  `30h / 10d / 360d` ranges fill in over time.
 * No build step for the front end — plain ES modules and hand-rolled canvas
   charts, no npm, no CDN.
+* Dashboard sparklines are embedded in `/api/summary`, so the whole grid is one
+  request regardless of target count.
 * `docker buildx` is not required (`deploy.sh` uses the legacy builder), which
   matters on Unraid.
 

@@ -185,7 +185,7 @@ export function drawSpark(canvas, series) {
   ctx.clearRect(0, 0, w, h);
   const vals = (series && series.median) || [];
   const loss = (series && series.loss) || [];
-  const t = (series && series.t) || [];
+  const t = (series && series.t) || vals.map((_, i) => i);
   if (t.length < 2) {
     ctx.fillStyle = css('--text-faint');
     ctx.font = `11px ${css('--sans') || 'sans-serif'}`;

@@ -5,8 +5,10 @@ set -e
 echo "[smokeping-modern] installing UI + API"
 
 mkdir -p /config/site-confs /config/log
-install -m 0644 /app/smokeping-modern/apache/smokeping-modern.conf \
-    /config/site-confs/smokeping-modern.conf
+# remove the pre-rename filename if upgrading
+rm -f /config/site-confs/smokeping-modern.conf
+install -m 0644 /app/smokeping-modern/apache/zz-smokeping-modern.conf \
+    /config/site-confs/zz-smokeping-modern.conf
 
 # alert history log (SmokePing has no alert db - see svc-smokeping override)
 touch /config/log/smokeping.log

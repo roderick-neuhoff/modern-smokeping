@@ -57,7 +57,11 @@ sub run {
         return health()                       if $route eq 'health';
         return _cached('tree', $ttl{tree}, \&tree)          if $route eq 'tree';
         return _cached('summary', $ttl{summary}, sub { summary($q) }) if $route eq 'summary';
-        return node($q)                       if $route eq 'node';
+        if ($route eq 'node') {
+            my $safe = ($q->{path} // '') . '|' . ($q->{range} // '3h');
+            $safe =~ s/[^A-Za-z0-9._-]+/_/g;
+            return _cached("node-$safe", 8, sub { node($q) });
+        }
         return _cached('alerts', $ttl{alerts}, \&alerts)    if $route eq 'alerts';
         die { status => 404, error => "unknown route '$route'" };
     };
@@ -123,18 +127,31 @@ sub _query {
 }
 
 # ---------------------------------------------------------------------------
-# config / smokeping bootstrap (once per request; CGI process is short-lived)
+# config / smokeping bootstrap
+# Under mod_fcgid the worker is long-lived, so the parsed config is kept and
+# only re-read when a config file's mtime changes.
 # ---------------------------------------------------------------------------
 
-my ($_si, $_cfg);
+my ($_si, $_cfg, $_sig);
+
+sub _cfg_signature {
+    my $s = '';
+    for my $f ($CONF, glob('/config/*')) {
+        my @st = stat $f or next;
+        $s .= "$f:$st[9]:$st[7];";
+    }
+    return $s;
+}
 
 sub _boot {
-    return ($_si, $_cfg) if $_si;
+    my $sig = _cfg_signature();
+    return ($_si, $_cfg) if $_si && $sig eq $_sig;
     die { status => 500, error => "config not found: $CONF" } unless -r $CONF;
     $_si  = Smokeping::Info->new($CONF);
     $_cfg = $_si->{cfg_hash};
     eval { Smokeping::init_alerts($_cfg); 1 }
         or warn "smokeping-modern: init_alerts failed: $@";
+    $_sig = $sig;
     return ($_si, $_cfg);
 }
 
@@ -354,14 +371,14 @@ sub summary {
     _each_leaf($cfg->{Targets}, '', sub {
         my ($n, $p) = @_;
         my $rrd = _rrd_for($p);
-        my ($lossNow, $medNow, $medAvg, $stddev);
+        my ($lossNow, $medNow, $medAvg, $stddev, $spark);
         if (-f $rrd) {
             my $pings = _pings_for($n);
             my $s = $si->stat_node({ path => $p, pings => $pings }, "-${secs}s", 'now');
             $lossNow = _num($s->{loss_now});
             $medNow  = _num($s->{med_now});
             $medAvg  = _num($s->{med_avg});
-            $stddev  = _rrd_stddev($rrd, $secs);
+            ($stddev, $spark) = _rrd_stddev_spark($rrd, $secs);
         }
 
         # loss is a fraction 0..1. a single dropped ping (~1/20) is noise;
@@ -389,6 +406,7 @@ sub summary {
             medianNowMs => defined $medNow  ? $medNow * 1000 : undef,
             medianAvgMs => defined $medAvg  ? $medAvg * 1000 : undef,
             stddevMs    => $stddev,
+            spark       => $spark,
             hasData     => _bool(-f $rrd),
         };
     });
@@ -408,20 +426,47 @@ sub summary {
     };
 }
 
-sub _rrd_stddev {
+# one fetch -> stddev (over the window) + a ~60-point sparkline for the card
+sub _rrd_stddev_spark {
     my ($rrd, $secs) = @_;
-    my (undef, undef, $names, $data) =
+    my ($start, $step, $names, $data) =
         RRDs::fetch($rrd, 'AVERAGE', '--start', "-${secs}s", '--end', 'now');
-    return undef if RRDs::error();
+    return (undef, undef) if RRDs::error();
     my %col;
     $col{ $names->[$_] } = $_ for 0 .. $#$names;
-    return undef unless defined $col{median};
-    my @v = grep { defined } map { $_->[ $col{median} ] } @$data;
-    return undef if @v < 3;
-    my $mean = 0; $mean += $_ for @v; $mean /= @v;
-    my $var = 0; $var += ($_ - $mean) ** 2 for @v; $var /= @v;
-    return sqrt($var) * 1000;
+    return (undef, undef) unless defined $col{median};
+
+    my @med = map { $_->[ $col{median} ] } @$data;
+    my @los = defined $col{loss} ? map { $_->[ $col{loss} ] } @$data : ();
+
+    my @v = grep { defined } @med;
+    my $stddev;
+    if (@v >= 3) {
+        my $mean = 0; $mean += $_ for @v; $mean /= @v;
+        my $var = 0; $var += ($_ - $mean) ** 2 for @v; $var /= @v;
+        $stddev = sqrt($var) * 1000;
+    }
+
+    # downsample to at most 60 buckets
+    my $want = 60;
+    my $n = scalar @med;
+    my $bucket = $n > $want ? int($n / $want) + 1 : 1;
+    my (@sm, @sl);
+    for (my $i = 0; $i < $n; $i += $bucket) {
+        my $hi = $i + $bucket - 1; $hi = $n - 1 if $hi >= $n;
+        my (@mm, @ll);
+        for my $j ($i .. $hi) {
+            push @mm, $med[$j] if defined $med[$j];
+            push @ll, $los[$j] if @los && defined $los[$j];
+        }
+        push @sm, @mm ? (_avg(@mm) * 1000) : undef;
+        push @sl, @ll ? _avg(@ll) : undef;   # loss as ping count; UI only needs >0
+    }
+    my $spark = { median => \@sm, loss => \@sl, step => $step * $bucket };
+    return ($stddev, $spark);
 }
+
+sub _avg { my $s = 0; $s += $_ for @_; return @_ ? $s / @_ : undef }
 
 # ---------------------------------------------------------------------------
 # alerts - live evaluation of every target's assigned alert patterns

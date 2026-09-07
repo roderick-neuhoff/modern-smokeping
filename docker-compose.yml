@@ -14,7 +14,8 @@ services:
       - PUID=${PUID:-99}
       - PGID=${PGID:-100}
       - TZ=${TZ:-Europe/Amsterdam}
-      # Login for the UI + API (+ classic CGI). WEBUI_AUTH=off disables it.
+      # Password for the Settings page and every write (config, acks, tests,
+      # reload). Viewing stays open. WEBUI_AUTH=off disables it.
       # Leave WEBUI_PASS empty to have one generated on first start - it is
       # printed in the container log and kept in /config/modern-auth/password.txt
       - WEBUI_AUTH=${WEBUI_AUTH:-on}

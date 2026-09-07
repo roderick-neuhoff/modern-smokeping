@@ -892,7 +892,7 @@ function paneAccess(pane) {
   pane.append(el('div', { class: 'card-plain' },
     el('h2', {}, 'Login'),
     el('p', {}, settingsData.user ? `You are signed in as ${settingsData.user}.` : 'Login is disabled (WEBUI_AUTH=off).'),
-    el('p', { class: 'sub' }, 'The UI, the API and the classic CGI share one HTTP Basic login. It is set from the container environment, not from here:'),
+    el('p', { class: 'sub' }, 'Viewing (dashboard, alerts, wall, classic UI) is open. The password guards only what changes things: this Settings page, config files, add-target, test mail/notify, reload and acknowledgements. It is set from the container environment, not from here:'),
     el('pre', { class: 'result ok', style: 'display:block' }, 'WEBUI_AUTH=on        # off disables the login\nWEBUI_USER=admin\nWEBUI_PASS=…          # blank = generated once, see /config/modern-auth/password.txt'),
     el('p', { class: 'sub' }, 'Change the values in .env and restart the container. Sign out by closing the browser (Basic auth has no logout).')));
 }

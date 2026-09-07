@@ -110,7 +110,10 @@ file is kept, and the daemon is reloaded with `SIGHUP` — no container restart.
 | **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves` with validate-and-save |
 | **Access** | shows who you are and how the login is configured |
 
-**Login.** The UI, the API and the classic CGI sit behind one HTTP Basic login:
+**Login.** Viewing is open — dashboard, alerts, wall, the classic CGI and every
+read-only API route. One HTTP Basic password guards only what *changes* things
+(the Settings page, config files, add-target, test mail/notify, reload, and
+acknowledging alerts); the browser prompts the first time you open Settings:
 
 ```
 WEBUI_AUTH=on        # off disables it entirely

@@ -30,28 +30,27 @@ else
         printf '%s\n' "$GEN" > /config/modern-auth/password.txt
         echo "[smokeping-modern] generated login: user=$WEBUI_USER password=$GEN (saved to /config/modern-auth/password.txt)"
     fi
+    # Viewing is open (dashboard, alerts, wall, classic CGI, read-only API).
+    # The password guards only what changes things: settings, config files,
+    # add-target, test mail/notify, reload, and ack writes.
     cat > "$AUTH_INC" <<EOF
 # written by modern-smokeping init - do not edit (set WEBUI_USER/WEBUI_PASS/WEBUI_AUTH instead)
-<Location /modern>
+<LocationMatch "^/api/(settings|config|targets|test|reload|me)(/|$)">
     AuthType Basic
-    AuthName "SmokePing"
+    AuthName "SmokePing settings"
     AuthUserFile $HTPASSWD
     Require valid-user
-</Location>
-<Location /api>
+</LocationMatch>
+<Location /api/acks>
     AuthType Basic
-    AuthName "SmokePing"
+    AuthName "SmokePing settings"
     AuthUserFile $HTPASSWD
-    Require valid-user
-</Location>
-<Location /smokeping>
-    AuthType Basic
-    AuthName "SmokePing"
-    AuthUserFile $HTPASSWD
-    Require valid-user
+    <LimitExcept GET HEAD>
+        Require valid-user
+    </LimitExcept>
 </Location>
 EOF
-    echo "[smokeping-modern] login enabled for user '$WEBUI_USER'"
+    echo "[smokeping-modern] login enabled for user '$WEBUI_USER' (settings + writes only)"
 fi
 
 # --- mail: let the Settings page edit ssmtp live --------------------------

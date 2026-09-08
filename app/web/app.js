@@ -1301,13 +1301,19 @@ function renderWall() {
   const draws = [];
   for (const n of nodes) {
     const crumbs = ancestorLabels(n.path);
-    const customer = crumbs.length ? crumbs[crumbs.length - 1] : '';
     const t = el('a', { class: 'wall-tile ' + n.severity, href: '#/node' + n.path },
       el('div', { class: 'wall-tile-title' }, n.title),
       el('div', { class: 'wall-tile-val' }, fmtMs(n.medianNowMs), el('small', {}, ' ' + fmtPct(n.lossNowPct) + ' loss')));
     const cv = el('canvas', { class: 'spark', style: 'height:38px' });
     t.append(cv);
-    if (customer) t.append(el('div', { class: 'wall-tile-cust', title: crumbs.join(' › ') }, customer));
+    if (crumbs.length) {
+      const path = el('div', { class: 'wall-tile-cust', title: crumbs.join(' › ') });
+      crumbs.forEach((c, i) => {
+        if (i) path.append(el('span', { class: 'sep' }, ' › '));
+        path.append(el('span', { class: i === 0 ? 'lead' : '' }, c));
+      });
+      t.append(path);
+    }
     draws.push([cv, n.spark]); grid.append(t);
   }
   main.append(grid);

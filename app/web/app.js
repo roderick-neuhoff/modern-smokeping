@@ -1267,6 +1267,23 @@ function paneAccess(pane) {
 
 // --- wall display ---------------------------------------------------
 
+// ancestor group labels for a leaf path, walked from the loaded tree
+// (the "Top" root is skipped). The last entry is the immediate parent
+// group - in a customer -> connection layout that is the customer name.
+function ancestorLabels(path) {
+  const root = state.tree && state.tree.root;
+  if (!root || !path || path === '/') return [];
+  const segs = path.split('/').filter(Boolean);
+  const out = [];
+  let node = root;
+  for (let i = 0; i < segs.length - 1; i++) {
+    node = (node.children || []).find(c => c.name === segs[i]);
+    if (!node) break;
+    out.push(node.menu || node.title || node.name);
+  }
+  return out;
+}
+
 function renderWall() {
   const main = document.getElementById('main');
   const s = state.summary;
@@ -1283,11 +1300,15 @@ function renderWall() {
   const grid = el('div', { class: 'wall-grid' });
   const draws = [];
   for (const n of nodes) {
+    const crumbs = ancestorLabels(n.path);
+    const customer = crumbs.length ? crumbs[crumbs.length - 1] : '';
     const t = el('a', { class: 'wall-tile ' + n.severity, href: '#/node' + n.path },
       el('div', { class: 'wall-tile-title' }, n.title),
       el('div', { class: 'wall-tile-val' }, fmtMs(n.medianNowMs), el('small', {}, ' ' + fmtPct(n.lossNowPct) + ' loss')));
     const cv = el('canvas', { class: 'spark', style: 'height:38px' });
-    t.append(cv); draws.push([cv, n.spark]); grid.append(t);
+    t.append(cv);
+    if (customer) t.append(el('div', { class: 'wall-tile-cust', title: crumbs.join(' › ') }, customer));
+    draws.push([cv, n.spark]); grid.append(t);
   }
   main.append(grid);
   requestAnimationFrame(() => { for (const [cv, sp] of draws) if (sp) drawSpark(cv, sp); });

@@ -356,6 +356,7 @@ body.wall-mode .main { padding: 14px; }
 .wall-tile-title { font-weight: 650; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wall-tile-val { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 2px 0 4px; }
 .wall-tile-val small { font-size: 12px; font-weight: 500; color: var(--text-dim); }
+.wall-tile-cust { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .only-mobile { display: none; }
 @media (max-width: 900px) {

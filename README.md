@@ -25,9 +25,10 @@ password, write) the same files. The classic CGI stays reachable at
 
 ### Requirements
 
-* Docker with the `docker compose` plugin (v2). `docker buildx` is **not** needed —
-  the deploy script uses the legacy builder, which matters on Unraid.
-* Outbound network from the host to pull `lscr.io/linuxserver/smokeping`.
+* Docker with the `docker compose` plugin (v2). Nothing is built on the host —
+  `deploy.sh` just pulls the published image, so `docker buildx` is not needed
+  even on Unraid.
+* Outbound network from the host to pull `ghcr.io/roderick-neuhoff/modern-smokeping`.
 * One free TCP port (default `8480`). On Unraid, 80 and 443 belong to the web UI.
 
 ### 1. Get the code
@@ -41,6 +42,9 @@ cp .env.example .env
 ### 2. Edit `.env`
 
 ```ini
+# image tag to pull from ghcr.io/roderick-neuhoff/modern-smokeping
+IMAGE_TAG=latest          # or pin a version: 1.2.3 / 1.2 / 1
+
 # where SmokePing keeps its config and its rrd data on the host
 CONFIG_DIR=/mnt/user/appdata/smokeping/config
 DATA_DIR=/mnt/user/appdata/smokeping/data
@@ -54,15 +58,13 @@ TZ=Europe/Amsterdam
 WEBUI_AUTH=on             # off = no login anywhere
 WEBUI_USER=admin
 WEBUI_PASS=               # blank = generated on first start (see step 4)
-
-BASE_TAG=latest           # lscr.io/linuxserver/smokeping tag to build on
 ```
 
 `CONFIG_DIR` and `DATA_DIR` are created if missing. If you already run
 `linuxserver/smokeping`, point them at **its** volumes — see
 [Migrating](#migrating-from-linuxserversmokeping).
 
-### 3. Build and start
+### 3. Pull and start
 
 ```bash
 ./deploy.sh
@@ -73,13 +75,15 @@ The script:
 1. creates the two directories,
 2. seeds `config-sample/*` (Targets, Alerts, Database, Probes) into `CONFIG_DIR` —
    **only for files that don't exist yet**, it never overwrites,
-3. builds the image with the legacy builder (`DOCKER_BUILDKIT=0 docker build`),
+3. pulls `IMAGE_TAG` from `ghcr.io/roderick-neuhoff/modern-smokeping` (built by
+   GitHub Actions — nothing is built on the host, so no buildx needed even on
+   Unraid),
 4. runs `docker compose up -d`.
 
 Without the script:
 
 ```bash
-DOCKER_BUILDKIT=0 docker build -t modern-smokeping:latest .
+docker compose pull
 docker compose up -d
 ```
 
@@ -115,16 +119,47 @@ docker exec smokeping tail -f /config/log/smokeping.log
 
 ```bash
 cd modern-smokeping
-git pull
 ./deploy.sh
 ```
 
-`deploy.sh` rebuilds the image and `docker compose up -d` **recreates** the
-container (a plain `docker restart` would keep running the old image). Your
-`/config` and `/data` are volumes and survive; the Apache snippet and the
-`svc-smokeping` override are reinstalled from the image on every start.
+`deploy.sh` pulls the current `IMAGE_TAG` and `docker compose up -d`
+**recreates** the container (a plain `docker restart` would keep running the
+old image). Your `/config` and `/data` are volumes and survive; the Apache
+snippet and the `svc-smokeping` override are reinstalled from the image on
+every start.
 
-To follow a newer SmokePing base, bump `BASE_TAG` and redeploy.
+To pin a specific version instead of always tracking `latest`, set
+`IMAGE_TAG` in `.env` (e.g. `IMAGE_TAG=1.2.3`) before redeploying.
+
+## Versioning / releases
+
+Images are built and published automatically by GitHub Actions
+(`.github/workflows/docker-publish.yml`) to
+[`ghcr.io/roderick-neuhoff/modern-smokeping`](https://github.com/roderick-neuhoff/modern-smokeping/pkgs/container/modern-smokeping) —
+nothing is built locally or on the deploy host.
+
+* Every push to `main` publishes/updates the `latest` tag.
+* Pushing a version tag (`git tag v1.2.3 && git push --tags`) builds a
+  multi-arch (amd64/arm64) image and publishes it as `1.2.3`, `1.2` and `1`,
+  and creates a GitHub Release with auto-generated notes.
+
+The image is always built `FROM lscr.io/linuxserver/smokeping:<tag>` — by
+default `latest`. To follow a different SmokePing base:
+
+* set it repo-wide: **Settings → Secrets and variables → Actions → Variables**,
+  add `BASE_TAG` (e.g. `2.7.4`) — every push/tag build then uses it, or
+* one-off: **Actions → Build and publish Docker image → Run workflow**, fill in
+  *base_tag*.
+
+To release a new version:
+
+```bash
+git tag v1.2.3
+git push --tags
+```
+
+Then set `IMAGE_TAG=1.2.3` in `.env` on hosts that should pick it up, and run
+`./deploy.sh`.
 
 ## Rollback
 
@@ -255,7 +290,7 @@ loss and sparkline, plus a status header and clock. Always live (ignores pause).
 | `WEBUI_AUTH` | `on` | `off` disables the login entirely |
 | `WEBUI_USER` | `admin` | login user |
 | `WEBUI_PASS` | *(blank)* | login password; blank = generated once |
-| `BASE_TAG` | `latest` | `lscr.io/linuxserver/smokeping` tag |
+| `IMAGE_TAG` | `latest` | tag pulled from `ghcr.io/roderick-neuhoff/modern-smokeping` |
 | `SMOKEPING_LOG` | `/config/log/smokeping.log` | alert-history log the API parses |
 
 ### Files in `/config` this project adds or manages
@@ -326,6 +361,7 @@ existing `.rrd` files** — to change it: stop the container, delete
 ## How it works
 
 ```
+.github/workflows/docker-publish.yml   builds + publishes the image to ghcr.io on push/tag
 Dockerfile                      FROM lscr.io/linuxserver/smokeping + the files below
 app/web/                        single-page UI (plain ES modules, canvas charts, no build step)  -> /modern/ and /
 app/api/smokeping-api.cgi       JSON API, runs under mod_fcgid                                -> /api/

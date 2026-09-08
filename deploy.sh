@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Build and (re)start modern-smokeping on a Docker host.
-#   ./deploy.sh            build + up on the local Docker
+# Pull and (re)start modern-smokeping on a Docker host.
+#   ./deploy.sh                          pull IMAGE_TAG (default: latest) + up
+#   IMAGE_TAG=1.2.3 ./deploy.sh          pin a version (also settable in .env)
 #   DOCKER_HOST=ssh://root@host ./deploy.sh
+#
+# The image is built by GitHub Actions and published to ghcr.io - nothing is
+# built on the host, so this works on Unraid without buildx.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,10 +23,7 @@ for f in config-sample/*; do
   fi
 done
 
-# buildx is not always present (e.g. Unraid) - fall back to the legacy builder.
-export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-0}"
-docker build --build-arg "BASE_TAG=${BASE_TAG:-latest}" -t modern-smokeping:latest .
-
+docker compose pull
 docker compose up -d
 docker compose ps
 echo

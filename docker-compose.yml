@@ -1,14 +1,15 @@
 # modern-smokeping - drop-in replacement for the LinuxServer.io SmokePing
 # container. Same volumes, same behaviour, plus a modern UI at / and /modern/
 # and a JSON API at /api/.
+#
+# Image is built by GitHub Actions and published to ghcr.io on every push to
+# main (tag "latest") and every version tag (v1.2.3 -> tags 1.2.3, 1.2, 1) -
+# see .github/workflows/docker-publish.yml. Set IMAGE_TAG in .env to pin a
+# version; deploy.sh just pulls it, nothing is built on the host.
 
 services:
   smokeping:
-    build:
-      context: .
-      args:
-        BASE_TAG: ${BASE_TAG:-latest}
-    image: modern-smokeping:latest
+    image: ghcr.io/roderick-neuhoff/modern-smokeping:${IMAGE_TAG:-latest}
     container_name: smokeping
     environment:
       - PUID=${PUID:-99}

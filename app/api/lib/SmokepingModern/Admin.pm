@@ -680,31 +680,39 @@ sub _graph_token_check {
     my $verdict;
     if (!$has_send) {
         $verdict = "PROBLEM: the token has no Mail.Send application role. In Entra ID -> your app -> API permissions -> "
-                 . "Add -> Microsoft Graph -> Application permissions -> Mail.Send -> Add, then Grant admin consent "
-                 . "(the 'Request admin consent' button here also works). Then run Check token again.";
+                 . "Add -> Microsoft Graph -> APPLICATION permissions (not Delegated) -> Mail.Send -> Add, then "
+                 . "Grant admin consent (the 'Request admin consent' button here also works). Then run Check token again.";
     } else {
-        # probe the mailbox the app will send as
-        my ($pr, $prc) = _capture(20, '/usr/bin/curl', '-sS', '-m', '15',
-            '-H', "Authorization: Bearer $token",
-            'https://graph.microsoft.com/v1.0/users/' . ($o->{account} =~ s/([^A-Za-z0-9_.\@~-])/sprintf('%%%02X',ord $1)/ger)
-            . '?$select=userPrincipalName,mail,mailboxSettings');
+        # a real dry run: attempt sendMail with an empty recipient list. Graph returns
+        # 400 (ErrorInvalidRecipients) if the app *may* send as this mailbox, and 403 if
+        # an ApplicationAccessPolicy / RBAC-for-Apps is blocking it.
+        my $probe = $JSON->encode({ message => { subject => 'modern-smokeping check',
+            body => { contentType => 'Text', content => '.' }, toRecipients => [] }, saveToSentItems => \0 });
+        my ($pr, $prc) = _capture(20, '/usr/bin/curl', '-sS', '-m', '15', '-w', "
+%{http_code}",
+            '-H', "Authorization: Bearer $token", '-H', 'Content-Type: application/json',
+            '--data-binary', $probe,
+            'https://graph.microsoft.com/v1.0/users/' . ($o->{account} =~ s/([^A-Za-z0-9_.\@~-])/sprintf('%%%02X',ord $1)/ger) . '/sendMail');
+        my ($pc) = $pr =~ /(\d{3})\s*\z/;
+        $pr =~ s/\s*\d{3}\s*\z//;
         my $pd = eval { $JSON->decode($pr) } || {};
-        if ($pd->{error}) {
-            my $c = $pd->{error}{code} // '';
-            if ($c eq 'ErrorAccessDenied' || $c =~ /Authorization/i) {
-                $verdict = "Token has Mail.Send, but Graph refuses this mailbox ($o->{account}). If you set an "
-                         . "Exchange ApplicationAccessPolicy, make sure it *allows* this app for a group that "
-                         . "contains $o->{account}. Otherwise the app can send but the policy is blocking it.";
-            } elsif ($c eq 'Request_ResourceNotFound' || $c =~ /NotFound/i) {
-                $verdict = "PROBLEM: mailbox '$o->{account}' not found in the directory. Use the exact "
-                         . "userPrincipalName / primary SMTP address of a real mailbox or shared mailbox.";
-            } else {
-                $verdict = "Token has Mail.Send. Mailbox probe returned '$c' - sending may still work; "
-                         . "use 'Test these settings' to confirm.";
-            }
+        my $pcode = $pd->{error}{code} // '';
+        if (($pc // '') eq '400') {
+            $verdict = "Ready: the app can send as '$o->{account}'. Run 'Test these settings'.";
+        } elsif (($pc // '') eq '403' || $pcode =~ /Denied|AccessDenied/i) {
+            $verdict = "PROBLEM: token has Mail.Send but Exchange is blocking this app for '$o->{account}' (HTTP 403). "
+                     . "Run in Exchange Online PowerShell:  Test-ApplicationAccessPolicy -Identity $o->{account} "
+                     . "-AppId $o->{clientId}  . If it says Denied, add a policy that ALLOWS this app:  "
+                     . "New-DistributionGroup -Name 'SmokePing senders' -Type Security -Members $o->{account} ;  "
+                     . "New-ApplicationAccessPolicy -AppId $o->{clientId} -PolicyScopeGroupId 'SmokePing senders' "
+                     . "-AccessRight RestrictAccess -Description modern-smokeping . "
+                     . "Also check the mailbox has an Exchange Online licence.";
+        } elsif ($pcode =~ /ResourceNotFound|NotFound/i || ($pc // '') eq '404') {
+            $verdict = "PROBLEM: mailbox '$o->{account}' not found. Use the exact primary SMTP / UPN of a real "
+                     . "(licensed) mailbox or shared mailbox.";
         } else {
-            $verdict = "Ready: token has Mail.Send and the mailbox '" . ($pd->{mail} || $pd->{userPrincipalName} || $o->{account})
-                     . "' is reachable. Run 'Test these settings'.";
+            $verdict = "Token has Mail.Send. Dry-run returned HTTP " . ($pc // '?') . " ($pcode) - "
+                     . "run 'Test these settings' for the real result.";
         }
     }
     push @lines, "scopes   : (app-only, uses roles not scopes)",

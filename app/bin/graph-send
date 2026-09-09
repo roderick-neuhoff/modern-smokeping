@@ -154,4 +154,8 @@ if ($code eq '401') { unlink $CACHE; ($code, $out) = send_once(fetch_token()); }
 
 if ($code eq '202') { logline("sent to @rcpt"); exit 0; }
 my $msg = eval { $J->decode($out)->{error}{message} } // (length $out ? substr($out, 0, 300) : "HTTP $code");
+if ($code eq '403') {
+    $msg .= "  [Exchange is blocking this app for $cfg->{account}: check Test-ApplicationAccessPolicy,"
+          . " add an ApplicationAccessPolicy that allows the app, and confirm the mailbox is licensed]";
+}
 fail("Graph sendMail HTTP $code: $msg", 75);

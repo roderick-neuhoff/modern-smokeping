@@ -223,10 +223,11 @@ sub _write_msmtp_to {
 
 # point SmokePing at the msmtp wrapper (pathnames: sendmail = ...)
 sub _ensure_sendmail_path {
+    my $target = shift || $SENDMAIL;
     my $s = _slurp($PATHNAMES) // '';
-    return 0 if $s =~ /^\s*sendmail\s*=\s*\Q$SENDMAIL\E\s*$/m;
-    if ($s =~ /^\s*sendmail\s*=/m) { $s =~ s/^\s*sendmail\s*=.*$/sendmail = $SENDMAIL/m }
-    else                            { $s = "sendmail = $SENDMAIL\n$s" }
+    return 0 if $s =~ /^\s*sendmail\s*=\s*\Q$target\E\s*$/m;
+    if ($s =~ /^\s*sendmail\s*=/m) { $s =~ s/^\s*sendmail\s*=.*$/sendmail = $target/m }
+    else                             { $s = "sendmail = $target\n$s" }
     _spew($PATHNAMES, $s, 0644);
     return 1;
 }
@@ -277,7 +278,7 @@ sub settings_get {
         clientId        => $o->{clientId} // '',
         clientSecretSet => (length($o->{clientSecret} // '') ? \1 : \0),
         refreshTokenSet => (length($o->{refreshToken} // '') ? \1 : \0),
-        configured      => ((length($o->{refreshToken} // '') || (($o->{provider} // '') eq 'microsoft-app' && length($o->{clientSecret} // ''))) ? \1 : \0),
+        configured      => ((length($o->{refreshToken} // '') || (($o->{provider} // '') =~ /^microsoft-(app|graph)$/ && length($o->{clientSecret} // ''))) ? \1 : \0),
         tenant          => $o->{tenant} // 'common',
         account         => $o->{account} // '',
         connectedAt     => $o->{connectedAt},

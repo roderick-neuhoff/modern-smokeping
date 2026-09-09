@@ -21,6 +21,7 @@ my $MASTER     = $ENV{SMOKEPING_CONF}       || '/etc/smokeping/config';
 my $SMOKEPING  = '/usr/sbin/smokeping';
 my $SSMTP_BIN  = '/usr/sbin/ssmtp';
 my $SENDMAIL   = '/app/smokeping-modern/bin/sendmail';     # msmtp wrapper
+my $GRAPH_SEND = '/app/smokeping-modern/bin/graph-send';   # Microsoft Graph app-only sender
 my $OAUTH_BIN  = '/app/smokeping-modern/bin/oauth-token';
 my $NOTIFY_BIN = '/app/smokeping-modern/bin/notify';
 my $SSMTP_CONF = "$CONFIG_DIR/ssmtp.conf";
@@ -145,6 +146,15 @@ sub _read_oauth {
 }
 
 sub _read_ssmtp {
+    my $go = _read_oauth();
+    if (($go->{provider} // '') eq 'microsoft-graph') {
+        return {
+            host => '', port => 0, starttls => \0, tls => \0,
+            authUser => $go->{account} // '', passSet => \0,
+            root => $go->{account} // '', hostname => '',
+            authMethod => 'graph-microsoft', engine => 'graph', _pass => '',
+        };
+    }
     my $m = _read_kv($MSMTP_CONF, ' ');
     if (%$m && $m->{host}) {
         my $o = _read_oauth();
@@ -284,12 +294,55 @@ sub settings_get {
     };
 }
 
+sub _settings_graph {
+    my $b = shift || {};
+    my $oi  = $b->{oauth} || {};
+    my $o   = _read_oauth();
+    my $same = ($o->{provider} // '') eq 'microsoft-graph';
+    my $sender = ($b->{authUser} // $b->{from} // '') =~ s/\s//gr;
+    $sender ||= ($same ? ($o->{account} // '') : '');
+
+    my %new = (
+        provider     => 'microsoft-graph',
+        tenant       => (($oi->{tenant} // '') =~ s/\s//gr) || ($same ? $o->{tenant} : ''),
+        clientId     => (($oi->{clientId} // '') =~ s/\s//gr) || ($same ? $o->{clientId} : ''),
+        clientSecret => (length($oi->{clientSecret} // '') ? $oi->{clientSecret} : ($same ? $o->{clientSecret} : '')),
+        account      => $sender,
+        connectedAt  => time,
+    );
+    for (qw(tenant clientId clientSecret account)) { $new{$_} =~ s/[\r\n]//g if defined $new{$_} }
+    die { status => 422, error => 'tenant (verified domain or directory GUID) is required' } unless length $new{tenant};
+    die { status => 422, error => 'tenant must be your domain or GUID, not "common"' }
+        if $new{tenant} =~ /^(common|organizations|consumers)$/i;
+    die { status => 422, error => 'application (client) ID is required' }
+        unless $new{clientId} =~ /^[0-9a-fA-F-]{36}$/;
+    die { status => 422, error => 'client secret is required' } unless length $new{clientSecret};
+    die { status => 422, error => 'sender mailbox address is required' }
+        unless $new{account} =~ /^[^\s@]+@[^\s@]+$/;
+
+    my $from = $b->{from} || $new{account};
+    die { status => 422, error => 'from must be an e-mail address' } unless $from =~ /^[^\s@]+@[^\s@]+$/;
+    my @emails = grep { length } map { s/\s//gr } @{ $b->{to} || [] };
+    for (@emails) { die { status => 422, error => "invalid recipient '$_'" } unless /^[^\s@]+@[^\s@]+$/ }
+
+    _spew($OAUTH_CFG, $JSON->canonical->encode(\%new) . "\n", 0600);
+    unlink '/tmp/spm-graph-token.json', '/tmp/spm-oauth-token.json';
+    my $switched = _ensure_sendmail_path($GRAPH_SEND);
+    _write_alert_header(\@emails, $from, $b->{webhooks} ? 1 : 0);
+
+    my $chk = _check_config();
+    my $rl  = _passed($chk) ? _hup() : { ok => \0, note => 'not reloaded - config check failed' };
+    return { ok => \1, check => $chk, reload => $rl, sendmailSwitched => ($switched ? \1 : \0),
+             engine => 'graph', settings => settings_get() };
+}
+
 sub settings_smtp {
     my $b = shift || {};
     my $cur = _read_ssmtp();
     my $method = $b->{authMethod} // 'password';
-    die { status => 422, error => 'authMethod must be password, oauth-google, oauth-microsoft or oauth-microsoft-app' }
-        unless $method =~ /^(password|oauth-google|oauth-microsoft|oauth-microsoft-app)$/;
+    die { status => 422, error => 'authMethod must be password, oauth-google, oauth-microsoft, oauth-microsoft-app or graph-microsoft' }
+        unless $method =~ /^(password|oauth-google|oauth-microsoft|oauth-microsoft-app|graph-microsoft)$/;
+    return _settings_graph($b) if $method eq 'graph-microsoft';
     my $host = $b->{host} // '';
     $host =~ s/\s//g;
     $host ||= $method eq 'oauth-google' ? 'smtp.gmail.com' : $method =~ /^oauth-microsoft/ ? 'smtp.office365.com' : '';
@@ -590,7 +643,82 @@ sub oauth_status {
 
 # exchange the stored credentials for a token once, then read what the token
 # actually grants - this is what Exchange looks at when it says 535 5.7.3
+# client-credentials token for Graph, then read what it grants + probe the mailbox
+sub _graph_token_check {
+    my $o = shift;
+    for (qw(tenant clientId clientSecret account)) {
+        return { ok => \0, rc => 1, output => "config field '$_' is missing" } unless length($o->{$_} // '');
+    }
+    my ($tok, $trc) = _capture(25, '/usr/bin/curl', '-sS', '-m', '20', '-X', 'POST',
+        "https://login.microsoftonline.com/$o->{tenant}/oauth2/v2.0/token",
+        '--data-urlencode', "client_id=$o->{clientId}",
+        '--data-urlencode', "client_secret=$o->{clientSecret}",
+        '--data-urlencode', 'grant_type=client_credentials',
+        '--data-urlencode', 'scope=https://graph.microsoft.com/.default');
+    my $td = eval { $JSON->decode($tok) } || {};
+    if ($trc || $td->{error}) {
+        my $m = $td->{error} ? "$td->{error}: " . ($td->{error_description} =~ s/\s*Trace ID:.*$//sr) : "curl rc=$trc";
+        return { ok => \0, rc => 1, output => "token request failed - $m" };
+    }
+    my $token = $td->{access_token} or return { ok => \0, rc => 1, output => 'no access_token returned' };
+
+    my @lines = ('access token obtained (' . length($token) . ' chars)');
+    my $claims;
+    if ($token =~ /^[\w-]+\.([\w-]+)\.[\w-]+$/) {
+        my $mid = $1; $mid =~ tr{-_}{+/}; $mid .= '=' x ((4 - length($mid) % 4) % 4);
+        require MIME::Base64;
+        $claims = eval { $JSON->decode(MIME::Base64::decode_base64($mid)) };
+    }
+    my @roles = ($claims && ref $claims->{roles} eq 'ARRAY') ? @{ $claims->{roles} } : ();
+    push @lines,
+        "audience : " . ($claims->{aud} // '?'),
+        "tenant   : " . ($claims->{tid} // '?'),
+        "app id   : " . ($claims->{appid} // $claims->{azp} // '?'),
+        "roles    : " . (@roles ? join(', ', @roles) : '(none)');
+
+    my $has_send = grep { /^Mail\.Send$/ } @roles;
+    my $verdict;
+    if (!$has_send) {
+        $verdict = "PROBLEM: the token has no Mail.Send application role. In Entra ID -> your app -> API permissions -> "
+                 . "Add -> Microsoft Graph -> Application permissions -> Mail.Send -> Add, then Grant admin consent "
+                 . "(the 'Request admin consent' button here also works). Then run Check token again.";
+    } else {
+        # probe the mailbox the app will send as
+        my ($pr, $prc) = _capture(20, '/usr/bin/curl', '-sS', '-m', '15',
+            '-H', "Authorization: Bearer $token",
+            'https://graph.microsoft.com/v1.0/users/' . ($o->{account} =~ s/([^A-Za-z0-9_.\@~-])/sprintf('%%%02X',ord $1)/ger)
+            . '?$select=userPrincipalName,mail,mailboxSettings');
+        my $pd = eval { $JSON->decode($pr) } || {};
+        if ($pd->{error}) {
+            my $c = $pd->{error}{code} // '';
+            if ($c eq 'ErrorAccessDenied' || $c =~ /Authorization/i) {
+                $verdict = "Token has Mail.Send, but Graph refuses this mailbox ($o->{account}). If you set an "
+                         . "Exchange ApplicationAccessPolicy, make sure it *allows* this app for a group that "
+                         . "contains $o->{account}. Otherwise the app can send but the policy is blocking it.";
+            } elsif ($c eq 'Request_ResourceNotFound' || $c =~ /NotFound/i) {
+                $verdict = "PROBLEM: mailbox '$o->{account}' not found in the directory. Use the exact "
+                         . "userPrincipalName / primary SMTP address of a real mailbox or shared mailbox.";
+            } else {
+                $verdict = "Token has Mail.Send. Mailbox probe returned '$c' - sending may still work; "
+                         . "use 'Test these settings' to confirm.";
+            }
+        } else {
+            $verdict = "Ready: token has Mail.Send and the mailbox '" . ($pd->{mail} || $pd->{userPrincipalName} || $o->{account})
+                     . "' is reachable. Run 'Test these settings'.";
+        }
+    }
+    push @lines, "scopes   : (app-only, uses roles not scopes)",
+                 "expires  : " . ($claims->{exp} ? scalar localtime($claims->{exp}) : '?'),
+                 '', $verdict;
+    return { ok => ($verdict =~ /^PROBLEM/ ? \0 : \1), rc => 0, output => join("\n", @lines),
+             claims => ($claims ? { aud => $claims->{aud}, tid => $claims->{tid},
+                                    appid => ($claims->{appid} // $claims->{azp}), roles => $claims->{roles} } : undef) };
+}
+
 sub oauth_token_check {
+    my $go = _read_oauth();
+    return _graph_token_check($go) if ($go->{provider} // '') eq 'microsoft-graph';
+
     unlink '/tmp/spm-oauth-token.json';                 # force a fresh exchange
     my ($out, $rc) = _capture(40, $OAUTH_BIN);
     my $token = $rc == 0 ? ($out =~ s/\s+//gr) : '';
@@ -1086,9 +1214,59 @@ sub acks_delete {
 #   to:    address, comma-separated list, or "recipients" = the saved alert list
 #   smtp:  optional - the E-mail form's *unsaved* values; when present the test
 #          goes through a temporary msmtp config so you can test before saving
+# a message body identical in spirit to a real SmokePing alert
+sub _sample_alert_message {
+    my ($to, $from) = @_;
+    my $host = (POSIX::uname())[1];
+    return join "\r\n",
+        "To: " . join(', ', @$to), "From: $from",
+        "Subject: [SmokeAlert] TEST hostdown was raised on Demo.Target",
+        "Content-Type: text/plain; charset=utf-8", "",
+        "This is a TEST from modern-smokeping on $host - no target is actually down.",
+        "A real alert mail from SmokePing looks like this:", "",
+        "Alert \"hostdown\" was raised for Demo.Target",
+        "Pattern: >90%,>90%,>90%,>90%,>90%,>90%",
+        "Data (old -> now): loss: 0%, 0%, 100%, 100%, 100%, 100%, 100%, 100%",
+        "                   rtt: 15ms, 15ms, U, U, U, U, U, U",
+        "Comment: Host unreachable - >90% packet loss for ~1 minute", "",
+        "Sent " . scalar(localtime), "";
+}
+
+sub _test_mail_graph {
+    my $b = shift || {};
+    die { status => 422, error => 'save the Graph settings first, then test' } unless -s $OAUTH_CFG;
+    my $o = _read_oauth();
+    die { status => 422, error => 'saved config is not in Graph mode' } unless ($o->{provider} // '') eq 'microsoft-graph';
+
+    my @to;
+    if (($b->{to} // '') eq 'recipients') {
+        @to = @{ _read_alert_header()->{emails} };
+        die { status => 422, error => 'no e-mail recipients are configured yet' } unless @to;
+    } else {
+        @to = grep { length } map { s/\s//gr } split /[,;\n]/, ($b->{to} // '');
+    }
+    die { status => 422, error => 'recipient address required' } unless @to;
+    for (@to) { die { status => 422, error => "invalid address '$_'" } unless /^[^\s@]+@[^\s@]+$/ }
+
+    my $from = $o->{account};
+    my $msg  = _sample_alert_message(\@to, $from);
+    my ($out, $rc) = _capture_in(60, $msg, $GRAPH_SEND, '-t');
+    $out =~ s/\s+$//;
+    return { ok => ($rc == 0 ? \1 : \0), rc => $rc, engine => 'graph', to => \@to, from => $from,
+             output => ($out || ($rc == 0 ? 'accepted by Microsoft Graph (HTTP 202)' : "exit code $rc")) };
+}
+
 sub test_mail {
     my $b = shift || {};
     my $cur = _read_ssmtp();
+
+    # Graph mode: no SMTP, send straight through bin/graph-send using the saved config
+    my $want_graph = ($b->{smtp} && ($b->{smtp}{authMethod} // '') eq 'graph-microsoft')
+                  || (!$b->{smtp} && ($cur->{authMethod} // '') eq 'graph-microsoft');
+    if ($want_graph) {
+        return _test_mail_graph($b);
+    }
+
     my @to;
     if (($b->{to} // '') eq 'recipients') {
         @to = @{ _read_alert_header()->{emails} };

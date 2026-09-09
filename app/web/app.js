@@ -815,8 +815,9 @@ function paneMail(pane) {
     method: el('select', { class: 'input' },
       el('option', { value: 'password' }, 'Username + password (or app password)'),
       el('option', { value: 'oauth-google' }, 'OAuth2 — Google / Gmail'),
-      el('option', { value: 'oauth-microsoft-app' }, 'OAuth2 — Microsoft 365, app-only (client ID + secret, no sign-in)'),
-      el('option', { value: 'oauth-microsoft' }, 'OAuth2 — Microsoft 365, sign in as a user (device code)')),
+      el('option', { value: 'graph-microsoft' }, 'Microsoft 365 — Graph API (app-only, no SMTP; recommended)'),
+      el('option', { value: 'oauth-microsoft-app' }, 'Microsoft 365 — SMTP app-only (SMTP.SendAsApp)'),
+      el('option', { value: 'oauth-microsoft' }, 'Microsoft 365 — SMTP, sign in as a user')),
     host: input({ value: s.host, placeholder: 'smtp.gmail.com' }),
     port: input({ type: 'number', value: s.port, style: 'width:100px' }),
     starttls: el('input', { type: 'checkbox' }), tls: el('input', { type: 'checkbox' }),
@@ -986,7 +987,7 @@ function paneMail(pane) {
     const tenant = (f.tenant.value.trim() || 'common');
     const u = new URL(`https://login.microsoftonline.com/${encodeURIComponent(tenant)}/v2.0/adminconsent`);
     u.searchParams.set('client_id', cid);
-    u.searchParams.set('scope', 'https://outlook.office365.com/.default');
+    u.searchParams.set('scope', f.method.value === 'graph-microsoft' ? 'https://graph.microsoft.com/.default' : 'https://outlook.office365.com/.default');
     u.searchParams.set('redirect_uri', NATIVE_REDIRECT);
     u.searchParams.set('state', 'modern-smokeping');
     window.open(u.toString(), '_blank', 'noopener');
@@ -1011,21 +1012,37 @@ function paneMail(pane) {
       catch (err) { toast(err.message, true); }
     } }, 'Forget OAuth2'));
 
-  const oauthWrap = el('div', {}, status, googleBox, appBox, microsoftBox, oauthFields, signInRow, oauthTools, oRes);
+  const graphBox = el('div', {},
+    el('p', { class: 'sub' }, el('b', {}, 'No SMTP at all: '), 'SmokePing posts each alert to Microsoft Graph (', el('span', { class: 'pattern' }, 'POST /users/{mailbox}/sendMail'), ') with the app credentials. Not affected by SMTP AUTH being disabled. One-time admin setup:'),
+    el('ol', { class: 'sub steps' },
+      el('li', {}, 'Entra ID → your app → ', el('b', {}, 'API permissions'), ' → Add → ', el('b', {}, 'Microsoft Graph'), ' → ',
+        el('b', {}, 'Application permissions'), ' → ', el('span', { class: 'pattern' }, 'Mail.Send'), ' → Add → ', el('b', {}, 'Grant admin consent'),
+        ' (or the ', el('b', {}, 'Request admin consent'), ' button below).'),
+      el('li', {}, el('b', {}, 'Certificates & secrets'), ' → New client secret → paste the ', el('i', {}, 'Value'), ' below.'),
+      el('li', {}, 'Optional but recommended — lock the app to one mailbox (Exchange Online PowerShell):',
+        el('pre', { class: 'result ok', style: 'display:block;margin:6px 0' },
+          'New-DistributionGroup -Name "SmokePing senders" -Type Security -Members alerts@yourdomain.com\n' +
+          'New-ApplicationAccessPolicy -AppId <client ID> -PolicyScopeGroupId "SmokePing senders" -AccessRight RestrictAccess -Description modern-smokeping')),
+      el('li', {}, 'Tenant = your verified domain or directory GUID, not "common".')));
+
+  const oauthWrap = el('div', {}, status, googleBox, appBox, microsoftBox, graphBox, oauthFields, signInRow, oauthTools, oRes);
+  const isOauthy = m => m.startsWith('oauth') || m === 'graph-microsoft';
   const applyMethod = () => {
     const m = f.method.value;
     pwBox.hidden = m !== 'password';
-    oauthWrap.hidden = !m.startsWith('oauth');
+    oauthWrap.hidden = !isOauthy(m);
+    for (const fe of [hostField, portField, starttlsField, tlsField]) fe.hidden = (m === 'graph-microsoft');
     googleBox.hidden = m !== 'oauth-google';
     appBox.hidden = m !== 'oauth-microsoft-app';
     microsoftBox.hidden = m !== 'oauth-microsoft';
+    graphBox.hidden = m !== 'graph-microsoft';
     oTenant.hidden = m === 'oauth-google';
     oRefresh.hidden = m !== 'oauth-google';
-    oBase.hidden = m === 'oauth-microsoft-app';
+    oBase.hidden = (m === 'oauth-microsoft-app' || m === 'graph-microsoft');
     signInRow.hidden = !(m === 'oauth-google' || m === 'oauth-microsoft');
     msBtn.hidden = m !== 'oauth-microsoft';
     signInBtn.textContent = m === 'oauth-google' ? 'Sign in with Google' : 'Sign in with Microsoft';
-    consentBtn.hidden = !m.startsWith('oauth-microsoft');
+    consentBtn.hidden = !(m.startsWith('oauth-microsoft') || m === 'graph-microsoft');
     if (m === 'oauth-google') {
       setLabel(oClient, 'Client ID'); setLabel(oSecret, 'Client secret');
       setLabel(oRefresh, 'Refresh token', 'from the OAuth 2.0 Playground'); setLabel(oUser, 'Mailbox (user)', 'the Google account you authorized');
@@ -1035,21 +1052,28 @@ function paneMail(pane) {
     } else if (m === 'oauth-microsoft') {
       setLabel(oTenant, 'Tenant', '"common" works for most; tenant ID for single-tenant apps'); setLabel(oClient, 'Application (client) ID');
       setLabel(oSecret, 'Client secret', 'only if the app is confidential (usually blank)'); setLabel(oUser, 'Mailbox (user)', 'filled in automatically after connecting');
+    } else if (m === 'graph-microsoft') {
+      setLabel(oTenant, 'Tenant ID or domain', 'not "common"'); setLabel(oClient, 'Application (client) ID');
+      setLabel(oSecret, 'Client secret', 'the secret Value, not its ID'); setLabel(oUser, 'Send-as mailbox', 'the mailbox / shared mailbox the app may send as');
     }
     if (m === 'oauth-google' && !f.host.value) { f.host.value = 'smtp.gmail.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
     if (m.startsWith('oauth-microsoft') && (!f.host.value || f.host.value === 'smtp.gmail.com')) { f.host.value = 'smtp.office365.com'; f.port.value = 587; f.starttls.checked = true; f.tls.checked = false; }
-    if (m === 'oauth-microsoft-app' && (!f.tenant.value || f.tenant.value === 'common')) f.tenant.value = '';
+    if ((m === 'oauth-microsoft-app' || m === 'graph-microsoft') && (!f.tenant.value || f.tenant.value === 'common')) f.tenant.value = '';
   };
   f.method.addEventListener('change', applyMethod);
   applyMethod();
+
+  const hostField = field('Mail server', f.host);
+  const portField = field('Port', f.port);
+  const starttlsField = field('STARTTLS', f.starttls, 'usually on for port 587');
+  const tlsField = field('TLS (implicit)', f.tls, 'for port 465');
 
   pane.append(el('div', { class: 'card-plain' },
     el('h2', {}, 'Outgoing mail (SMTP)'),
     el('p', { class: 'sub' }, 'Alert e-mails are sent through msmtp. Gmail and Microsoft 365 both prefer OAuth2 over passwords; an app password still works for Gmail accounts with 2-step verification.'),
     el('div', { class: 'form-grid' },
       field('Sign-in method', f.method),
-      field('Mail server', f.host), field('Port', f.port),
-      field('STARTTLS', f.starttls, 'usually on for port 587'), field('TLS (implicit)', f.tls, 'for port 465'),
+      hostField, portField, starttlsField, tlsField,
       field('From address', f.from)),
     pwBox, oauthWrap,
     el('h2', {}, 'Alert recipients'),

@@ -1,0 +1,157 @@
+#!/usr/bin/perl
+# sendmail-compatible sender that delivers via the Microsoft Graph API using
+# app-only (client-credentials) OAuth2 - no SMTP, no SMTP AUTH, no user sign-in.
+# Equivalent to  POST /v1.0/users/{mailbox}/sendMail .
+#
+# SmokePing calls it as:  graph-send -f <from> <recipient> [<recipient>...]
+# with the full RFC822 message (headers + blank line + body) on stdin.
+# `-t` (take recipients from the headers) is also honoured.
+#
+# Config: /config/modern-oauth.json
+#   { "provider":"microsoft-graph", "tenant":"<domain-or-guid>",
+#     "clientId":"<app id>", "clientSecret":"<secret>",
+#     "account":"<mailbox the app may send as>" }
+#
+# The app registration needs Microsoft Graph  Mail.Send  APPLICATION permission
+# (admin-consented); scope it to one mailbox with an Exchange Online
+# ApplicationAccessPolicy.
+
+use strict;
+use warnings;
+use JSON::PP ();
+use IPC::Open3 ();
+use Symbol ();
+
+my $CFG   = $ENV{SPM_GRAPH_CFG}   || '/config/modern-oauth.json';
+my $CACHE = $ENV{SPM_GRAPH_CACHE} || '/tmp/spm-graph-token.json';
+my $LOG   = $ENV{SPM_GRAPH_LOG}   || '/config/log/msmtp.log';
+my $CURL  = '/usr/bin/curl';
+my $J     = JSON::PP->new->utf8;
+
+sub logline { my $l = shift; if (open my $fh, '>>', $LOG) { print $fh scalar(localtime), " graph-send: $l\n"; close $fh } }
+sub fail    { my ($m, $rc) = @_; print STDERR "graph-send: $m\n"; logline("FAILED: $m"); exit($rc // 75) }
+sub urlenc  { my $s = shift // ''; $s =~ s/([^A-Za-z0-9_.\@~-])/sprintf('%%%02X', ord $1)/ge; $s }
+
+# run @cmd, feed $stdin, return (stdout, exit-code)
+sub run {
+    my ($stdin, @cmd) = @_;
+    my ($wr, $rd) = (Symbol::gensym(), Symbol::gensym());
+    my $pid = eval { IPC::Open3::open3($wr, $rd, $rd, @cmd) } or return ("cannot run $cmd[0]: $@", 127);
+    print $wr $stdin if defined $stdin;
+    close $wr;
+    local $/;
+    my $out = <$rd> // '';
+    close $rd;
+    waitpid $pid, 0;
+    return ($out, $? >> 8);
+}
+
+# --- arguments (sendmail-ish) -----------------------------------------------
+my (@rcpt, $tflag);
+{
+    my @a = @ARGV;
+    while (@a) {
+        my $x = shift @a;
+        if    ($x eq '-t')           { $tflag = 1 }
+        elsif ($x =~ /^-[fFrR]$/)    { shift @a }        # envelope-from: Graph uses the mailbox, ignore
+        elsif ($x eq '--')           { push @rcpt, @a; last }
+        elsif ($x =~ /^-/)           { }                 # ignore -oi -i ...
+        else                         { push @rcpt, split /\s*,\s*/, $x }
+    }
+}
+
+# --- message ---------------------------------------------------------------
+my $raw = do { local $/; <STDIN> } // '';
+$raw =~ s/\r\n/\n/g;
+my ($hdr, $body) = split /\n\n/, $raw, 2;
+$hdr  //= '';
+$body //= '';
+
+my %H;
+{
+    my $k;
+    for my $line (split /\n/, $hdr) {
+        if    ($line =~ /^(\S[^:]*):[ \t]?(.*)$/)      { $k = lc $1; $H{$k} = $2 }
+        elsif ($line =~ /^[ \t]+(.*)$/ && defined $k)  { $H{$k} .= " $1" }
+    }
+}
+if ($tflag) {
+    for my $f (qw(to cc bcc)) {
+        next unless defined $H{$f};
+        push @rcpt, ($H{$f} =~ /([^\s<>,;()]+\@[^\s<>,;()]+)/g);
+    }
+}
+{ my %seen; @rcpt = grep { /^[^\s@]+\@[^\s@]+$/ && !$seen{lc $_}++ } @rcpt; }
+fail('no valid recipients', 64) unless @rcpt;
+
+my $subject = defined $H{subject} ? $H{subject} : '(no subject)';
+my $ctype   = ($H{'content-type'} // '') =~ /html/i ? 'HTML' : 'Text';
+$body =~ s/\s+\z//;
+
+# --- config --------------------------------------------------------------
+my $cfg = eval {
+    open my $f, '<', $CFG or die "\n";
+    local $/; my $s = <$f>; close $f;
+    $J->decode($s);
+} or fail("no mail config ($CFG) - open Settings -> E-mail", 78);
+fail('mail config is not in Graph mode', 78) unless ($cfg->{provider} // '') eq 'microsoft-graph';
+length($cfg->{$_} // '') or fail("config field '$_' is missing", 78) for qw(tenant clientId clientSecret account);
+
+my $cachekey = substr($cfg->{clientSecret}, -8) . ':' . $cfg->{tenant} . ':' . $cfg->{clientId};
+
+# --- token -------------------------------------------------------------
+sub cached_token {
+    my $c = eval {
+        open my $f, '<', $CACHE or return undef;
+        local $/; my $s = <$f>; close $f;
+        $J->decode($s);
+    } or return undef;
+    return undef unless ($c->{key} // '') eq $cachekey && $c->{token} && $c->{exp};
+    return $c->{exp} - time > 120 ? $c->{token} : undef;
+}
+sub fetch_token {
+    my ($out, $rc) = run(undef, $CURL, '-sS', '-m', '20', '-X', 'POST',
+        "https://login.microsoftonline.com/$cfg->{tenant}/oauth2/v2.0/token",
+        '--data-urlencode', "client_id=$cfg->{clientId}",
+        '--data-urlencode', "client_secret=$cfg->{clientSecret}",
+        '--data-urlencode', 'grant_type=client_credentials',
+        '--data-urlencode', 'scope=https://graph.microsoft.com/.default');
+    fail("token endpoint unreachable (curl rc=$rc)", 75) if $rc;
+    my $d = eval { $J->decode($out) } or fail("token endpoint returned non-JSON: " . substr($out, 0, 200), 75);
+    fail("$d->{error}: " . ($d->{error_description} // ''), 77) if $d->{error};
+    fail('no access_token from token endpoint', 75) unless $d->{access_token};
+    if (open my $fh, '>', "$CACHE.$$") {
+        print $fh $J->encode({ token => $d->{access_token}, exp => time + ($d->{expires_in} || 3600), key => $cachekey });
+        close $fh; chmod 0600, "$CACHE.$$"; rename "$CACHE.$$", $CACHE;
+    }
+    return $d->{access_token};
+}
+
+# --- send ------------------------------------------------------------
+my $payload = $J->encode({
+    message => {
+        subject      => $subject,
+        body         => { contentType => $ctype, content => $body },
+        toRecipients => [ map { { emailAddress => { address => $_ } } } @rcpt ],
+    },
+    saveToSentItems => JSON::PP::false,
+});
+
+sub send_once {
+    my $token = shift;
+    my ($out, $rc) = run($payload, $CURL, '-sS', '-m', '30', '-w', "\n%{http_code}", '-X', 'POST',
+        '-H', "Authorization: Bearer $token",
+        '-H', 'Content-Type: application/json',
+        '--data-binary', '@-',
+        'https://graph.microsoft.com/v1.0/users/' . urlenc($cfg->{account}) . '/sendMail');
+    my ($code) = $out =~ /(\d{3})\s*\z/;
+    $out =~ s/\s*\d{3}\s*\z//;
+    return ($code // '000', $out);
+}
+
+my ($code, $out) = send_once(cached_token() || fetch_token());
+if ($code eq '401') { unlink $CACHE; ($code, $out) = send_once(fetch_token()); }
+
+if ($code eq '202') { logline("sent to @rcpt"); exit 0; }
+my $msg = eval { $J->decode($out)->{error}{message} } // (length $out ? substr($out, 0, 300) : "HTTP $code");
+fail("Graph sendMail HTTP $code: $msg", 75);

@@ -242,9 +242,17 @@ Auto-refresh is off on this page so it can never wipe a half-filled form.
 
 ### E-mail: OAuth2
 
-Alert mail goes out through **msmtp** (added to the image), configured from
-Settings → E-mail. Three sign-in methods:
+Configured from Settings → E-mail. Options:
 
+* **Microsoft 365 — Graph API (recommended).** No SMTP at all: SmokePing POSTs
+  each alert to `https://graph.microsoft.com/v1.0/users/{mailbox}/sendMail` using
+  the app's own client-credentials token. Unaffected by Microsoft turning off
+  SMTP AUTH. Setup: Entra ID → your app → API permissions → **Microsoft Graph →
+  Application permissions → `Mail.Send`** → *Grant admin consent*; add a client
+  secret; enter tenant (domain/GUID, not `common`), client ID, secret and the
+  send-as mailbox. Lock the app to that one mailbox with an Exchange
+  `New-ApplicationAccessPolicy` so it can't send as anyone else. **Check token**
+  verifies the role and probes the mailbox.
 * **Password / app password** — classic SMTP AUTH. Gmail needs an *app password*
   (2-step verification on).
 * **OAuth2 — Google / Gmail.** Google has no device sign-in for the Gmail scope, so
@@ -261,13 +269,14 @@ Settings → E-mail. Three sign-in methods:
   tenant, click **Connect with Microsoft**, open the URL it shows, type the code,
   sign in — the refresh token and mailbox are stored automatically.
 
-Under the hood: `msmtp` uses `auth xoauth2` with
-`passwordeval bin/oauth-token`, which exchanges the stored refresh token for an
+The three SMTP methods go through **msmtp** (`auth xoauth2` +
+`passwordeval bin/oauth-token`), which exchanges the stored refresh token for an
 access token (cached in `/tmp` until near expiry). Secrets live in
 `/config/modern-oauth.json` (0600) and `/config/msmtp.conf` (0600). **Check
 token** proves the credentials without sending mail; **Forget OAuth2** wipes them.
-On first save `pathnames` is switched to `sendmail = /app/smokeping-modern/bin/sendmail`
-(the msmtp wrapper); until then a legacy `ssmtp.conf` keeps working.
+On save, `pathnames` is pointed at the right sender wrapper
+(`bin/graph-send` for Graph, `bin/sendmail`→msmtp for SMTP); a legacy
+`ssmtp.conf` keeps working until then.
 
 ### Wall display (`#/wall`)
 

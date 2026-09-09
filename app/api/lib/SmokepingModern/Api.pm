@@ -25,7 +25,7 @@ use RRDs;
 use Smokeping::Info;
 use Smokeping;
 
-our $VERSION = '1.0.0';
+our $VERSION = '1.0.3';
 
 my $CONF     = $ENV{SMOKEPING_CONF} || '/etc/smokeping/config';
 my $LOGFILE  = $ENV{SMOKEPING_LOG}  || '';

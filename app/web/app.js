@@ -1012,6 +1012,11 @@ function paneMail(pane) {
       catch (err) { toast(err.message, true); }
     } }, 'Forget OAuth2'));
 
+  const hostField = field('Mail server', f.host);
+  const portField = field('Port', f.port);
+  const starttlsField = field('STARTTLS', f.starttls, 'usually on for port 587');
+  const tlsField = field('TLS (implicit)', f.tls, 'for port 465');
+
   const graphBox = el('div', {},
     el('p', { class: 'sub' }, el('b', {}, 'No SMTP at all: '), 'SmokePing posts each alert to Microsoft Graph (', el('span', { class: 'pattern' }, 'POST /users/{mailbox}/sendMail'), ') with the app credentials. Not affected by SMTP AUTH being disabled. One-time admin setup:'),
     el('ol', { class: 'sub steps' },
@@ -1062,11 +1067,6 @@ function paneMail(pane) {
   };
   f.method.addEventListener('change', applyMethod);
   applyMethod();
-
-  const hostField = field('Mail server', f.host);
-  const portField = field('Port', f.port);
-  const starttlsField = field('STARTTLS', f.starttls, 'usually on for port 587');
-  const tlsField = field('TLS (implicit)', f.tls, 'for port 465');
 
   pane.append(el('div', { class: 'card-plain' },
     el('h2', {}, 'Outgoing mail (SMTP)'),

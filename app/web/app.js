@@ -1162,13 +1162,19 @@ function paneTargets(pane) {
   const walk = (node, depth) => { for (const c of (node.children || [])) { if (!c.isLeaf) { groups.push(c.path); walk(c, depth + 1); } } };
   if (state.tree) walk(state.tree.root, 0);
   const sel = el('select', { class: 'input' }, el('option', { value: '' }, '(top level)'), ...groups.map(g => el('option', { value: g }, g)));
-  const alertNames = ((state.alerts && state.alerts.active) || []).map(a => a.alert);
+  const definedAlerts = (state.tree && state.tree.alertsDefined) || [];
+  const addAlertBoxes = definedAlerts.map(name => {
+    const cb = el('input', { type: 'checkbox' }); cb.dataset.alert = name;
+    return el('label', { class: 'alert-check' }, cb, ' ', name);
+  });
+  const addAlerts = addAlertBoxes.length
+    ? el('div', { class: 'alert-checks' }, ...addAlertBoxes)
+    : el('p', { class: 'field-help' }, 'No alerts defined yet (Config files → Alerts).');
   const f = {
     parent: sel, key: input({ placeholder: 'MyRouter  (letters, digits, - _)' }),
     menu: input({ placeholder: 'Menu label' }), title: input({ placeholder: 'Title shown on the page' }),
     host: input({ placeholder: '192.168.1.1 or host.example.com' }),
     probe: input({ placeholder: 'FPing (blank = inherit)' }),
-    alerts: input({ placeholder: 'hostdown,majorloss,… (blank = inherit)' }),
   };
   const res = resultBox();
   pane.append(el('div', { class: 'card-plain' },
@@ -1177,20 +1183,100 @@ function paneTargets(pane) {
     el('div', { class: 'form-grid' },
       field('Group', f.parent), field('Key', f.key, 'becomes part of the path and the rrd filename'),
       field('Menu', f.menu), field('Title', f.title), field('Host', f.host),
-      field('Probe', f.probe), field('Alerts', f.alerts)),
+      field('Probe', f.probe)),
+    field('Alerts', addAlerts),
     el('div', { class: 'modal-actions' }, el('button', { class: 'chip on', onclick: async (e) => {
       e.currentTarget.disabled = true;
       try {
         const r = await post('/targets/add', {
           parent: f.parent.value, key: f.key.value.trim(), menu: f.menu.value.trim(), title: f.title.value.trim(),
           host: f.host.value.trim(), probe: f.probe.value.trim(),
-          alerts: f.alerts.value.split(',').map(x => x.trim()).filter(Boolean),
+          alerts: [...addAlerts.querySelectorAll('input[type=checkbox]')].filter(c => c.checked).map(c => c.dataset.alert),
         });
         showResult(res, r, `Added ${r.path}. Reloading tree…`);
         state.tree = await api('/tree'); renderTree();
       } catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
       e.currentTarget.disabled = false;
     } }, 'Add target')), res));
+
+  // --- edit an existing target --------------------------------------
+  const eall = [];
+  const ewalk = (node) => { for (const c of (node.children || [])) { eall.push([c.path, c.isLeaf ? 'target' : 'group']); ewalk(c); } };
+  if (state.tree) ewalk(state.tree.root);
+  const esel = el('select', { class: 'input' }, el('option', { value: '' }, '— choose —'),
+    ...eall.map(([p, k]) => el('option', { value: p }, `${p}  (${k})`)));
+  const ebody = el('div', { hidden: 'hidden' });
+  const eres = resultBox();
+  esel.addEventListener('change', () => loadEdit(esel.value));
+
+  async function loadEdit(path) {
+    ebody.innerHTML = ''; ebody.hidden = true; eres.hidden = true;
+    if (!path) return;
+    let d;
+    try { d = await api('/targets/get?path=' + encodeURIComponent(path)); }
+    catch (e) { showResult(eres, { ok: false, error: e.message, ...(e.data || {}) }); return; }
+    const orig = d.props || {};
+    const menu = input({ value: orig.menu || '', placeholder: d.name });
+    const title = input({ value: orig.title || '', placeholder: d.name });
+    const host = input({ value: orig.host || '', placeholder: d.isLeaf ? 'host or IP address' : '(group)' });
+    const probe = input({ value: orig.probe || '', placeholder: 'inherit from parent' });
+    const alertee = input({ value: orig.alertee || '', placeholder: 'extra e-mail address(es), optional' });
+
+    const defined = d.availableAlerts || [];
+    const explicit = new Set(d.explicitAlerts || []);
+    const mkBox = (name, warn) => {
+      const cb = el('input', { type: 'checkbox' });
+      cb.checked = explicit.has(name);
+      cb.dataset.alert = name;
+      return el('label', { class: 'alert-check', title: warn ? 'set on this target but not defined in the Alerts file' : '' },
+        cb, ' ', name, warn ? ' ⚠' : '');
+    };
+    const orphan = [...explicit].filter(a => !defined.includes(a));
+    const alertBoxes = [...defined.map(n => mkBox(n, false)), ...orphan.map(n => mkBox(n, true))];
+    const inh = d.inheritedAlerts || [];
+    const alertsWrap = el('div', {},
+      alertBoxes.length ? el('div', { class: 'alert-checks' }, ...alertBoxes)
+        : el('p', { class: 'field-help' }, 'No alerts defined yet — add some on the Config files tab (Alerts file).'),
+      inh.length ? el('p', { class: 'field-help' },
+        'Also inherited (applies no matter what is ticked): '
+        + inh.map(x => `${x.alerts} — from ${x.from}`).join('; ')) : null);
+
+    ebody.append(
+      el('div', { class: 'form-grid' },
+        field('Menu', menu), field('Title', title),
+        (d.isLeaf || orig.host) ? field('Host', host,
+          d.isGroup ? 'multi-host target — space-separated paths' : 'changing this starts a fresh graph') : null,
+        field('Probe', probe), field('Extra alert recipients', alertee)),
+      field('Alerts on this ' + (d.isGroup ? 'group (applies to every target under it)' : 'target'), alertsWrap),
+      el('div', { class: 'modal-actions' }, el('button', { class: 'chip on', onclick: saveEdit }, 'Save changes')));
+    ebody.hidden = false;
+
+    async function saveEdit(e) {
+      e.currentTarget.disabled = true;
+      const alerts = [...ebody.querySelectorAll('input[type=checkbox][data-alert]')]
+        .filter(c => c.checked).map(c => c.dataset.alert);
+      const payload = { path, alerts };
+      const chg = (el2, key) => { if (el2.value.trim() !== (orig[key] || '')) payload[key] = el2.value.trim(); };
+      chg(menu, 'menu'); chg(title, 'title'); chg(probe, 'probe'); chg(alertee, 'alertee');
+      if (d.isLeaf || orig.host) chg(host, 'host');
+      try {
+        const r = await authed(() => post('/targets/edit', payload));
+        showResult(eres, r, `Saved ${r.path}. SmokePing reloaded.`);
+        state.tree = await api('/tree'); renderTree();
+        await loadEdit(path);
+      } catch (err) { showResult(eres, { ok: false, error: err.message, ...(err.data || {}) }); }
+      e.currentTarget.disabled = false;
+    }
+  }
+
+  pane.append(el('div', { class: 'card-plain' },
+    el('h2', {}, 'Edit a target'),
+    el('p', { class: 'sub' }, 'Change the menu, title, host, probe or alerts of a target that already exists — '
+      + 'including ones from an imported SmokePing config. Ticking an alert here writes an "alerts = …" line on '
+      + 'that target; validated with smokeping --check and reloaded.'),
+    el('div', { class: 'form-grid' }, field('Target / group', esel)),
+    ebody, eres));
+
 
   // --- remove ---------------------------------------------------------
   const all = [];

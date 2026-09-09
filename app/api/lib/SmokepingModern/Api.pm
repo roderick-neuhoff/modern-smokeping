@@ -267,6 +267,7 @@ sub tree {
         owner     => $cfg->{General}{owner},
         title     => $cfg->{Targets}{title} // 'SmokePing',
         ranges    => [ sort { $RANGE_SEC{$a} <=> $RANGE_SEC{$b} } keys %RANGE_SEC ],
+        alertsDefined => [ sort grep { ref $cfg->{Alerts}{$_} eq 'HASH' } keys %{ $cfg->{Alerts} || {} } ],
         root      => $root,
     };
 }

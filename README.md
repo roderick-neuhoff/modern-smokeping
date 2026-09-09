@@ -234,7 +234,7 @@ container restart.
 |-----|---|
 | **E-mail** | SMTP server / port / STARTTLS / TLS, sign-in method **password or OAuth2** (Google, Microsoft 365), alert *from* + recipient list, **Send test e-mail** — see [E-mail: OAuth2](#e-mail-oauth2) |
 | **Notifications** | Discord, Slack, Telegram, ntfy, Gotify, generic JSON webhook — each with **Save & send test**. Enable *Webhook notifications* on the E-mail tab to route alerts there |
-| **Targets** | **Add** a target under any group. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
+| **Targets** | **Add** a target under any group. **Edit** an existing target or group — menu, title, host, probe and its alerts (tick boxes for each defined alert); works on targets from an imported SmokePing config. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
 | **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves`; nothing is saved if the check fails |
 | **Access** | who you are, how the login is set, **Sign out** |
 

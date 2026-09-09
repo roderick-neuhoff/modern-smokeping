@@ -306,6 +306,9 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; font-
 .card-plain { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 16px; box-shadow: var(--shadow); }
 .card-plain h2 { font-size: 15px; margin: 6px 0 10px; }
 .card-plain .sub { color: var(--text-faint); font-size: 13px; margin: 0 0 12px; }
+.alert-checks { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 4px 0 6px; }
+.alert-check { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; color: var(--text); background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 6px; padding: 4px 9px; cursor: pointer; user-select: none; }
+.alert-check input { accent-color: var(--accent); }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 18px; margin-bottom: 12px; }
 .field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 .field-label { color: var(--text-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }

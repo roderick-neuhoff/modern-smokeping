@@ -61,7 +61,9 @@ sub handle {
         return config_put($sub, $body)              if $method eq 'POST';
     }
     if ($route eq 'targets') {
+        return (200, target_get($q))                if $sub eq 'get'    && $method eq 'GET';
         return target_add($body)                    if $sub eq 'add'    && $method eq 'POST';
+        return target_edit($body)                   if $sub eq 'edit'   && $method eq 'POST';
         return target_remove($body)                 if $sub eq 'remove' && $method eq 'POST';
     }
     if ($route eq 'acks') {
@@ -710,6 +712,209 @@ sub config_put {
     _spew($f, $text, 0644);
     my $rl = _hup();
     return (200, { ok => \1, check => $chk, reload => $rl, name => $name });
+}
+
+# ---------------------------------------------------------------------------
+# read / edit an existing target's own properties (menu/title/host/probe/
+# alerts/alertee). Alerts on an existing target - the common "old SmokePing
+# config" case - could previously only be changed in the raw Config editor.
+# ---------------------------------------------------------------------------
+
+sub _targets_read {
+    my $file = "$CONFIG_DIR/Targets";
+    my $raw = _slurp($file);
+    die { status => 500, error => 'Targets file missing' } unless defined $raw;
+    (my $norm = $raw) =~ s/\r\n?/\n/g;
+    return ($file, $raw, [ split /\n/, $norm, -1 ]);
+}
+
+# names of alerts defined in the Alerts file (+name at column 0)
+sub _defined_alerts {
+    my $s = _slurp("$CONFIG_DIR/Alerts") // '';
+    my @n;
+    for (split /\n/, $s) { push @n, $1 if /^\+\s*([A-Za-z0-9_.-]+)\s*$/ }
+    return \@n;
+}
+
+# locate a target/group by its path segments. returns:
+#   ($header_idx, $region_end, $block_end)
+#   header_idx  : the "+++ Name" line
+#   region_end  : first line after the header that starts a sub-section (own
+#                 properties live between header+1 and region_end, exclusive)
+#   block_end   : where this node's whole subtree ends
+sub _locate_block {
+    my ($lines, $segs) = @_;
+    my $n = scalar @$segs;
+    return unless $n;
+    my (@stack, $h, $bend);
+    for my $i (0 .. $#$lines) {
+        next unless $lines->[$i] =~ /^\s*(\++)\s*(\S.*?)\s*$/;
+        my ($depth, $name) = (length $1, $2);
+        if (defined $h && !defined $bend && $depth <= $n) { $bend = $i; last }
+        $#stack = $depth - 2 if $depth - 1 <= $#stack;
+        $stack[$depth - 1] = $name;
+        if (!defined $h && $depth == $n
+            && join("\x00", @stack[0 .. $depth - 1]) eq join("\x00", @$segs)) { $h = $i }
+    }
+    return unless defined $h;
+    $bend //= scalar @$lines;
+    my $rend = $bend;
+    for my $i ($h + 1 .. $bend - 1) {
+        if ($lines->[$i] =~ /^\s*\++\s/) { $rend = $i; last }
+    }
+    return ($h, $rend, $bend);
+}
+
+sub _path_segs {
+    my $p = shift // '';
+    $p =~ s{^/+}{};
+    $p =~ s{/+$}{};
+    my @segs = split m{/}, $p;
+    die { status => 422, error => 'path is required' } unless @segs;
+    for (@segs) {
+        die { status => 422, error => "bad path segment '$_'" } if !length or m{[\x00-\x1f/]};
+    }
+    return @segs;
+}
+
+# alerts set on ancestor groups / the top-level default (informational)
+sub _inherited_alerts {
+    my ($lines, $segs) = @_;
+    my @inh;
+    my $first_plus = scalar @$lines;
+    for my $i (0 .. $#$lines) { if ($lines->[$i] =~ /^\s*\+/) { $first_plus = $i; last } }
+    for my $i (0 .. $first_plus - 1) {
+        push @inh, { from => '(top level)', alerts => $1 }
+            if $lines->[$i] =~ /^\s*alerts\s*=\s*(\S.*?)\s*$/;
+    }
+    for my $k (1 .. $#$segs) {                       # ancestors only, not the node
+        my @anc = @$segs[0 .. $k - 1];
+        my ($h, $rend) = _locate_block($lines, \@anc);
+        next unless defined $h;
+        for my $i ($h + 1 .. $rend - 1) {
+            push @inh, { from => '/' . join('/', @anc), alerts => $1 }
+                if $lines->[$i] =~ /^\s*alerts\s*=\s*(\S.*?)\s*$/;
+        }
+    }
+    return \@inh;
+}
+
+sub target_get {
+    my $q = shift || {};
+    my @segs = _path_segs($q->{path});
+    my ($file, $raw, $lines) = _targets_read();
+    my ($h, $rend, $bend) = _locate_block($lines, \@segs)
+        or die { status => 404, error => "'/" . join('/', @segs) . "' not found in Targets" };
+
+    my %props;
+    for my $i ($h + 1 .. $rend - 1) {
+        $props{lc $1} = $2 if $lines->[$i] =~ /^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/;
+    }
+    my $has_child = grep { $lines->[$_] =~ /^\s*\++\s/ } $rend .. $bend - 1;
+    my $is_leaf = (exists $props{host} && $props{host} !~ m{[\s/]}) ? 1 : 0;
+
+    return {
+        path            => '/' . join('/', @segs),
+        name            => $segs[-1],
+        isLeaf          => ($is_leaf ? \1 : \0),
+        isGroup         => ($is_leaf ? \0 : \1),
+        hasChildren     => ($has_child ? \1 : \0),
+        props           => {
+            menu    => $props{menu},
+            title   => $props{title},
+            host    => $props{host},
+            probe   => $props{probe},
+            alertee => $props{alertee},
+        },
+        explicitAlerts  => [ $props{alerts} ? (split /\s*,\s*/, $props{alerts}) : () ],
+        inheritedAlerts => _inherited_alerts($lines, \@segs),
+        availableAlerts => _defined_alerts(),
+        block           => join("\n", @$lines[$h .. $bend - 1]),
+    };
+}
+
+sub target_edit {
+    my $b = shift || {};
+    my @segs = _path_segs($b->{path});
+    my ($file, $raw, $lines) = _targets_read();
+    my ($h, $rend, $bend) = _locate_block($lines, \@segs)
+        or die { status => 404, error => "'/" . join('/', @segs) . "' not found in Targets" };
+    my $has_child = grep { $lines->[$_] =~ /^\s*\++\s/ } $rend .. $bend - 1;
+
+    my %set;    # key => new value ; value '' means "remove the line"
+    for my $k (qw(menu title probe alertee)) {
+        next unless exists $b->{$k};
+        my $v = $b->{$k};
+        $v =~ s/[\r\n]//g if defined $v;
+        $set{$k} = defined $v ? $v : '';
+    }
+    if (exists $b->{host}) {
+        my $host = $b->{host} // '';
+        $host =~ s/^\s+|\s+$//g;
+        if (length $host) {
+            die { status => 422, error => 'host contains unsafe characters' }
+                unless $host =~ m{^[A-Za-z0-9.:_ /-]+$};
+        } else {
+            die { status => 422, error => 'cannot clear host on a target that has no sub-targets' }
+                unless $has_child;
+        }
+        $set{host} = $host;
+    }
+    if (exists $b->{alerts}) {
+        my @want = ref $b->{alerts} eq 'ARRAY' ? @{ $b->{alerts} } : split /\s*,\s*/, ($b->{alerts} // '');
+        @want = grep { length } map { my $x = $_; $x =~ s/\s//g; $x } @want;
+        my %def = map { $_ => 1 } @{ _defined_alerts() };
+        for my $a (@want) {
+            die { status => 422, error => "alert '$a' has invalid characters" } unless $a =~ /^[A-Za-z0-9_.-]+$/;
+            die { status => 422, error => "alert '$a' is not defined in the Alerts file" } unless $def{$a};
+        }
+        $set{alerts} = @want ? join(',', @want) : '';
+    }
+    die { status => 422, error => 'nothing to change' } unless %set;
+
+    my @head   = @$lines[0 .. $h];
+    my @region = @$lines[$h + 1 .. $rend - 1];
+    my @tail   = @$lines[$rend .. $#$lines];
+
+    my (%done, @out);
+    for my $line (@region) {
+        if ($line =~ /^(\s*)([A-Za-z][A-Za-z0-9_]*)(\s*=\s*)/) {
+            my ($ind, $key) = ($1, lc $2);
+            if (exists $set{$key}) {
+                $done{$key} = 1;
+                push @out, "$ind$key = $set{$key}" if length $set{$key};   # else drop the line
+                next;
+            }
+        }
+        push @out, $line;
+    }
+    my @insert;
+    for my $key (qw(menu title host probe alerts alertee)) {
+        next if $done{$key} or !exists $set{$key} or !length $set{$key};
+        push @insert, "$key = $set{$key}";
+    }
+    # place new lines after the existing properties, before any trailing blanks
+    my $trail = 0;
+    $trail++ while $trail < @out && $out[$#out - $trail] =~ /^\s*$/;
+    splice @out, scalar(@out) - $trail, 0, @insert;
+
+    my @new = (@head, @out, @tail);
+    my $text = join("\n", @new);
+    $text .= "\n" unless $text =~ /\n\z/;
+
+    my $chk = _check_candidate('Targets', $text);
+    return (422, { ok => \0, check => $chk, error => 'config check failed - nothing was changed' })
+        unless _passed($chk);
+    _spew("$file.bak", $raw);
+    _spew($file, $text, 0644);
+    my $rl = _hup();
+    return (200, {
+        ok      => \1,
+        check   => $chk,
+        reload  => $rl,
+        path    => '/' . join('/', @segs),
+        applied => { map { $_ => (length $set{$_} ? $set{$_} : undef) } keys %set },
+    });
 }
 
 sub target_add {

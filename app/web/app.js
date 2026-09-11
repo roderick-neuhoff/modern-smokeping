@@ -40,6 +40,12 @@ function el(tag, attrs = {}, ...kids) {
 }
 const SEV_LABEL = { ok: 'OK', warning: 'Warning', critical: 'Critical', down: 'Down', unknown: 'No data' };
 const SEV_ORDER = { critical: 0, down: 1, warning: 2, unknown: 3, ok: 4 };
+// severity first, then current loss % (so a problem outranks a quieter node
+// even inside the same severity bucket - e.g. two "ok" nodes where one has
+// transient loss that hasn't crossed an alert threshold yet), then path.
+function sevSort(a, b) {
+  return SEV_ORDER[a.severity] - SEV_ORDER[b.severity] || (b.lossNowPct || 0) - (a.lossNowPct || 0) || a.path.localeCompare(b.path);
+}
 
 function fmtPct(v) { return v == null ? '–' : (v < 0.5 && v > 0 ? v.toFixed(1) : v.toFixed(0)) + ' %'; }
 function ago(ts) {
@@ -382,7 +388,7 @@ function renderDashboard() {
     (n.host || '').toLowerCase().includes(f));
 
   const sorters = {
-    severity: (a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity] || (b.lossNowPct || 0) - (a.lossNowPct || 0) || a.path.localeCompare(b.path),
+    severity: sevSort,
     name: (a, b) => a.path.localeCompare(b.path),
     loss: (a, b) => (b.lossNowPct || 0) - (a.lossNowPct || 0),
     latency: (a, b) => (b.medianNowMs || 0) - (a.medianNowMs || 0),
@@ -1405,7 +1411,7 @@ function renderWall() {
   const main = document.getElementById('main');
   const s = state.summary;
   if (!s) { main.innerHTML = '<div class="loading">Loading…</div>'; return; }
-  const allNodes = s.nodes.slice().sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity] || a.path.localeCompare(b.path));
+  const allNodes = s.nodes.slice().sort(sevSort);
   const worst = allNodes.length ? allNodes[0].severity : 'unknown';
   const problemsOnly = state.wallProblems;
   const nodes = problemsOnly ? allNodes.filter(n => n.severity !== 'ok') : allNodes;

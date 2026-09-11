@@ -15,6 +15,7 @@ const state = {
   filter: '',
   sort: localStorage.getItem('sp.sort') || 'severity',
   online: true,
+  wallProblems: localStorage.getItem('sp.wallProblems') === '1',
 };
 
 // --- utilities ------------------------------------------------------
@@ -263,6 +264,12 @@ function treeRow(node, depth, isLink) {
 }
 
 function caretSvg() { return '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M9 6l6 6-6 6"/></svg>'; }
+function smileSvg() {
+  return '<svg viewBox="0 0 24 24" class="wall-smile"><circle cx="12" cy="12" r="10.5"/>' +
+    '<circle cx="8.5" cy="10" r="1.15" fill="currentColor" stroke="none"/>' +
+    '<circle cx="15.5" cy="10" r="1.15" fill="currentColor" stroke="none"/>' +
+    '<path d="M7.5 14.5c1 2 3 3 4.5 3s3.5-1 4.5-3"/></svg>';
+}
 
 function toggleCollapse(path) {
   if (state.collapsed.has(path)) state.collapsed.delete(path);
@@ -1398,15 +1405,36 @@ function renderWall() {
   const main = document.getElementById('main');
   const s = state.summary;
   if (!s) { main.innerHTML = '<div class="loading">Loading…</div>'; return; }
-  const nodes = s.nodes.slice().sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity] || a.path.localeCompare(b.path));
-  const worst = nodes.length ? nodes[0].severity : 'unknown';
+  const allNodes = s.nodes.slice().sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity] || a.path.localeCompare(b.path));
+  const worst = allNodes.length ? allNodes[0].severity : 'unknown';
+  const problemsOnly = state.wallProblems;
+  const nodes = problemsOnly ? allNodes.filter(n => n.severity !== 'ok') : allNodes;
   main.innerHTML = '';
   main.append(el('div', { class: 'wall-head ' + worst },
     el('span', { class: 'wall-title' }, state.tree && state.tree.title || 'SmokePing'),
     el('span', { class: 'wall-counts' },
       ...['ok', 'warning', 'critical', 'down'].map(k => el('span', { class: 'pill', 'data-sev': k }, el('span', { class: 'dot' }), `${SEV_LABEL[k]} ${s.counts[k] || 0}`))),
     el('span', { class: 'wall-clock' }, new Date().toLocaleTimeString()),
+    el('button', {
+      class: 'chip' + (problemsOnly ? ' on' : ''),
+      'aria-pressed': String(problemsOnly),
+      title: 'Show only targets that currently have a problem',
+      onclick: () => {
+        state.wallProblems = !state.wallProblems;
+        try { localStorage.setItem('sp.wallProblems', state.wallProblems ? '1' : '0'); } catch {}
+        renderWall();
+      },
+    }, 'Problems only'),
     el('a', { class: 'chip', href: '#/' }, 'exit')));
+
+  if (problemsOnly && !nodes.length) {
+    main.append(el('div', { class: 'wall-allclear' },
+      el('div', { class: 'wall-smile-wrap', html: smileSvg() }),
+      el('h2', {}, 'All clear'),
+      el('p', {}, `${allNodes.length} target${allNodes.length === 1 ? '' : 's'} monitored, none having problems.`)));
+    return;
+  }
+
   const grid = el('div', { class: 'wall-grid' });
   const draws = [];
   for (const n of nodes) {

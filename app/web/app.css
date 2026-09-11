@@ -363,6 +363,13 @@ body.wall-mode .main { padding: 14px; }
 .wall-tile-cust .lead { font-weight: 700; color: var(--text); }
 .wall-tile-cust .sep { opacity: .5; }
 
+.wall-allclear { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; min-height: calc(100vh - 120px); text-align: center; }
+.wall-smile-wrap { color: var(--ok); animation: wall-smile-pop .4s ease-out; }
+.wall-smile-wrap .wall-smile { width: min(34vw, 260px); height: min(34vw, 260px); }
+.wall-allclear h2 { margin: 0; font-size: 28px; }
+.wall-allclear p { margin: 0; color: var(--text-dim); font-size: 15px; }
+@keyframes wall-smile-pop { from { transform: scale(.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
 .only-mobile { display: none; }
 @media (max-width: 900px) {
   .only-mobile { display: inline-flex; }

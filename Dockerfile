@@ -22,6 +22,13 @@ RUN apk add --no-cache msmtp
 COPY app/ /app/smokeping-modern/
 COPY root/ /
 
+# Stamps the release into the UI (topbar + wallboard) at build time - the
+# web files are plain static assets with no JS build step, so this sed is
+# the whole "build". docker-publish.yml sets APP_VERSION from the git tag
+# (or "latest-<sha>" for a plain push to main).
+ARG APP_VERSION=dev
+RUN sed -i "s/__APP_VERSION__/${APP_VERSION}/" /app/smokeping-modern/web/index.html
+
 RUN chmod +x /app/smokeping-modern/api/smokeping-api.cgi \
              /app/smokeping-modern/bin/notify \
              /app/smokeping-modern/bin/sendmail \
@@ -31,4 +38,5 @@ RUN chmod +x /app/smokeping-modern/api/smokeping-api.cgi \
 
 LABEL org.opencontainers.image.title="modern-smokeping" \
       org.opencontainers.image.description="Modern responsive UI + alerts page for LinuxServer SmokePing" \
-      org.opencontainers.image.source="https://github.com/roderick-neuhoff/modern-smokeping"
+      org.opencontainers.image.source="https://github.com/roderick-neuhoff/modern-smokeping" \
+      org.opencontainers.image.version="${APP_VERSION}"

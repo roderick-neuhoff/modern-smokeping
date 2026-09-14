@@ -349,6 +349,7 @@ body.wall-mode .main { padding: 14px; }
 .wall-head.ok { border-left-color: var(--ok); } .wall-head.warning { border-left-color: var(--warn); }
 .wall-head.critical { border-left-color: var(--crit); } .wall-head.down { border-left-color: var(--down); }
 .wall-title { font-size: 20px; font-weight: 700; }
+.wall-version { margin-left: 8px; font-style: normal; font-weight: 400; font-size: 12px; color: var(--text-faint); }
 .wall-counts { display: flex; gap: 6px; flex-wrap: wrap; }
 .wall-clock { margin-left: auto; font-family: var(--mono); font-size: 18px; color: var(--text-dim); }
 .wall-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }

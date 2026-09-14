@@ -4,6 +4,9 @@ import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs } from '
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
 const REFRESH_MS = 15_000;
 const FETCH_TIMEOUT_MS = 25_000;
+// stamped into index.html at image build time (see Dockerfile) - the Wall
+// page hides the topbar, so it needs its own copy of this.
+const APP_VERSION = document.getElementById('appVersion')?.textContent || '';
 
 const state = {
   tree: null,
@@ -1417,7 +1420,7 @@ function renderWall() {
   const nodes = problemsOnly ? allNodes.filter(n => n.severity !== 'ok') : allNodes;
   main.innerHTML = '';
   main.append(el('div', { class: 'wall-head ' + worst },
-    el('span', { class: 'wall-title' }, state.tree && state.tree.title || 'SmokePing'),
+    el('span', { class: 'wall-title' }, state.tree && state.tree.title || 'SmokePing', el('em', { class: 'wall-version' }, APP_VERSION)),
     el('span', { class: 'wall-counts' },
       ...['ok', 'warning', 'critical', 'down'].map(k => el('span', { class: 'pill', 'data-sev': k }, el('span', { class: 'dot' }), `${SEV_LABEL[k]} ${s.counts[k] || 0}`))),
     el('span', { class: 'wall-clock' }, new Date().toLocaleTimeString()),

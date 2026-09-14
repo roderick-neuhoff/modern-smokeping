@@ -209,8 +209,12 @@ files quiescent, otherwise expect the last few seconds to be missing.
 Cards per target with a loss-coloured sparkline; click one for the full smoke
 chart (median coloured by loss, symmetric min–max / p10–p90 / p20–p80 smoke).
 **Drag** on the chart to zoom into any window, **double-click** to reset. Ranges
-`3h / 30h / 10d / 360d`. The ⏸ button in the top bar pauses auto-refresh per
-browser; the refresh button always works.
+`3h / 30h / 10d / 360d`. **Export PNG** / **Export CSV** on a target page save
+the current chart's image or raw data points. The ⏸ button in the top bar
+pauses auto-refresh per browser; the refresh button always works.
+
+**Keyboard:** `/` focuses the target filter; `Esc` clears it, closes an open
+dialog, or closes the mobile target drawer.
 
 ### Alerts page
 
@@ -223,6 +227,8 @@ page reconstructs both:
   (the bundled `svc-smokeping` override adds `--logfile`).
 * **Acknowledge** — silence for 1 h / 8 h / 24 h / 7 d / until cleared, with a note
   and who did it. Server-side, shared by everyone (`/config/modern-acks.json`).
+* **Export CSV** — on both the active-alerts table and the history list, downloads
+  what's currently shown (respects the active table's filter/search).
 
 ### Settings page (`#/settings`, password)
 
@@ -234,8 +240,8 @@ container restart.
 |-----|---|
 | **E-mail** | SMTP server / port / STARTTLS / TLS, sign-in method **password or OAuth2** (Google, Microsoft 365), alert *from* + recipient list, **Send test e-mail** — see [E-mail: OAuth2](#e-mail-oauth2) |
 | **Notifications** | Discord, Slack, Telegram, ntfy, Gotify, generic JSON webhook — each with **Save & send test**. Enable *Webhook notifications* on the E-mail tab to route alerts there |
-| **Targets** | **Add** a target under any group. **Edit** an existing target or group — menu, title, host, probe and its alerts (tick boxes for each defined alert); works on targets from an imported SmokePing config. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
-| **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves`; nothing is saved if the check fails |
+| **Targets** | **Add** a target under any group. **Edit** an existing target or group — menu, title, host, probe (a dropdown of the probes actually defined in the Probes file, validated server-side too — no more typo'd probe names) and its alerts (tick boxes for each defined alert); works on targets from an imported SmokePing config. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
+| **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves`; nothing is saved if the check fails. **Show changes** previews a line diff against the loaded version before you save |
 | **Access** | who you are, how the login is set, **Sign out** |
 
 Auto-refresh is off on this page so it can never wipe a half-filled form.
@@ -282,6 +288,12 @@ On save, `pathnames` is pointed at the right sender wrapper
 
 Chrome-less tile view for a TV: every target as a coloured tile with median,
 loss and sparkline, plus a status header and clock. Always live (ignores pause).
+
+* **Problems only** — hides everything that's currently OK; when nothing's left
+  to show, a big all-clear smiley replaces the grid instead of an empty page.
+* **Small / Normal / Large** — tile density. The grid also auto-adjusts for very
+  narrow (phone) and very large (4K TV) screens, but this overrides that when
+  the reported viewport size doesn't match actual viewing distance.
 
 ---
 

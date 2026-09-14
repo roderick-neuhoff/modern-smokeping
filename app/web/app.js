@@ -1104,10 +1104,11 @@ function paneMail(pane) {
   const oauthTools = el('div', { class: 'modal-actions', style: 'justify-content:flex-start' },
     consentBtn,
     el('button', { class: 'chip', type: 'button', onclick: async (e) => {
-      e.currentTarget.disabled = true; oRes.hidden = false; oRes.className = 'result'; oRes.textContent = 'Exchanging refresh token…';
+      const btn = e.currentTarget;
+      btn.disabled = true; oRes.hidden = false; oRes.className = 'result'; oRes.textContent = 'Exchanging refresh token…';
       try { showResult(oRes, await post('/oauth/check', {}), 'Token OK — OAuth2 credentials work.'); }
       catch (err) { showResult(oRes, { ok: false, error: err.message, ...(err.data || {}) }); }
-      e.currentTarget.disabled = false;
+      btn.disabled = false;
     } }, 'Check token'),
     el('button', { class: 'chip', type: 'button', onclick: async () => {
       if (!confirm('Forget the stored OAuth2 refresh token and client secret?')) return;
@@ -1185,7 +1186,8 @@ function paneMail(pane) {
       field('Webhook notifications', f.webhooks, 'also pipe every alert to the Notifications channels')),
     el('div', { class: 'modal-actions' },
       el('button', { class: 'chip on', onclick: async (e) => {
-        e.currentTarget.disabled = true;
+        const btn = e.currentTarget;
+        btn.disabled = true;
         try {
           const r = await post('/settings/smtp', {
             authMethod: f.method.value,
@@ -1199,7 +1201,7 @@ function paneMail(pane) {
           f.authPass.value = ''; f.clientSecret.value = ''; f.refreshToken.value = '';
           settingsData = r.settings || settingsData;
         } catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
-        e.currentTarget.disabled = false;
+        btn.disabled = false;
       } }, 'Save mail settings')),
     res,
     el('h2', {}, 'Test'),
@@ -1252,12 +1254,13 @@ function paneNotify(pane) {
         el('label', { class: 'switch' }, en, ' enabled')),
       el('div', { class: 'form-grid' }, ...fields.map(([fk, fl]) => field(fl, inputs[fk]))),
       el('div', { class: 'modal-actions' }, el('button', { class: 'chip', onclick: async (e) => {
-        e.currentTarget.disabled = true; tRes.hidden = false; tRes.className = 'result'; tRes.textContent = 'Saving + sending test…';
+        const btn = e.currentTarget;
+        btn.disabled = true; tRes.hidden = false; tRes.className = 'result'; tRes.textContent = 'Saving + sending test…';
         try {
           await saveNotify();
           showResult(tRes, await post('/test/notify', { channel: key }), 'Test sent.');
         } catch (err) { showResult(tRes, { ok: false, error: err.message, ...(err.data || {}) }); }
-        e.currentTarget.disabled = false;
+        btn.disabled = false;
       } }, 'Save & send test')),
       tRes);
   });
@@ -1277,10 +1280,11 @@ function paneNotify(pane) {
     settingsData.alerts.webhooks ? el('b', {}, 'Currently ON.') : el('b', { style: 'color:var(--warn)' }, 'Currently OFF — enable it there.')),
     ...cards,
     el('div', { class: 'modal-actions' }, el('button', { class: 'chip on', onclick: async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try { showResult(res, await saveNotify(), 'Notification settings saved.'); }
       catch (err) { showResult(res, { ok: false, error: err.message }); }
-      e.currentTarget.disabled = false;
+      btn.disabled = false;
     } }, 'Save all channels')), res);
 }
 
@@ -1317,7 +1321,8 @@ function paneTargets(pane) {
       field('Probe', f.probe)),
     field('Alerts', addAlerts),
     el('div', { class: 'modal-actions' }, el('button', { class: 'chip on', onclick: async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try {
         const r = await post('/targets/add', {
           parent: f.parent.value, key: f.key.value.trim(), menu: f.menu.value.trim(), title: f.title.value.trim(),
@@ -1327,7 +1332,7 @@ function paneTargets(pane) {
         showResult(res, r, `Added ${r.path}. Reloading tree…`);
         state.tree = await api('/tree'); renderTree();
       } catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
-      e.currentTarget.disabled = false;
+      btn.disabled = false;
     } }, 'Add target')), res));
 
   // --- edit an existing target --------------------------------------
@@ -1389,7 +1394,8 @@ function paneTargets(pane) {
     ebody.hidden = false;
 
     async function saveEdit(e) {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       const alerts = [...ebody.querySelectorAll('input[type=checkbox][data-alert]')]
         .filter(c => c.checked).map(c => c.dataset.alert);
       const payload = { path, alerts };
@@ -1401,8 +1407,9 @@ function paneTargets(pane) {
         showResult(eres, r, `Saved ${r.path}. SmokePing reloaded.`);
         state.tree = await api('/tree'); renderTree();
         await loadEdit(path);
+        return;   // loadEdit() just rebuilt ebody - btn is detached, don't touch it
       } catch (err) { showResult(eres, { ok: false, error: err.message, ...(err.data || {}) }); }
-      e.currentTarget.disabled = false;
+      btn.disabled = false;
     }
   }
 
@@ -1436,7 +1443,8 @@ function paneTargets(pane) {
       if (!path) { showResult(rres, { ok: false, error: 'Choose a target first.' }); return; }
       const isGroup = all.find(([p]) => p === path)?.[1] === 'group';
       if (!confirm(`Remove ${path}${isGroup ? ' and every target under it' : ''}${rdata.checked ? ' AND delete its collected data' : ''}?`)) return;
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try {
         const r = await authed(() => post('/targets/remove', { path, password: rpass.value, deleteData: rdata.checked }));
         showResult(rres, r, `Removed ${r.path} (${r.removedLines} lines${r.removedChildren ? ', ' + r.removedChildren + ' sub-targets' : ''}${r.deletedFiles?.length ? ', ' + r.deletedFiles.length + ' data files deleted' : ''}).`);
@@ -1444,7 +1452,7 @@ function paneTargets(pane) {
         state.tree = await api('/tree'); renderTree();
         [...rsel.options].find(o => o.value === path)?.remove();
       } catch (err) { showResult(rres, { ok: false, error: err.message, ...(err.data || {}) }); }
-      e.currentTarget.disabled = false;
+      btn.disabled = false;
     } }, 'Remove target')), rres));
 }
 
@@ -1482,7 +1490,8 @@ function paneConfig(pane) {
       el('button', { class: 'chip', onclick: load }, 'Revert'),
       el('button', { class: 'chip', onclick: () => { diffBox.hidden = !diffBox.hidden; if (!diffBox.hidden) renderDiff(); } }, 'Show changes'),
       el('button', { class: 'chip on', onclick: async (e) => {
-        e.currentTarget.disabled = true; res.hidden = false; res.className = 'result'; res.textContent = 'Validating…';
+        const btn = e.currentTarget;
+        btn.disabled = true; res.hidden = false; res.className = 'result'; res.textContent = 'Validating…';
         try {
           const r = await post('/config/' + sel.value, { text: ta.value });
           showResult(res, r, 'Saved and reloaded.');
@@ -1490,7 +1499,7 @@ function paneConfig(pane) {
           if (!diffBox.hidden) renderDiff();
         }
         catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
-        e.currentTarget.disabled = false;
+        btn.disabled = false;
       } }, 'Validate & save')),
     diffBox,
     res));

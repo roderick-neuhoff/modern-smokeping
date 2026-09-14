@@ -295,4 +295,33 @@ export function drawSpark(canvas, series) {
   }
 }
 
+// --- export helpers ---------------------------------------------------
+
+// CSV of a node's plotted series - same pmin/p10/p90 fallback as drawSmoke
+// so older/partial API responses still export something sane.
+export function seriesToCsv(series) {
+  const { t, median, loss, p20, p50, p80, pmax } = series;
+  const pmin = series.pmin || p20, p10 = series.p10 || p20, p90 = series.p90 || p80;
+  const rows = ['time,median_ms,loss_pct,p10,p20,p50,p80,p90,pmin,pmax'];
+  for (let i = 0; i < (t || []).length; i++) {
+    const cols = [median[i], loss[i], p10[i], p20[i], p50[i], p80[i], p90[i], pmin[i], pmax[i]]
+      .map(v => v == null ? '' : v);
+    rows.push([new Date(t[i] * 1000).toISOString(), ...cols].join(','));
+  }
+  return rows.join('\n');
+}
+
+// flattens the chart canvas onto an opaque background (it's transparent by
+// default) so the exported PNG is readable regardless of where it's pasted.
+export function toPngDataUrl(canvas, bg) {
+  const off = document.createElement('canvas');
+  off.width = canvas.width;
+  off.height = canvas.height;
+  const ctx = off.getContext('2d');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, off.width, off.height);
+  ctx.drawImage(canvas, 0, 0);
+  return off.toDataURL('image/png');
+}
+
 export { fmtMs };

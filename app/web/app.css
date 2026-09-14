@@ -244,6 +244,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
   box-shadow: var(--shadow); overflow: hidden; margin-bottom: 16px;
 }
 .tablecard h2 { font-size: 14px; margin: 0; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.tablecard-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.tablecard-head h2 { padding: 0; border-bottom: none; }
 .table-scroll { overflow-x: auto; }
 table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.data th, table.data td { padding: 9px 12px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border); }
@@ -324,6 +326,10 @@ ol.steps pre { white-space: pre-wrap; word-break: break-all; }
 .result { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; margin: 10px 0 0; max-height: 260px; overflow: auto; }
 .result.ok { border-color: var(--ok); }
 .result.bad { border-color: var(--crit); }
+.diffbox { max-height: 400px; padding: 8px 0; }
+.diffbox .diff-ctx { padding: 0 12px; color: var(--text-dim); }
+.diffbox .diff-add { padding: 0 12px; background: var(--ok-weak); color: var(--text); }
+.diffbox .diff-del { padding: 0 12px; background: var(--crit-weak); color: var(--text); text-decoration: line-through; text-decoration-color: var(--text-faint); }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 .chip.on { background: var(--accent); color: #fff; border-color: var(--accent); }
 .chip:disabled { opacity: .6; cursor: wait; }
@@ -370,6 +376,38 @@ body.wall-mode .main { padding: 14px; }
 .wall-allclear h2 { margin: 0; font-size: 28px; }
 .wall-allclear p { margin: 0; color: var(--text-dim); font-size: 15px; }
 @keyframes wall-smile-pop { from { transform: scale(.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+/* extreme-viewport tuning: a phone still gets desktop-size tiles by default,
+   and a 4K TV at viewing distance gets desktop-size text by default - both
+   automatic by viewport width, below/above which the manual density toggle
+   (data-density, cycled from the Wall header) takes over regardless of the
+   reported viewport. */
+@media (max-width: 480px) {
+  .wall-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+  .wall-tile { padding: 8px 10px; }
+  .wall-tile-title { font-size: 12.5px; }
+  .wall-tile-val { font-size: 18px; }
+}
+@media (min-width: 1600px) {
+  .wall-grid { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 18px; }
+  .wall-tile { padding: 16px 20px; }
+  .wall-tile-title { font-size: clamp(16px, 1.1vw, 22px); }
+  .wall-tile-val { font-size: clamp(26px, 2vw, 44px); }
+  .wall-title { font-size: clamp(24px, 1.8vw, 40px); }
+  .wall-clock { font-size: clamp(18px, 1.4vw, 30px); }
+  .wall-head { padding: 16px 24px; }
+}
+body.wall-mode[data-density="small"] .wall-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+body.wall-mode[data-density="small"] .wall-tile { padding: 8px 10px; }
+body.wall-mode[data-density="small"] .wall-tile-title { font-size: 12.5px; }
+body.wall-mode[data-density="small"] .wall-tile-val { font-size: 18px; }
+body.wall-mode[data-density="large"] .wall-grid { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 18px; }
+body.wall-mode[data-density="large"] .wall-tile { padding: 16px 20px; }
+body.wall-mode[data-density="large"] .wall-tile-title { font-size: clamp(16px, 1.1vw, 22px); }
+body.wall-mode[data-density="large"] .wall-tile-val { font-size: clamp(26px, 2vw, 44px); }
+body.wall-mode[data-density="large"] .wall-title { font-size: clamp(24px, 1.8vw, 40px); }
+body.wall-mode[data-density="large"] .wall-clock { font-size: clamp(18px, 1.4vw, 30px); }
+body.wall-mode[data-density="large"] .wall-head { padding: 16px 24px; }
 
 .only-mobile { display: none; }
 @media (max-width: 900px) {

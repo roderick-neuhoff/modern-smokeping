@@ -873,6 +873,14 @@ sub _defined_alerts {
     return \@n;
 }
 
+# names of probes defined in the Probes file (+name at column 0)
+sub _defined_probes {
+    my $s = _slurp("$CONFIG_DIR/Probes") // '';
+    my @n;
+    for (split /\n/, $s) { push @n, $1 if /^\+\s*([A-Za-z0-9_.-]+)\s*$/ }
+    return \@n;
+}
+
 # locate a target/group by its path segments. returns:
 #   ($header_idx, $region_end, $block_end)
 #   header_idx  : the "+++ Name" line
@@ -966,6 +974,7 @@ sub target_get {
         explicitAlerts  => [ $props{alerts} ? (split /\s*,\s*/, $props{alerts}) : () ],
         inheritedAlerts => _inherited_alerts($lines, \@segs),
         availableAlerts => _defined_alerts(),
+        availableProbes => _defined_probes(),
         block           => join("\n", @$lines[$h .. $bend - 1]),
     };
 }
@@ -984,6 +993,13 @@ sub target_edit {
         my $v = $b->{$k};
         $v =~ s/[\r\n]//g if defined $v;
         $set{$k} = defined $v ? $v : '';
+    }
+    if (exists $set{probe} && length $set{probe}) {
+        die { status => 422, error => "probe '$set{probe}' has invalid characters" }
+            unless $set{probe} =~ /^[A-Za-z0-9_]+$/;
+        my %def = map { $_ => 1 } @{ _defined_probes() };
+        die { status => 422, error => "probe '$set{probe}' is not defined in the Probes file" }
+            unless $def{ $set{probe} };
     }
     if (exists $b->{host}) {
         my $host = $b->{host} // '';
@@ -1088,7 +1104,14 @@ sub target_add {
         'menu = '  . $esc->($b->{menu}  || $key),
         'title = ' . $esc->($b->{title} || $b->{menu} || $key),
         "host = $host");
-    push @block, 'probe = '  . $esc->($b->{probe})  if $b->{probe} && $b->{probe} =~ /^[A-Za-z0-9_]+$/;
+    if ($b->{probe}) {
+        die { status => 422, error => "probe '$b->{probe}' has invalid characters" }
+            unless $b->{probe} =~ /^[A-Za-z0-9_]+$/;
+        my %defp = map { $_ => 1 } @{ _defined_probes() };
+        die { status => 422, error => "probe '$b->{probe}' is not defined in the Probes file" }
+            unless $defp{ $b->{probe} };
+        push @block, 'probe = ' . $esc->($b->{probe});
+    }
     push @block, 'alerts = ' . join(',', grep { /^[A-Za-z0-9_-]+$/ } @{ $b->{alerts} || [] }) if @{ $b->{alerts} || [] };
     splice @lines, $insert_at, 0, @block;
     my $text = join("\n", @lines) . "\n";

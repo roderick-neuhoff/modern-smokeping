@@ -1,5 +1,6 @@
 // SmokePing Modern UI - app shell, router and views.
-import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs } from './chart.js';
+import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs, seriesToCsv, toPngDataUrl } from './chart.js';
+import { diffLines } from './diff.js';
 
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
 const REFRESH_MS = 15_000;
@@ -19,6 +20,7 @@ const state = {
   sort: localStorage.getItem('sp.sort') || 'severity',
   online: true,
   wallProblems: localStorage.getItem('sp.wallProblems') === '1',
+  wallDensity: localStorage.getItem('sp.wallDensity') || 'normal',
 };
 
 // --- utilities ------------------------------------------------------
@@ -341,6 +343,40 @@ function applyFilter() {
   });
 }
 
+// --- keyboard shortcuts ------------------------------------------------
+
+document.addEventListener('keydown', (e) => {
+  if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+  const t = e.target;
+  const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+
+  if (e.key === '/' && !typing) {
+    e.preventDefault();
+    document.getElementById('search')?.focus();
+    return;
+  }
+  if (e.key !== 'Escape') return;
+
+  if (document.getElementById('sidebar')?.classList.contains('open')) { closeDrawer(); return; }
+  const scrim = document.querySelector('.modal-scrim');
+  if (scrim) {
+    // Cancel button if this dialog has one (ackDialog), else the scrim's
+    // own backdrop-click handler (signInDialog) - either resolves the
+    // dialog's promise properly instead of just yanking it out of the DOM.
+    const cancelBtn = scrim.querySelector('.modal-actions .chip:not(.on)');
+    if (cancelBtn) cancelBtn.click(); else scrim.click();
+    return;
+  }
+  if (typing && t.id !== 'search') return;   // don't hijack Esc while editing raw config, forms, etc.
+  if (state.filter) {
+    state.filter = '';
+    const s = document.getElementById('search'); if (s) s.value = '';
+    applyFilter();
+    if (currentRoute().name === 'dashboard') renderDashboard();
+  }
+  t.blur?.();
+});
+
 // --- router -----------------------------------------------------
 
 function currentRoute() {
@@ -493,6 +529,17 @@ async function renderNode(path) {
       class: (r === nodeRange && !zoomed) ? 'on' : '',
       onclick: () => { nodeRange = r; localStorage.setItem('sp.range', r); zoom = { path, start: null, end: null }; renderNode(path); },
     }, r))),
+    el('button', {
+      class: 'chip', title: 'Save the chart as a PNG image',
+      onclick: () => {
+        const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-elev').trim() || '#fff';
+        downloadDataUrl(toPngDataUrl(main.querySelector('canvas.smokechart'), bg), pathSlug(path) + '-' + nodeRange + '.png');
+      },
+    }, 'Export PNG'),
+    el('button', {
+      class: 'chip', title: 'Download this chart’s data as CSV',
+      onclick: () => downloadBlob(seriesToCsv(d.series), pathSlug(path) + '-' + nodeRange + '.csv'),
+    }, 'Export CSV'),
   ));
 
   const wrap = el('div', { class: 'chart-wrap', style: 'position:relative' });
@@ -630,7 +677,14 @@ function renderAlerts(sevFilter) {
     });
     tbl.append(tb);
     main.append(el('div', { class: 'tablecard' },
-      el('h2', {}, 'Active alerts'),
+      el('div', { class: 'tablecard-head' }, el('h2', {}, 'Active alerts'),
+        el('button', {
+          class: 'chip', title: 'Download the currently shown active alerts as CSV',
+          onclick: () => downloadBlob(rowsToCsv(
+            ['severity', 'target', 'path', 'alert', 'type', 'loss_pct', 'rtt_ms', 'pattern', 'acked'],
+            rows.map(r => [r.severity, r.target, r.path, r.alert, r.type, r.currentLossPct, r.currentRttMs, r.pattern, ackFor(r) ? 'yes' : 'no'])),
+            'smokeping-alerts-active.csv'),
+        }, 'Export CSV')),
       el('div', { class: 'table-scroll' }, tbl)));
 
     requestAnimationFrame(() => {
@@ -640,7 +694,15 @@ function renderAlerts(sevFilter) {
 
   // history
   const hist = a.recent || [];
-  const hc = el('div', { class: 'tablecard' }, el('h2', {}, 'Recent history'));
+  const hc = el('div', { class: 'tablecard' },
+    el('div', { class: 'tablecard-head' }, el('h2', {}, 'Recent history'),
+      hist.length ? el('button', {
+        class: 'chip', title: 'Download the alert history as CSV',
+        onclick: () => downloadBlob(rowsToCsv(
+          ['time', 'event', 'alert', 'target', 'count', 'last'],
+          hist.map(ev => [ev.time ? new Date(ev.time * 1000).toISOString() : '', ev.event, ev.alert, ev.target, ev.count, ev.last ? new Date(ev.last * 1000).toISOString() : ''])),
+          'smokeping-alerts-history.csv'),
+      }, 'Export CSV') : null));
   if (!a.logSource) {
     hc.append(el('p', { class: 'note' },
       'Alert history is unavailable — SmokePing has no alert database. Mount its log file and set ',
@@ -734,6 +796,31 @@ function toast(msg, bad) {
   document.body.append(t);
   setTimeout(() => t.classList.add('show'), 10);
   setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, bad ? 6000 : 3000);
+}
+
+// --- file export -----------------------------------------------------
+
+function downloadBlob(text, filename, type = 'text/csv') {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = el('a', { href: url, download: filename });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function downloadDataUrl(dataUrl, filename) {
+  const a = el('a', { href: dataUrl, download: filename });
+  document.body.append(a); a.click(); a.remove();
+}
+function pathSlug(path) {
+  const clean = (path || '').replace(/^\/+/, '').replace(/\/+/g, '-').replace(/[^A-Za-z0-9_-]/g, '_');
+  return 'smokeping-' + (clean || 'root');
+}
+function rowsToCsv(headers, rows) {
+  const esc = (v) => {
+    if (v == null) return '';
+    const s = String(v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  return [headers, ...rows].map(r => r.map(esc).join(',')).join('\n');
 }
 
 // --- sign-in (Basic auth, kept for this browser session only) ------------
@@ -1203,6 +1290,10 @@ function paneTargets(pane) {
   if (state.tree) walk(state.tree.root, 0);
   const sel = el('select', { class: 'input' }, el('option', { value: '' }, '(top level)'), ...groups.map(g => el('option', { value: g }, g)));
   const definedAlerts = (state.tree && state.tree.alertsDefined) || [];
+  const definedProbes = (state.tree && state.tree.probesDefined) || [];
+  const probeSel = el('select', { class: 'input' },
+    el('option', { value: '' }, '(inherit)'),
+    ...definedProbes.map(p => el('option', { value: p }, p)));
   const addAlertBoxes = definedAlerts.map(name => {
     const cb = el('input', { type: 'checkbox' }); cb.dataset.alert = name;
     return el('label', { class: 'alert-check' }, cb, ' ', name);
@@ -1214,7 +1305,7 @@ function paneTargets(pane) {
     parent: sel, key: input({ placeholder: 'MyRouter  (letters, digits, - _)' }),
     menu: input({ placeholder: 'Menu label' }), title: input({ placeholder: 'Title shown on the page' }),
     host: input({ placeholder: '192.168.1.1 or host.example.com' }),
-    probe: input({ placeholder: 'FPing (blank = inherit)' }),
+    probe: probeSel,
   };
   const res = resultBox();
   pane.append(el('div', { class: 'card-plain' },
@@ -1259,7 +1350,13 @@ function paneTargets(pane) {
     const menu = input({ value: orig.menu || '', placeholder: d.name });
     const title = input({ value: orig.title || '', placeholder: d.name });
     const host = input({ value: orig.host || '', placeholder: d.isLeaf ? 'host or IP address' : '(group)' });
-    const probe = input({ value: orig.probe || '', placeholder: 'inherit from parent' });
+    const availableProbes = d.availableProbes || [];
+    const probe = el('select', { class: 'input' },
+      el('option', { value: '' }, '(inherit from parent)'),
+      ...availableProbes.map(p => el('option', { value: p }, p)),
+      ...(orig.probe && !availableProbes.includes(orig.probe)
+        ? [el('option', { value: orig.probe }, orig.probe + ' ⚠ (not defined)')] : []));
+    probe.value = orig.probe || '';
     const alertee = input({ value: orig.alertee || '', placeholder: 'extra e-mail address(es), optional' });
 
     const defined = d.availableAlerts || [];
@@ -1357,10 +1454,24 @@ function paneConfig(pane) {
   const ta = el('textarea', { class: 'input code', rows: '24', spellcheck: 'false' });
   const meta = el('span', { class: 'sub' });
   const res = resultBox();
+  const diffBox = el('pre', { class: 'result diffbox', hidden: 'hidden' });
+  let orig = '';
+  const renderDiff = () => {
+    diffBox.innerHTML = '';
+    for (const ln of diffLines(orig, ta.value)) {
+      diffBox.append(el('div', { class: 'diff-' + (ln.type === 'same' ? 'ctx' : ln.type) },
+        (ln.type === 'add' ? '+ ' : ln.type === 'del' ? '- ' : '  ') + ln.text));
+    }
+  };
   const load = async () => {
     ta.value = 'loading…';
-    try { const r = await api('/config/' + sel.value); ta.value = r.text; meta.textContent = r.exists ? 'last modified ' + new Date(r.mtime * 1000).toLocaleString() : 'file does not exist yet'; }
-    catch (e) { ta.value = ''; meta.textContent = e.message; }
+    diffBox.hidden = true;
+    try {
+      const r = await api('/config/' + sel.value);
+      ta.value = r.text; orig = r.text;
+      meta.textContent = r.exists ? 'last modified ' + new Date(r.mtime * 1000).toLocaleString() : 'file does not exist yet';
+    }
+    catch (e) { ta.value = ''; orig = ''; meta.textContent = e.message; }
   };
   sel.addEventListener('change', load);
   pane.append(el('div', { class: 'card-plain' },
@@ -1369,12 +1480,19 @@ function paneConfig(pane) {
     ta,
     el('div', { class: 'modal-actions' },
       el('button', { class: 'chip', onclick: load }, 'Revert'),
+      el('button', { class: 'chip', onclick: () => { diffBox.hidden = !diffBox.hidden; if (!diffBox.hidden) renderDiff(); } }, 'Show changes'),
       el('button', { class: 'chip on', onclick: async (e) => {
         e.currentTarget.disabled = true; res.hidden = false; res.className = 'result'; res.textContent = 'Validating…';
-        try { showResult(res, await post('/config/' + sel.value, { text: ta.value }), 'Saved and reloaded.'); }
+        try {
+          const r = await post('/config/' + sel.value, { text: ta.value });
+          showResult(res, r, 'Saved and reloaded.');
+          orig = ta.value;
+          if (!diffBox.hidden) renderDiff();
+        }
         catch (err) { showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
         e.currentTarget.disabled = false;
       } }, 'Validate & save')),
+    diffBox,
     res));
   load();
 }
@@ -1419,11 +1537,21 @@ function renderWall() {
   const problemsOnly = state.wallProblems;
   const nodes = problemsOnly ? allNodes.filter(n => n.severity !== 'ok') : allNodes;
   main.innerHTML = '';
+  document.body.dataset.density = state.wallDensity;
   main.append(el('div', { class: 'wall-head ' + worst },
     el('span', { class: 'wall-title' }, state.tree && state.tree.title || 'SmokePing', el('em', { class: 'wall-version' }, APP_VERSION)),
     el('span', { class: 'wall-counts' },
       ...['ok', 'warning', 'critical', 'down'].map(k => el('span', { class: 'pill', 'data-sev': k }, el('span', { class: 'dot' }), `${SEV_LABEL[k]} ${s.counts[k] || 0}`))),
     el('span', { class: 'wall-clock' }, new Date().toLocaleTimeString()),
+    el('div', { class: 'seg', title: 'Tile density - overrides automatic sizing for this screen' },
+      ...['small', 'normal', 'large'].map(d => el('button', {
+        class: state.wallDensity === d ? 'on' : '',
+        onclick: () => {
+          state.wallDensity = d;
+          try { localStorage.setItem('sp.wallDensity', d); } catch {}
+          renderWall();
+        },
+      }, d[0].toUpperCase() + d.slice(1)))),
     el('button', {
       class: 'chip' + (problemsOnly ? ' on' : ''),
       'aria-pressed': String(problemsOnly),

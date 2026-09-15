@@ -20,7 +20,7 @@ const state = {
   sort: localStorage.getItem('sp.sort') || 'severity',
   online: true,
   wallProblems: localStorage.getItem('sp.wallProblems') === '1',
-  wallDensity: localStorage.getItem('sp.wallDensity') || 'normal',
+  wallDensity: localStorage.getItem('sp.wallDensity') || 'small',
 };
 
 // --- utilities ------------------------------------------------------

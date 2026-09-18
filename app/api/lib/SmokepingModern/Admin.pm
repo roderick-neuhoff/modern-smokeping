@@ -16,6 +16,7 @@ use Symbol ();
 use POSIX ();
 use File::Temp ();
 use SmokepingModern::AlertRule ();
+use SmokepingModern::Maintenance ();
 
 my $CONFIG_DIR = $ENV{SMOKEPING_CONFIG_DIR} || '/config';
 my $MASTER     = $ENV{SMOKEPING_CONF}       || '/etc/smokeping/config';
@@ -72,6 +73,11 @@ sub handle {
         return (200, alertdefs_get())               if $method eq 'GET';
         return alertdefs_save($body)                if $method eq 'POST' && $sub ne 'delete';
         return alertdefs_delete($body)              if $method eq 'POST' && $sub eq 'delete';
+    }
+    if ($route eq 'maintenance') {
+        return (200, maintenance_get())             if $method eq 'GET';
+        return (200, maintenance_save($body))       if $method eq 'POST' && $sub ne 'delete';
+        return (200, maintenance_delete($body))     if $method eq 'POST' && $sub eq 'delete';
     }
     if ($route eq 'acks') {
         return (200, acks_get())                    if $method eq 'GET';
@@ -1547,6 +1553,53 @@ sub alertdefs_delete {
     _spew("$CONFIG_DIR/Alerts.bak", $raw_before) if defined $raw_before;
     _spew("$CONFIG_DIR/Alerts", $text, 0644);
     return (200, { ok => \1, check => $chk, reload => _hup(), name => $name });
+}
+
+# ---------------------------------------------------------------------------
+# maintenance windows (see SmokepingModern::Maintenance)
+# ---------------------------------------------------------------------------
+
+sub maintenance_get {
+    my $now = time;
+    my $all = SmokepingModern::Maintenance::load();
+    # forget one-off windows that ended more than 30 days ago
+    my @keep = grep { ($_->{mode} // 'once') ne 'once' || ($_->{end} // 0) > $now - 30 * 86400 } @$all;
+    SmokepingModern::Maintenance::save(\@keep) if @keep != @$all;
+    my @out = map { { %$_, state => SmokepingModern::Maintenance::state_of($_, $now) } } @keep;
+    return { now => $now, windows => \@out };
+}
+
+sub maintenance_save {
+    my $b = shift || {};
+    my $w = SmokepingModern::Maintenance::normalize($b);
+    my $all = SmokepingModern::Maintenance::load();
+    my $id = $b->{id};
+    if (defined $id && length $id) {
+        my ($i) = grep { ($all->[$_]{id} // '') eq $id } 0 .. $#$all;
+        die { status => 404, error => 'no such maintenance window' } unless defined $i;
+        $w->{id} = $id;
+        @$w{qw(created createdBy)} = @{ $all->[$i] }{qw(created createdBy)};
+        $w->{updatedBy} = $ENV{REMOTE_USER} // 'anon';
+        $all->[$i] = $w;
+    } else {
+        die { status => 422, error => 'too many maintenance windows (200) - delete old ones first' } if @$all >= 200;
+        $w->{id} = sprintf('m%x%04x', time, int rand 65536);
+        $w->{created} = time;
+        $w->{createdBy} = $ENV{REMOTE_USER} // 'anon';
+        push @$all, $w;
+    }
+    SmokepingModern::Maintenance::save($all);
+    return { ok => \1, id => $w->{id}, %{ maintenance_get() } };
+}
+
+sub maintenance_delete {
+    my $b = shift || {};
+    my $id = $b->{id} // '';
+    my $all = SmokepingModern::Maintenance::load();
+    my @keep = grep { ($_->{id} // '') ne $id } @$all;
+    die { status => 404, error => 'no such maintenance window' } if @keep == @$all;
+    SmokepingModern::Maintenance::save(\@keep);
+    return { ok => \1, %{ maintenance_get() } };
 }
 
 sub reload {

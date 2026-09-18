@@ -478,3 +478,23 @@ body.wall-mode[data-density="large"] .wall-head { padding: 16px 24px; }
   .tablecard, .stat { box-shadow: none; break-inside: avoid; }
   table.data td, table.data th { white-space: normal; }
 }
+
+/* maintenance ---------------------------------------------------------- */
+:root { --maint: #4b6584; --maint-weak: #e4eaf2; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --maint: #8fa6c4; --maint-weak: #1d2735; } }
+:root[data-theme="dark"] { --maint: #8fa6c4; --maint-weak: #1d2735; }
+.pill[data-sev="maintenance"] { color: var(--maint); background: var(--maint-weak); }
+.statusbadge.maintenance { color: var(--maint); background: var(--maint-weak); }
+.sev-maintenance { background: var(--maint) !important; }
+.card.sev-left.maintenance { border-left-color: var(--maint); opacity: .72; }
+.wall-tile.maintenance { border-top-color: var(--maint); opacity: .7; }
+.wall-head.maintenance { border-left-color: var(--maint); }
+.maint-banner {
+  display: block; margin-bottom: 14px; padding: 9px 14px; border-radius: 8px; color: var(--text);
+  background: var(--maint-weak); border: 1px solid var(--maint); font-size: 13px;
+}
+.maint-banner:hover { text-decoration: none; }
+.maint-banner .sub { color: var(--text-dim); }
+.maint-tree { max-height: 240px; overflow-y: auto; margin-top: 8px; padding: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-sunken); }
+.maint-node { display: block; font-size: 13px; padding: 2px 0; }
+.seg-label { padding: 5px 10px; font-size: 12px; color: var(--text-faint); background: var(--bg-sunken); align-self: center; }

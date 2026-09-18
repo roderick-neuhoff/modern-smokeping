@@ -34,6 +34,8 @@ RUN chmod +x /app/smokeping-modern/api/smokeping-api.cgi \
              /app/smokeping-modern/bin/notify \
              /app/smokeping-modern/bin/sendmail \
              /app/smokeping-modern/bin/oauth-token \
+             /app/smokeping-modern/bin/graph-send \
+             /app/smokeping-modern/bin/maint-check \
              /custom-cont-init.d/50-smokeping-modern \
              /etc/s6-overlay/s6-rc.d/svc-smokeping/run
 

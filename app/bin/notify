@@ -43,6 +43,20 @@ my $cfg  = do {
     eval { $json->decode($raw) } || {};
 };
 
+my $when = strftime('%Y-%m-%d %H:%M:%S', localtime);
+
+# planned maintenance: drop the notification (never for the Settings test button)
+if (!$test) {
+    my $mw = eval {
+        require SmokepingModern::Maintenance;
+        SmokepingModern::Maintenance::suppress_alert($alert, ($state eq 'CLEARED' ? 'cleared' : 'raised'), $target);
+    };
+    if (defined $mw) {
+        logline("$target: $alert $state -> suppressed (maintenance: $mw)");
+        exit_with("suppressed by maintenance window '$mw'", 0);
+    }
+}
+
 # recovery: how long was it down? SmokePing logs the transition before it
 # runs us, so the log tail (or the persistent event store) has the answer.
 my ($dur_sec, $dur);
@@ -59,7 +73,6 @@ if ($state eq 'CLEARED' && !$test) {
     };
 }
 
-my $when  = strftime('%Y-%m-%d %H:%M:%S', localtime);
 my $short = "$target: $alert $state" . (defined $dur ? " (back after $dur)" : '') . ($test ? ' (TEST)' : '');
 my $body  = join "\n",
     ($test ? "This is a TEST notification from modern-smokeping." : ()),

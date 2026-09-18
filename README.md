@@ -16,6 +16,7 @@ password, write) the same files. The classic CGI stays reachable at
 | Layout       | frameset, fixed width            | responsive, mobile drawer, light / dark / auto      |
 | Graphs       | pre-rendered PNGs                | live canvas smoke charts, hover readout, drag-zoom  |
 | Alerts       | e-mail / log only                | **alerts page**: live state, persistent incident history with durations, acknowledgements, "back after 4m12s" recovery notices |
+| Planned work | none                             | **maintenance windows**: silence alerts + leave downtime out of the report, one-off or weekly |
 | Reporting    | none                             | **availability / SLA report** (uptime %, downtime, p95, worst hour, CSV/print), **compare targets** on one chart, Prometheus `/api/metrics` |
 | Config       | edit files by hand               | **settings page**: SMTP, Discord/Telegram/ntfy/…, add & remove targets, **alert-rule form with live preview**, validated config editor |
 | Navigation   | full page reload per click       | single-page app, 15 s auto-refresh, wall display    |
@@ -242,6 +243,31 @@ page reconstructs both:
 * **Export CSV** — on both the active-alerts table and the history list, downloads
   what's currently shown (respects the active table's filter/search).
 
+### Maintenance windows (Settings → Maintenance)
+
+Planning a router swap or a nightly backup that drops the link? Add a window and it
+stops paging anybody and stops counting against your uptime:
+
+* **Scope** — every target, or any mix of targets and whole groups.
+* **Schedule** — one-off (with *Start now for 1 / 2 / 4 / 8 / 24 h* shortcuts) or
+  **weekly** (pick weekdays, a start time and a length up to 48 h; may run past midnight).
+  Weekly times use the container's time zone (`TZ`).
+* **While active** — alert e-mails (Graph and msmtp) and webhooks for covered targets
+  are **not sent**; the dashboard, wall and alerts page show them as *Maintenance*
+  instead of a problem (banner on the dashboard, muted alert rows, grey status pill);
+  the availability report leaves that time out of every figure and does not count
+  incidents that began inside a window.
+* **Recoveries** — an outage that began *before* the window still announces its recovery;
+  one that began *inside* it does not (nobody was told it started).
+* SmokePing keeps measuring and evaluating alerts as usual, so the graphs stay complete
+  and the Alerts page still lists the alert (muted, "in maintenance"). Prometheus gets
+  `smokeping_target_maintenance{path=…}` (1 while covered) so your own alert rules can
+  ignore planned work: `smokeping_target_status >= 2 unless on(path) smokeping_target_maintenance == 1`.
+* Also reachable from a target page (*Maintenance…* pre-selects that target). *End now*
+  finishes a running one-off window early. Finished one-offs are forgotten after 30 days.
+
+Windows are stored in `/config/modern-maintenance.json`.
+
 ### Availability report (`#/report`)
 
 Pick 24 h / 7 d / 30 d / 90 d and get, per target and per group: **availability**,
@@ -268,6 +294,7 @@ container restart.
 | **Notifications** | Discord, Slack, Telegram, ntfy, Gotify, generic JSON webhook — each with **Save & send test**. Enable *Webhook notifications* on the E-mail tab to route alerts there |
 | **Targets** | **Add** a target under any group. **Edit** an existing target or group — menu, title, host, probe (a dropdown of the probes actually defined in the Probes file, validated server-side too — no more typo'd probe names) and its alerts (tick boxes for each defined alert); works on targets from an imported SmokePing config. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
 | **Alert rules** | the Alerts file as a form — **minutes instead of poll cycles** (it converts using your Database step). Rule types: *packet loss* (raise / clear thresholds), *host down*, *high latency*, *latency shift vs. baseline*, plus *custom* for raw patterns. A **live preview** shows which targets would be firing right now and replays the last 20 h to show how often the rule would have fired — tune it before you save. Existing rules are parsed back into the form (the sample alerts all round-trip); unknown patterns open as *custom*. A rule still assigned to a target can't be deleted. Assign rules to targets on the *Targets* tab |
+| **Maintenance** | planned-work windows — see [Maintenance windows](#maintenance-windows-settings--maintenance) |
 | **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves`; nothing is saved if the check fails. **Show changes** previews a line diff against the loaded version before you save |
 | **Access** | who you are, how the login is set, **Sign out** |
 
@@ -294,7 +321,8 @@ scrape_configs:
     static_configs: [{ targets: ['unraid:8480'] }]
 ```
 
-Handy queries: `smokeping_target_status >= 2` (down or critical),
+Handy queries: `smokeping_target_status >= 2` (down or critical; add
+`unless on(path) smokeping_target_maintenance == 1` to ignore planned work),
 `smokeping_alerts_active > 0`, `smokeping_target_loss_percent > 5`.
 
 ### E-mail: OAuth2
@@ -375,6 +403,7 @@ loss and sparkline, plus a status header and clock. Always live (ignores pause).
 | `ssmtp.conf` | SMTP (edited by Settings → E-mail; symlinked to `/etc/ssmtp/ssmtp.conf`) |
 | `modern-notify.json` | webhook channels (Settings → Notifications) |
 | `modern-acks.json` | acknowledgements |
+| `modern-maintenance.json` | maintenance windows |
 | `modern-events.jsonl`, `modern-events.state` | persistent alert/incident history and its log-tail offset |
 | `log/smokeping.log`, `log/notify.log` | alert history; notifier log |
 | `Targets.bak`, `Alerts.bak`, … | previous version of any file saved through the UI |
@@ -439,8 +468,9 @@ Dockerfile                      FROM lscr.io/linuxserver/smokeping + the files b
 app/web/                        single-page UI (plain ES modules: app.js, views.js, chart.js; no build step)  -> /modern/ and /
 app/api/smokeping-api.cgi       JSON API, runs under mod_fcgid                                -> /api/
 app/api/lib/SmokepingModern/    Api.pm (read: tree, summary, node, alerts, report, events, metrics)  Admin.pm (write: settings, config, targets, alert rules, acks)
-                                Events.pm (persistent incident store)  AlertRule.pm (minutes <-> SmokePing patterns)
+                                Events.pm (persistent incident store)  Maintenance.pm (windows)  AlertRule.pm (minutes <-> SmokePing patterns)
 app/bin/notify                  webhook notifier, invoked by SmokePing as a |script alertee
+app/bin/maint-check             drops alert mail for targets in a maintenance window (used by bin/sendmail)
 app/apache/                     Apache alias / fcgid / rewrite snippet
 root/custom-cont-init.d/        installs the snippet + login on every start
 root/etc/s6-overlay/.../svc-smokeping/run   upstream run script + --logfile
@@ -453,11 +483,11 @@ rather than reimplementing any of it.
 
 | Endpoint | |
 |----------|---|
-| `GET /api/health` `tree` `summary` `alerts` `acks` `metrics` | open |
+| `GET /api/health` `tree` `summary` `alerts` `acks` `maintenance` `metrics` | open |
 | `GET /api/report?range=24h\|7d\|30d\|90d` `events?range=&target=` `alertpreview?kind=…` | open |
 | `GET /api/node?path=&range=` or `&start=&end=` | open |
 | `GET /api/settings` `me` `config/<file>` `alertdefs` | password |
-| `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `alertdefs` `alertdefs/delete` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |
+| `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `alertdefs` `alertdefs/delete` `maintenance` `maintenance/delete` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |
 
 ## License
 

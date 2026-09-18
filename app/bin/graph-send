@@ -90,6 +90,12 @@ my $subject = defined $H{subject} ? $H{subject} : '(no subject)';
 my $ctype   = ($H{'content-type'} // '') =~ /html/i ? 'HTML' : 'Text';
 $body =~ s/\s+\z//;
 
+# planned maintenance: drop alert mail for targets inside a window (fails open)
+{
+    my $mw = eval { require SmokepingModern::Maintenance; SmokepingModern::Maintenance::suppress_message($subject) };
+    if (defined $mw) { logline("suppressed by maintenance window '$mw': $subject"); exit 0 }
+}
+
 # recovery mails: say how long the outage lasted. SmokePing's subject is
 #   [SmokeAlert] <alert> was cleared on <target>
 # and it logs the clear before it mails, so the duration is already known.

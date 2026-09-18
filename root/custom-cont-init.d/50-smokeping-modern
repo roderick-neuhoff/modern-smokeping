@@ -41,14 +41,14 @@ else
     AuthUserFile $HTPASSWD
     Require valid-user
 </LocationMatch>
-<Location /api/acks>
+<LocationMatch "^/api/(acks|maintenance)(/|$)">
     AuthType Basic
     AuthName "SmokePing settings"
     AuthUserFile $HTPASSWD
     <LimitExcept GET HEAD>
         Require valid-user
     </LimitExcept>
-</Location>
+</LocationMatch>
 # the OAuth provider redirects the browser here after sign-in; a one-time
 # state token in the request is the proof, so no password prompt
 <Location /api/oauth/callback>
@@ -71,7 +71,8 @@ ln -sf /config/ssmtp.conf /etc/ssmtp/ssmtp.conf
 touch /config/log/smokeping.log /config/log/notify.log /config/log/msmtp.log
 
 chmod +x /app/smokeping-modern/api/smokeping-api.cgi /app/smokeping-modern/bin/notify \
-         /app/smokeping-modern/bin/sendmail /app/smokeping-modern/bin/oauth-token /app/smokeping-modern/bin/graph-send
+         /app/smokeping-modern/bin/sendmail /app/smokeping-modern/bin/oauth-token /app/smokeping-modern/bin/graph-send \
+         /app/smokeping-modern/bin/maint-check
 chmod 0640 /config/ssmtp.conf /config/modern-notify.json 2>/dev/null || true
 # msmtp insists its config is private; the OAuth file holds a refresh token
 chmod 0600 /config/msmtp.conf /config/modern-oauth.json 2>/dev/null || true

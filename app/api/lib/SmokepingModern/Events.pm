@@ -263,32 +263,38 @@ sub incidents {
 # ---------------------------------------------------------------------------
 
 sub outage_duration {
+    my ($start, $end) = outage_times(@_);
+    return defined $start && defined $end ? $end - $start : undef;
+}
+
+# (start, end) epoch of the most recent completed outage of this alert+target
+sub outage_times {
     my ($alert, $target) = @_;
-    my $log = log_file() or return undef;
-    my @st = stat $log or return undef;
-    open my $fh, '<', $log or return undef;
-    my $take = 2 * 1024 * 1024;
-    seek $fh, ($st[7] > $take ? $st[7] - $take : 0), SEEK_SET;
-    my ($start, $dur);
-    while (my $line = <$fh>) {
-        my $e = parse_line($line) or next;
-        next unless $e->{alert} eq $alert && $e->{target} eq $target;
-        if ($e->{what} eq 'raised' || $e->{what} eq 'active') { $start = $e->{t} unless defined $start; }
-        elsif ($e->{what} eq 'cleared') {
-            $dur = defined $start ? $e->{t} - $start : undef;
-            $start = undef;
+    my $log = log_file();
+    if ($log && (my @st = stat $log) && open my $fh, '<', $log) {
+        my $take = 2 * 1024 * 1024;
+        seek $fh, ($st[7] > $take ? $st[7] - $take : 0), SEEK_SET;
+        my ($start, $found_s, $found_e);
+        while (my $line = <$fh>) {
+            my $e = parse_line($line) or next;
+            next unless $e->{alert} eq $alert && $e->{target} eq $target;
+            if ($e->{what} eq 'raised' || $e->{what} eq 'active') { $start = $e->{t} unless defined $start; }
+            elsif ($e->{what} eq 'cleared') {
+                ($found_s, $found_e) = ($start, $e->{t}) if defined $start;
+                $start = undef;
+            }
         }
+        close $fh;
+        return ($found_s, $found_e) if defined $found_s;
     }
-    close $fh;
-    return $dur if defined $dur;
 
     # not in the log tail (rotated away): the persistent store remembers it
-    my $last;
+    my ($ls, $le);
     for my $e (@{ read_store() }) {
         next unless $e->{alert} eq $alert && $e->{target} eq $target && $e->{event} eq 'cleared' && defined $e->{start};
-        $last = $e->{t} - $e->{start};
+        ($ls, $le) = ($e->{start}, $e->{t});
     }
-    return $last;
+    return ($ls, $le);
 }
 
 sub fmt_duration {

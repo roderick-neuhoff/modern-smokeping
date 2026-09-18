@@ -3,9 +3,17 @@
 # (pathnames: sendmail = /app/smokeping-modern/bin/sendmail).
 # msmtp reads /config/msmtp.conf, written by Settings -> E-mail; for OAuth2
 # accounts it fetches the access token through bin/oauth-token (passwordeval).
+# Mail for targets that are in a maintenance window is dropped (bin/maint-check).
 CONF=/config/msmtp.conf
 if [ ! -s "$CONF" ]; then
     echo "modern-smokeping: no mail configuration yet (open Settings -> E-mail)" >&2
     exit 78   # EX_CONFIG
 fi
-exec /usr/bin/msmtp -C "$CONF" "$@"
+TMP=$(mktemp) || exec /usr/bin/msmtp -C "$CONF" "$@"
+trap 'rm -f "$TMP"' EXIT
+cat > "$TMP"
+if WINDOW=$(/usr/bin/perl /app/smokeping-modern/bin/maint-check < "$TMP" 2>/dev/null); then
+    echo "$(date) suppressed by maintenance window '$WINDOW'" >> /config/log/msmtp.log 2>/dev/null
+    exit 0
+fi
+/usr/bin/msmtp -C "$CONF" "$@" < "$TMP"

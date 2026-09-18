@@ -66,6 +66,7 @@ export async function renderReport(main, range) {
     kpi('Overall availability', fmtAvail(s.availability), availClass(s.availability)),
     kpi('Full-outage time', fmtDur(s.downtimeSec), s.downtimeSec ? 'warning' : 'ok', 'summed over all targets'),
     kpi('Incidents', String(s.incidents ?? 0), s.incidents ? 'warning' : 'ok'),
+    s.maintenanceSec ? kpi('Maintenance excluded', fmtDur(s.maintenanceSec), null, 'planned windows, summed over targets') : null,
     kpi('Targets', String(s.targets ?? 0)),
     kpi('Perfect', `${s.perfect ?? 0} / ${s.targets ?? 0}`, null, 'no measurable loss'),
   ));
@@ -103,7 +104,8 @@ export async function renderReport(main, range) {
       tb.append(el('tr', {},
         el('td', {}, el('a', { href: '#/node' + t.path }, t.title),
           t.host ? el('div', { class: 'cell-sub' }, t.host) : null),
-        el('td', {}, availCell(t.availability)),
+        el('td', {}, availCell(t.availability),
+          t.maintenanceSec ? el('div', { class: 'cell-sub' }, `excludes ${fmtDur(t.maintenanceSec)} maintenance`) : null),
         el('td', { class: 'num' }, fmtDur(t.downtimeSec)),
         el('td', { class: 'num' }, t.lossMinutes < 0.05 ? '0' : t.lossMinutes.toFixed(1)),
         el('td', { class: 'num' }, D.fmtPct(t.avgLossPct)),
@@ -124,7 +126,7 @@ export async function renderReport(main, range) {
   main.append(el('p', { class: 'note' },
     `Availability is 100 % minus the average packet loss over the period (so 10 % loss for a whole day counts as 10 % unavailable). ` +
     `Full-outage time is the time spent in poll slots with ${r.downLossPct} % or more loss, at the RRD resolution available for that range (${r.targets[0] ? r.targets[0].stepSec + ' s' : 'n/a'} steps). ` +
-    `Loss-minutes is the same loss expressed as minutes of total outage. Incidents come from the persistent alert history.`));
+    `Loss-minutes is the same loss expressed as minutes of total outage. Incidents come from the persistent alert history. Time inside a maintenance window is left out of every figure, and incidents that began during one are not counted.`));
 }
 
 function kpi(k, v, cls, hint) {
@@ -134,6 +136,7 @@ function kpi(k, v, cls, hint) {
 }
 
 function availCell(v) {
+  if (v == null) return D.el('span', { class: 'sub' }, 'in maintenance');
   const pct = v == null ? 0 : Math.max(0, Math.min(100, v));
   return D.el('div', { class: 'availbar' },
     D.el('span', { class: 'track' }, D.el('i', { class: availClass(v), style: `width:${pct}%` })),
@@ -142,11 +145,11 @@ function availCell(v) {
 
 function exportReportCsv(r, range) {
   const rows = r.targets.map(t => [t.path, t.title, t.host, t.availability == null ? '' : t.availability.toFixed(4), t.downtimeSec,
-    t.lossMinutes.toFixed(2), t.avgLossPct.toFixed(3), t.avgMs == null ? '' : t.avgMs.toFixed(2), t.p95Ms == null ? '' : t.p95Ms.toFixed(2),
+    t.lossMinutes.toFixed(2), t.avgLossPct == null ? '' : t.avgLossPct.toFixed(3), t.avgMs == null ? '' : t.avgMs.toFixed(2), t.p95Ms == null ? '' : t.p95Ms.toFixed(2),
     t.maxMs == null ? '' : t.maxMs.toFixed(2), t.worstHour ? new Date(t.worstHour.t * 1000).toISOString() : '',
-    t.worstHour ? t.worstHour.lossPct.toFixed(2) : '', t.incidents, t.longestSec, t.coveragePct.toFixed(1)]);
+    t.worstHour ? t.worstHour.lossPct.toFixed(2) : '', t.incidents, t.longestSec, t.coveragePct.toFixed(1), t.maintenanceSec || 0]);
   D.downloadBlob(D.rowsToCsv(['path', 'title', 'host', 'availability_pct', 'full_outage_sec', 'loss_minutes', 'avg_loss_pct', 'avg_rtt_ms',
-    'p95_rtt_ms', 'max_rtt_ms', 'worst_hour', 'worst_hour_loss_pct', 'incidents', 'longest_incident_sec', 'coverage_pct'], rows),
+    'p95_rtt_ms', 'max_rtt_ms', 'worst_hour', 'worst_hour_loss_pct', 'incidents', 'longest_incident_sec', 'coverage_pct', 'maintenance_sec'], rows),
     `smokeping-availability-${range}.csv`);
 }
 
@@ -304,9 +307,9 @@ export function incidentHistory(opts = {}) {
     }
     if (last && last.incidents.length) {
       tools.append(el('button', { class: 'chip', title: 'Download as CSV', onclick: () => D.downloadBlob(D.rowsToCsv(
-        ['target', 'path', 'alert', 'started', 'ended', 'duration_sec', 'ongoing'],
+        ['target', 'path', 'alert', 'started', 'ended', 'duration_sec', 'ongoing', 'maintenance'],
         last.incidents.map(i => [i.title, i.path, i.alert, new Date(i.start * 1000).toISOString(),
-          i.end ? new Date(i.end * 1000).toISOString() : '', i.durationSec, i.open ? 'yes' : 'no'])),
+          i.end ? new Date(i.end * 1000).toISOString() : '', i.durationSec, i.open ? 'yes' : 'no', i.maintenance ? 'yes' : 'no'])),
         `smokeping-incidents-${range}.csv`) }, 'Export CSV'));
     }
     head.append(tools);
@@ -332,7 +335,7 @@ export function incidentHistory(opts = {}) {
     for (const i of last.incidents.slice(0, opts.compact ? 10 : 200)) {
       tb.append(el('tr', {},
         opts.target ? null : el('td', {}, el('a', { href: '#/node' + i.path }, i.title)),
-        el('td', {}, i.alert),
+        el('td', {}, i.alert, i.maintenance ? el('span', { class: 'statusbadge maintenance', style: 'margin-left:6px', title: 'started during a maintenance window' }, 'planned') : null),
         el('td', {}, stamp(i.start)),
         el('td', {}, i.open ? el('span', { class: 'statusbadge critical' }, el('span', { class: 'dot' }), 'ongoing') : stamp(i.end)),
         el('td', { class: 'num', title: i.level ? 'level-triggered alert: the end is inferred from when it stopped being reported' : '' },
@@ -611,5 +614,264 @@ function ruleEditor({ mode, def, stepSec, onClose, onSaved }) {
     res);
   drawForm();
   runPreview();
+  return card;
+}
+
+// ============================================================================
+// Settings -> Maintenance
+// ============================================================================
+
+const pad2 = (n) => String(n).padStart(2, '0');
+const toLocalInput = (ts) => { const d = new Date(ts * 1000); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+const fromLocalInput = (v) => Math.floor(new Date(v).getTime() / 1000);
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+// "14:30" today, otherwise date + time
+export function fmtUntil(ts) {
+  if (!ts) return '?';
+  const d = new Date(ts * 1000), now = new Date();
+  return d.toDateString() === now.toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+function describeWhen(w) {
+  if (w.mode === 'weekly') {
+    return `${(w.days || []).map(d => DAY_NAMES[d]).join(', ')} at ${w.time} for ${fmtDur((w.durationMin || 0) * 60)}`;
+  }
+  return `${stamp(w.start)} → ${stamp(w.end)}`;
+}
+
+function describeScope(w) {
+  const p = w.paths || [];
+  if (!p.length) return 'All targets';
+  return p.map(x => x.split('/').filter(Boolean).pop()).join(', ');
+}
+
+// flat [{path, label, depth, isLeaf}] of the whole target tree
+function flatTree() {
+  const out = [];
+  const walk = (node, depth) => {
+    for (const c of (node.children || [])) {
+      out.push({ path: c.path, label: c.menu || c.name, depth, isLeaf: !!c.isLeaf });
+      walk(c, depth + 1);
+    }
+  };
+  if (D.state.tree) walk(D.state.tree.root, 0);
+  return out;
+}
+
+export async function paneMaintenance(pane) {
+  const { el } = D;
+  let data;
+  try { data = await D.api('/maintenance'); }
+  catch (e) { pane.append(el('div', { class: 'empty' }, 'Could not load maintenance windows: ' + e.message)); return; }
+
+  const listHost = el('div');
+  const editorHost = el('div');
+  pane.append(listHost, editorHost);
+
+  const openEditor = (w, preset) => {
+    editorHost.innerHTML = '';
+    editorHost.append(maintenanceEditor({
+      w, preset,
+      onClose: () => { editorHost.innerHTML = ''; },
+      onSaved: async () => { editorHost.innerHTML = ''; await reload(); },
+    }));
+    editorHost.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  async function reload() {
+    try { data = await D.api('/maintenance'); } catch (e) { D.toast('Reload failed: ' + e.message, true); return; }
+    drawList();
+  }
+
+  const statusCell = (w) => {
+    const st = w.state || {};
+    if (w.enabled === false) return el('span', { class: 'sub' }, 'disabled');
+    if (st.status === 'active') return el('span', { class: 'statusbadge warning' }, el('span', { class: 'dot' }), 'Active until ' + fmtUntil(st.until));
+    if (st.status === 'upcoming') return el('span', { class: 'sub' }, (w.mode === 'weekly' ? 'Next: ' : 'Starts ') + fmtUntil(st.next));
+    return el('span', { class: 'sub' }, 'Ended');
+  };
+
+  function drawList() {
+    listHost.innerHTML = '';
+    const card = el('div', { class: 'card-plain' });
+    card.append(el('div', { class: 'card-top' },
+      el('h2', { style: 'margin:0' }, 'Maintenance windows'),
+      el('span', { style: 'flex:1' }),
+      el('button', { class: 'chip on', onclick: () => openEditor(null) }, '+ New window')));
+    card.append(el('p', { class: 'sub' },
+      'While a window covers a target its alert e-mails and webhooks are not sent, it shows as "maintenance" instead of a problem, and its downtime is left out of the availability report. ' +
+      'SmokePing keeps measuring as usual. Weekly windows use the server’s time zone.'));
+    const wins = (data.windows || []).slice().sort((a, b) => {
+      const rank = (w) => ({ active: 0, upcoming: 1, ended: 2 }[(w.state || {}).status] ?? 3);
+      return rank(a) - rank(b) || ((a.state || {}).next || 0) - ((b.state || {}).next || 0);
+    });
+    if (!wins.length) card.append(el('p', { class: 'note' }, 'No maintenance windows. Planning work on a router? Add one so it does not page anybody or count against your uptime.'));
+    else {
+      const tbl = el('table', { class: 'data' },
+        el('thead', {}, el('tr', {}, ...['Window', 'Covers', 'When', 'Status', ''].map(h => el('th', {}, h)))));
+      const tb = el('tbody');
+      for (const w of wins) {
+        const st = w.state || {};
+        const actions = el('div', { class: 'row-actions' },
+          el('button', { class: 'chip', onclick: () => openEditor(w) }, 'Edit'));
+        if (st.status === 'active' && w.mode === 'once') {
+          actions.append(el('button', { class: 'chip', title: 'Finish the window right now', onclick: () => endNow(w) }, 'End now'));
+        }
+        actions.append(el('button', { class: 'chip danger', onclick: () => remove(w) }, 'Delete'));
+        tb.append(el('tr', { class: st.status === 'ended' ? 'row-muted' : '' },
+          el('td', {}, el('strong', {}, w.title), w.note ? el('div', { class: 'cell-sub' }, w.note) : null),
+          el('td', { style: 'white-space:normal;max-width:220px' }, describeScope(w)),
+          el('td', { style: 'white-space:normal' }, describeWhen(w)),
+          el('td', {}, statusCell(w)),
+          el('td', {}, actions)));
+      }
+      tbl.append(tb);
+      card.append(el('div', { class: 'table-scroll' }, tbl));
+    }
+    listHost.append(card);
+  }
+
+  async function endNow(w) {
+    try {
+      await D.post('/maintenance', { id: w.id, title: w.title, note: w.note, paths: w.paths, mode: 'once', start: w.start, end: Math.floor(Date.now() / 1000), enabled: w.enabled });
+      D.toast('Maintenance ended.'); await reload();
+    } catch (e) { D.toast(e.message, true); }
+  }
+  async function remove(w) {
+    if (!confirm(`Delete the maintenance window '${w.title}'?`)) return;
+    try { await D.post('/maintenance/delete', { id: w.id }); D.toast('Deleted.'); await reload(); }
+    catch (e) { D.toast(e.message, true); }
+  }
+
+  drawList();
+  // deep link from a target page: #/settings/maintenance?path=/WAN/Quad9
+  const q = new URLSearchParams((location.hash.split('?')[1]) || '');
+  if (q.get('path')) openEditor(null, { path: q.get('path') });
+}
+
+function maintenanceEditor({ w, preset, onClose, onSaved }) {
+  const { el } = D;
+  const edit = !!w;
+  const now = Math.floor(Date.now() / 1000);
+  const m = {
+    id: w ? w.id : undefined,
+    title: w ? w.title : '',
+    note: w ? (w.note || '') : '',
+    all: w ? !(w.paths || []).length : !(preset && preset.path),
+    paths: new Set(w ? (w.paths || []) : (preset && preset.path ? [preset.path] : [])),
+    mode: w ? w.mode : 'once',
+    start: toLocalInput(w && w.mode === 'once' ? w.start : now),
+    end: toLocalInput(w && w.mode === 'once' ? w.end : now + 7200),
+    days: new Set(w && w.mode === 'weekly' ? w.days : [6]),
+    time: w && w.mode === 'weekly' ? w.time : '03:00',
+    hours: w && w.mode === 'weekly' ? (w.durationMin / 60) : 2,
+    enabled: w ? w.enabled !== false : true,
+  };
+  const tree = flatTree();
+  const nodes = (D.state.summary && D.state.summary.nodes) || [];
+
+  const card = el('div', { class: 'card-plain rule-editor' });
+  const formHost = el('div');
+  const summary = el('p', { class: 'sub maint-summary' });
+  const res = D.resultBox();
+
+  const covered = () => nodes.filter(n => m.all || [...m.paths].some(p => n.path === p || n.path.startsWith(p + '/'))).length;
+  const drawSummary = () => {
+    const n = covered();
+    summary.textContent = `Silences alerts, e-mail and webhooks for ${n} target${n === 1 ? '' : 's'} and leaves their downtime out of the availability report.`;
+  };
+
+  const draw = () => {
+    formHost.innerHTML = '';
+    const title = D.input({ placeholder: 'e.g. Router firmware upgrade', value: m.title, maxlength: '80' });
+    title.addEventListener('input', () => { m.title = title.value; });
+    const note = D.input({ placeholder: 'optional - shown on the dashboard', value: m.note, maxlength: '300' });
+    note.addEventListener('input', () => { m.note = note.value; });
+    formHost.append(el('div', { class: 'form-grid' }, D.field('Title', title), D.field('Note', note)));
+
+    // scope
+    const allRadio = el('input', { type: 'radio', name: 'maint-scope' }); allRadio.checked = m.all;
+    const selRadio = el('input', { type: 'radio', name: 'maint-scope' }); selRadio.checked = !m.all;
+    const picker = el('div', { class: 'maint-tree', hidden: m.all ? 'hidden' : null });
+    for (const t of tree) {
+      const cb = el('input', { type: 'checkbox' }); cb.checked = m.paths.has(t.path);
+      cb.addEventListener('change', () => { cb.checked ? m.paths.add(t.path) : m.paths.delete(t.path); drawSummary(); });
+      picker.append(el('label', { class: 'maint-node', style: `padding-left:${t.depth * 18 + 4}px` }, cb, ' ', t.isLeaf ? t.label : el('strong', {}, t.label + '  (whole group)')));
+    }
+    if (!tree.length) picker.append(el('span', { class: 'sub' }, 'No targets loaded.'));
+    allRadio.addEventListener('change', () => { m.all = true; picker.hidden = true; drawSummary(); });
+    selRadio.addEventListener('change', () => { m.all = false; picker.hidden = false; drawSummary(); });
+    formHost.append(D.field('Covers',
+      el('div', {},
+        el('label', { class: 'switch' }, allRadio, ' every target'), el('br'),
+        el('label', { class: 'switch' }, selRadio, ' only the targets / groups I tick'),
+        picker)));
+
+    // when
+    const modeSel = el('select', { class: 'input' },
+      el('option', { value: 'once' }, 'One time'), el('option', { value: 'weekly' }, 'Repeats every week'));
+    modeSel.value = m.mode;
+    modeSel.addEventListener('change', () => { m.mode = modeSel.value; draw(); });
+    formHost.append(D.field('Schedule', modeSel));
+
+    if (m.mode === 'once') {
+      const s = el('input', { class: 'input', type: 'datetime-local', value: m.start });
+      const e = el('input', { class: 'input', type: 'datetime-local', value: m.end });
+      s.addEventListener('input', () => { m.start = s.value; });
+      e.addEventListener('input', () => { m.end = e.value; });
+      const quick = el('div', { class: 'seg', style: 'flex-wrap:wrap' }, el('span', { class: 'seg-label' }, 'Start now for'),
+        ...[1, 2, 4, 8, 24].map(h => el('button', { onclick: () => {
+          const t = Math.floor(Date.now() / 1000);
+          m.start = toLocalInput(t); m.end = toLocalInput(t + h * 3600); s.value = m.start; e.value = m.end;
+        } }, h + ' h')));
+      formHost.append(el('div', { class: 'form-grid' }, D.field('From', s), D.field('Until', e)), quick);
+    } else {
+      const days = el('div', { class: 'alert-checks' }, ...DAY_NAMES.map((n, i) => {
+        const cb = el('input', { type: 'checkbox' }); cb.checked = m.days.has(i);
+        cb.addEventListener('change', () => { cb.checked ? m.days.add(i) : m.days.delete(i); });
+        return el('label', { class: 'alert-check' }, cb, ' ', n);
+      }));
+      const time = el('input', { class: 'input', type: 'time', value: m.time });
+      time.addEventListener('input', () => { m.time = time.value; });
+      const hrs = el('input', { class: 'input', type: 'number', min: '0.25', max: '48', step: '0.25', value: m.hours });
+      hrs.addEventListener('input', () => { m.hours = hrs.value; });
+      formHost.append(D.field('On', days), el('div', { class: 'form-grid' },
+        D.field('Starting at', time, 'server time zone'), D.field('Lasting (hours)', hrs, 'up to 48; may run past midnight')));
+    }
+    const en = el('input', { type: 'checkbox' }); en.checked = m.enabled;
+    en.addEventListener('change', () => { m.enabled = en.checked; });
+    formHost.append(el('label', { class: 'switch' }, en, ' enabled'));
+    drawSummary();
+  };
+
+  async function save(btn) {
+    btn.disabled = true;
+    try {
+      if (!m.all && !m.paths.size) throw new Error('Tick at least one target or group, or choose "every target".');
+      const body = { id: m.id, title: m.title, note: m.note, paths: m.all ? [] : [...m.paths], mode: m.mode, enabled: m.enabled };
+      if (m.mode === 'once') {
+        body.start = fromLocalInput(m.start); body.end = fromLocalInput(m.end);
+        if (!isFinite(body.start) || !isFinite(body.end)) throw new Error('Pick a start and an end time.');
+      } else {
+        body.days = [...m.days]; body.time = m.time; body.durationMin = Math.round(parseFloat(m.hours) * 60);
+      }
+      await D.post('/maintenance', body);
+      D.toast(edit ? 'Maintenance window saved.' : 'Maintenance window created.');
+      await onSaved();
+    } catch (e) {
+      D.showResult(res, { ok: false, error: e.message, ...(e.data || {}) });
+      btn.disabled = false;
+    }
+  }
+
+  card.append(el('h2', {}, edit ? `Edit: ${w.title}` : 'New maintenance window'), formHost, summary,
+    el('div', { class: 'modal-actions' },
+      el('button', { class: 'chip', onclick: onClose }, 'Cancel'),
+      el('button', { class: 'chip on', onclick: (e) => save(e.currentTarget) }, edit ? 'Save window' : 'Create window')),
+    res);
+  draw();
   return card;
 }

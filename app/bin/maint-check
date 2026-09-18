@@ -1,0 +1,18 @@
+#!/usr/bin/perl
+# Exit 0 (and print the window title) if the alert e-mail on stdin should be
+# dropped because its target is in a maintenance window; exit 1 otherwise.
+# Used by bin/sendmail before it hands the message to msmtp. Fails open: any
+# problem here means "send it".
+use strict;
+use warnings;
+use FindBin ();
+use lib "$FindBin::RealBin/../api/lib";
+
+my $subject;
+while (my $l = <STDIN>) {
+    last if $l =~ /^\r?\n$/;
+    $subject = $1 if $l =~ /^Subject:\s*(.*?)\s*$/i;
+}
+my $title = eval { require SmokepingModern::Maintenance; SmokepingModern::Maintenance::suppress_message($subject) };
+if (defined $title) { print "$title\n"; exit 0 }
+exit 1;

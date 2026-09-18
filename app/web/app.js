@@ -1,7 +1,7 @@
 // SmokePing Modern UI - app shell, router and views.
 import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs, seriesToCsv, toPngDataUrl } from './chart.js';
 import { diffLines } from './diff.js';
-import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules } from './views.js';
+import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules, paneMaintenance, fmtUntil } from './views.js';
 
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
 const REFRESH_MS = 15_000;
@@ -44,8 +44,8 @@ function el(tag, attrs = {}, ...kids) {
   for (const kid of kids.flat()) if (kid != null) n.append(kid.nodeType ? kid : document.createTextNode(kid));
   return n;
 }
-const SEV_LABEL = { ok: 'OK', warning: 'Warning', critical: 'Critical', down: 'Down', unknown: 'No data' };
-const SEV_ORDER = { critical: 0, down: 1, warning: 2, unknown: 3, ok: 4 };
+const SEV_LABEL = { ok: 'OK', warning: 'Warning', critical: 'Critical', down: 'Down', unknown: 'No data', maintenance: 'Maintenance' };
+const SEV_ORDER = { critical: 0, down: 1, warning: 2, unknown: 3, ok: 4, maintenance: 5 };
 // severity first, then current loss % (so a problem outranks a quieter node
 // even inside the same severity bucket - e.g. two "ok" nodes where one has
 // transient loss that hasn't crossed an alert threshold yet), then path.
@@ -111,6 +111,8 @@ async function refresh() {
         api('/alerts',  { retries: 2 }).catch(e => { throw tag(e, '/api/alerts'); }),
         api('/acks').catch(() => null),          // optional - older API or auth hiccup
       ]);
+      // a target inside a planned window is not a problem: show it as "maintenance" everywhere
+      for (const n of summary.nodes) if (n.maintenance) { n.realSeverity = n.severity; n.severity = 'maintenance'; }
       state.summary = summary;
       state.alerts = alerts;
       if (acks && acks.acks) state.acks = acks.acks;
@@ -209,6 +211,7 @@ function renderStatusPills() {
     ['critical', (c.critical || 0), '#/alerts?sev=critical'],
     ['down', (c.down || 0), '#/alerts'],
   ];
+  if (c.maintenance) defs.push(['maintenance', c.maintenance, '#/settings/maintenance']);
   for (const [sev, n, href] of defs) {
     host.append(el('a', {
       class: 'pill' + (n ? '' : ' zero'), 'data-sev': sev, href,
@@ -457,6 +460,8 @@ function renderDashboard() {
     sortControl(),
   ));
 
+  main.append(...maintenanceBanners());
+
   if (!nodes.length) { main.append(el('div', { class: 'empty' }, 'No targets match your filter.')); return; }
 
   const grid = el('div', { class: 'grid' });
@@ -469,6 +474,17 @@ function renderDashboard() {
   main.append(grid);
   requestAnimationFrame(() => {
     for (const [cv, spark] of draws) if (cv && spark) drawSpark(cv, spark);
+  });
+}
+
+// one banner per maintenance window in effect right now
+function maintenanceBanners() {
+  const wins = (state.summary && state.summary.maintenance) || [];
+  return wins.map(w => {
+    const n = ((state.summary && state.summary.nodes) || []).filter(x => x.maintenance && x.maintenance.id === w.id).length;
+    return el('a', { class: 'maint-banner', href: '#/settings/maintenance' },
+      el('strong', {}, 'Maintenance in progress: '), w.title,
+      el('span', { class: 'sub' }, ` \u00b7 ${n} target${n === 1 ? '' : 's'} \u00b7 alerts silenced until ${fmtUntil(w.until)}`));
   });
 }
 
@@ -544,6 +560,7 @@ async function renderNode(path) {
       onclick: () => { nodeRange = r; localStorage.setItem('sp.range', r); zoom = { path, start: null, end: null }; renderNode(path); },
     }, r))),
     el('a', { class: 'chip', href: compareHash([path], nodeRange), title: 'Overlay other targets on this chart' }, 'Compare…'),
+    el('a', { class: 'chip', href: '#/settings/maintenance?path=' + encodeURIComponent(path), title: 'Silence alerts and exclude downtime from reports for planned work' }, 'Maintenance…'),
     el('button', {
       class: 'chip', title: 'Save the chart as a PNG image',
       onclick: () => {
@@ -556,6 +573,13 @@ async function renderNode(path) {
       onclick: () => downloadBlob(seriesToCsv(d.series), pathSlug(path) + '-' + nodeRange + '.csv'),
     }, 'Export CSV'),
   ));
+
+  const inMaint = ((state.summary && state.summary.nodes) || []).find(x => x.path === path && x.maintenance);
+  if (inMaint) {
+    main.append(el('a', { class: 'maint-banner', href: '#/settings/maintenance' },
+      el('strong', {}, 'In maintenance: '), inMaint.maintenance.title,
+      el('span', { class: 'sub' }, ` \u00b7 alerts silenced until ${fmtUntil(inMaint.maintenance.until)}`)));
+  }
 
   const wrap = el('div', { class: 'chart-wrap', style: 'position:relative' });
   const cv = el('canvas', { class: 'smokechart' });
@@ -675,10 +699,12 @@ function renderAlerts(sevFilter) {
       const ack = ackFor(r);
       const cv = el('canvas', { class: 'minispark' });
       sparks.push([cv, r]);
-      tb.append(el('tr', { class: ack ? 'row-muted' : '' },
+      tb.append(el('tr', { class: (ack || r.maintenance) ? 'row-muted' : '' },
         el('td', {}, el('span', { class: `statusbadge ${r.severity}` }, el('span', { class: 'dot' }), SEV_LABEL[r.severity] || r.severity)),
         el('td', {}, el('a', { href: '#/node' + r.path }, r.target),
           r.comment ? el('div', { style: 'color:var(--text-faint);font-size:12px' }, r.comment) : null,
+          r.maintenance ? el('div', { style: 'color:var(--text-faint);font-size:12px' },
+            `in maintenance: ${r.maintenance.title} (notifications silenced until ${fmtUntil(r.maintenance.until)})`) : null,
           ack ? el('div', { style: 'color:var(--text-faint);font-size:12px' },
             `acked by ${ack.by}${ack.until ? ' until ' + new Date(ack.until * 1000).toLocaleString() : ' (no expiry)'}${ack.note ? ' — ' + ack.note : ''}`) : null),
         el('td', {}, r.alert),
@@ -737,7 +763,7 @@ function ackFor(a) {
   const live = (x) => x && (!x.until || x.until > now) ? x : null;
   return live(k1) || live(k2);
 }
-function isAcked(a) { return !!ackFor(a); }
+function isAcked(a) { return !!ackFor(a) || !!a.maintenance; }
 
 // run a write; on 401 ask for the settings password once and retry
 async function authed(fn) {
@@ -859,7 +885,7 @@ function signInDialog() {
 
 // --- settings view --------------------------------------------------
 
-const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Targets'], ['rules', 'Alert rules'], ['config', 'Config files'], ['access', 'Access']];
+const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Targets'], ['rules', 'Alert rules'], ['maintenance', 'Maintenance'], ['config', 'Config files'], ['access', 'Access']];
 let settingsData = null;
 
 async function renderSettings(tab) {
@@ -883,7 +909,7 @@ async function renderSettings(tab) {
     el('a', { class: 'segbtn' + (tab === k ? ' on' : ''), href: '#/settings/' + k }, l))));
   const pane = el('div', { class: 'settings-pane' });
   main.append(pane);
-  ({ mail: paneMail, notify: paneNotify, targets: paneTargets, rules: paneRules, config: paneConfig, access: paneAccess }[tab] || paneMail)(pane);
+  ({ mail: paneMail, notify: paneNotify, targets: paneTargets, rules: paneRules, maintenance: paneMaintenance, config: paneConfig, access: paneAccess }[tab] || paneMail)(pane);
 }
 
 function field(label, input, help) {
@@ -1536,13 +1562,13 @@ function renderWall() {
   const allNodes = s.nodes.slice().sort(sevSort);
   const worst = allNodes.length ? allNodes[0].severity : 'unknown';
   const problemsOnly = state.wallProblems;
-  const nodes = problemsOnly ? allNodes.filter(n => n.severity !== 'ok') : allNodes;
+  const nodes = problemsOnly ? allNodes.filter(n => n.severity !== 'ok' && n.severity !== 'maintenance') : allNodes;
   main.innerHTML = '';
   document.body.dataset.density = state.wallDensity;
   main.append(el('div', { class: 'wall-head ' + worst },
     el('span', { class: 'wall-title' }, state.tree && state.tree.title || 'SmokePing', el('em', { class: 'wall-version' }, APP_VERSION)),
     el('span', { class: 'wall-counts' },
-      ...['ok', 'warning', 'critical', 'down'].map(k => el('span', { class: 'pill', 'data-sev': k }, el('span', { class: 'dot' }), `${SEV_LABEL[k]} ${s.counts[k] || 0}`))),
+      ...['ok', 'warning', 'critical', 'down', ...(s.counts.maintenance ? ['maintenance'] : [])].map(k => el('span', { class: 'pill', 'data-sev': k }, el('span', { class: 'dot' }), `${SEV_LABEL[k]} ${s.counts[k] || 0}`))),
     el('span', { class: 'wall-clock' }, new Date().toLocaleTimeString()),
     el('div', { class: 'seg', title: 'Tile density - overrides automatic sizing for this screen' },
       ...['small', 'normal', 'large'].map(d => el('button', {

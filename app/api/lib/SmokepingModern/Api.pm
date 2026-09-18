@@ -25,6 +25,7 @@ use RRDs;
 use Smokeping::Info;
 use Smokeping;
 use SmokepingModern::Events ();
+use SmokepingModern::Maintenance ();
 
 # stamped from the git tag at image build time (see Dockerfile); "dev" when run from a checkout
 our $VERSION = '__APP_VERSION__';
@@ -58,7 +59,7 @@ sub run {
 
     # everything that writes (settings, config files, acks, tests, reload)
     # lives in SmokepingModern::Admin
-    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me oauth alertdefs);
+    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me oauth alertdefs maintenance);
     if ($admin{$route}) {
         my ($status, $body) = eval {
             require SmokepingModern::Admin;
@@ -449,9 +450,11 @@ sub summary {
     my $secs = $RANGE_SEC{ $q->{range} || '3h' } || $RANGE_SEC{'3h'};
 
     my $alert_state = _alert_index();  # path => worst severity from live eval
+    my $now   = time;
+    my $maint = SmokepingModern::Maintenance::load();
 
     my (@nodes, %counts);
-    $counts{$_} = 0 for qw(ok warning critical down unknown);
+    $counts{$_} = 0 for qw(ok warning critical down unknown maintenance);
 
     _each_leaf($cfg->{Targets}, '', sub {
         my ($n, $p) = @_;
@@ -480,10 +483,12 @@ sub summary {
             $sev = 'warning'  if $sev eq 'ok' || $sev eq 'unknown';
             $sev = 'critical' if $as eq 'critical' && $sev ne 'down';
         }
-        $counts{$sev}++;
+        my $mw = SmokepingModern::Maintenance::covers($p, $now, $maint);
+        $counts{ $mw ? 'maintenance' : $sev }++;      # a planned window is not a problem
 
         push @nodes, {
             path        => $p,
+            maintenance => $mw ? { id => $mw->{id}, title => $mw->{title}, until => $mw->{until}, note => $mw->{note} } : undef,
             title       => $n->{title} // (split m{/}, $p)[-1],
             host        => $n->{host},
             severity    => $sev,
@@ -501,9 +506,10 @@ sub summary {
     my @by_stddev  = sort { ($b->{stddevMs}    // -1) <=> ($a->{stddevMs}    // -1) } @nodes;
 
     return {
-        generated    => time,
+        generated    => $now,
         total        => scalar @nodes,
         counts       => \%counts,
+        maintenance  => [ SmokepingModern::Maintenance::active($now, $maint) ],
         nodes        => \@nodes,
         worstLoss    => [ grep { ($_->{lossNowPct}  // 0) > 0 } @by_loss[0 .. 7] ],
         worstLatency => [ grep { defined $_->{medianNowMs} } @by_latency[0 .. 7] ],
@@ -567,6 +573,7 @@ sub _avg { my $s = 0; $s += $_ for @_; return @_ ? $s / @_ : undef }
 sub alerts {
     my ($si, $cfg) = _boot();
     my @active;
+    my $maint = SmokepingModern::Maintenance::load();
     eval { SmokepingModern::Events::ingest() };      # keep the persistent incident store current
 
     _each_leaf($cfg->{Targets}, '', sub {
@@ -589,8 +596,10 @@ sub alerts {
             my $match = eval { $alert->{sub}->($x) } || 0;
             next unless $match;
 
+            my $mw = SmokepingModern::Maintenance::covers($p, time, $maint);
             push @active, {
                 path           => $p,
+                maintenance    => $mw ? { id => $mw->{id}, title => $mw->{title}, until => $mw->{until} } : undef,
                 target         => $n->{title} // (split m{/}, $p)[-1],
                 host           => $n->{host},
                 alert          => $an,
@@ -759,7 +768,10 @@ sub _live_incidents {
     my ($now, $titles) = @_;
     $titles ||= _title_map();
     my $inc = SmokepingModern::Events::incidents(SmokepingModern::Events::read_store(), $now);
-    return [ grep { exists $titles->{ $_->{path} } } @$inc ];
+    my $maint = SmokepingModern::Maintenance::load();
+    my @keep = grep { exists $titles->{ $_->{path} } } @$inc;
+    $_->{maintenance} = SmokepingModern::Maintenance::covers($_->{path}, $_->{start}, $maint) ? 1 : 0 for @keep;
+    return \@keep;
 }
 
 # path => title for every leaf
@@ -798,6 +810,7 @@ sub events {
         $r->{title} = $titles->{ $r->{path} } // (split m{/}, $r->{path})[-1];
         $r->{open}  = _bool($r->{open});
         $r->{level} = _bool($r->{level});
+        $r->{maintenance} = _bool($r->{maintenance});
         if ($r->{durationSec} !~ /^-/) {
             $sum += $r->{durationSec}; $closed++;
             $longest = $r->{durationSec} if $r->{durationSec} > $longest;
@@ -843,8 +856,10 @@ sub report {
     eval { SmokepingModern::Events::ingest() };
     my $inc = _live_incidents($now);
     my %inc_n; my %inc_longest;
+    my $maint = SmokepingModern::Maintenance::load();
     for my $i (@$inc) {
         next if ($i->{end} // $now) < $now - $secs;
+        next if $i->{maintenance};                        # planned work is not an incident
         $inc_n{ $i->{path} }++;
         $inc_longest{ $i->{path} } = $i->{durationSec} if ($inc_longest{ $i->{path} } // 0) < $i->{durationSec};
     }
@@ -862,11 +877,14 @@ sub report {
         return unless defined $col{loss} && defined $col{median};
 
         my ($known, $downSlots, $lossSum, @med, %hour);
+        my $maintSlots = 0;
+        my @iv = SmokepingModern::Maintenance::intervals($p, $start - $step, $now + $step, $maint);
         my $ts = $start;
         for my $row (@$data) {
             my ($t, $l, $m) = ($ts, $row->[ $col{loss} ], $row->[ $col{median} ]);
             $ts += $step;
             next unless defined $l;
+            if (@iv && grep { $t > $_->[0] && $t - $step < $_->[1] } @iv) { $maintSlots++; next }   # planned window: excluded
             my $lp = $l * 100 / $pings;
             $lp = 100 if $lp > 100;
             $known++;
@@ -876,7 +894,16 @@ sub report {
             my $h = $t - $t % 3600;
             $hour{$h}[0] += $lp; $hour{$h}[1]++;
         }
-        return unless $known;
+        my $title = $n->{title} // (split m{/}, $p)[-1];
+        my $grp   = ($p =~ m{^(.*)/[^/]+$}) ? $1 : '';
+        unless ($known) {
+            return unless $maintSlots;                     # no data at all -> not in the report
+            push @rows, { path => $p, title => $title, host => $n->{host}, group => $grp, availability => undef,
+                          downtimeSec => 0, lossMinutes => 0, avgLossPct => undef, avgMs => undef, p95Ms => undef,
+                          maxMs => undef, worstHour => undef, incidents => 0, longestSec => 0, coveragePct => 0,
+                          stepSec => $step + 0, maintenanceSec => int($maintSlots * $step) };
+            return;
+        }
         my @sorted = sort { $a <=> $b } @med;
         my ($worst, $worstLoss) = (undef, -1);
         for my $h (keys %hour) {
@@ -887,9 +914,9 @@ sub report {
         my $covered = $known * $step;
         my $row = {
             path         => $p,
-            title        => $n->{title} // (split m{/}, $p)[-1],
+            title        => $title,
             host         => $n->{host},
-            group        => (($p =~ m{^(.*)/[^/]+$}) ? $1 : ''),
+            group        => $grp,
             availability => 100 - $avgLoss,                        # packet based: 100 - mean loss
             downtimeSec  => int($downSlots * $step),               # time in >=90 % loss slots
             lossMinutes  => $lossSum / 100 * $step / 60,           # "equivalent full-outage minutes"
@@ -902,12 +929,13 @@ sub report {
             longestSec   => $inc_longest{$p} || 0,
             coveragePct  => min_(100, 100 * $covered / $secs),
             stepSec      => $step + 0,
+            maintenanceSec => int($maintSlots * $step),            # left out of every number above
         };
         push @rows, $row;
     });
 
     # roll up per group (parent folder)
-    for my $r (@rows) {
+    for my $r (grep { defined $_->{availability} } @rows) {
         my $g = $grp{ $r->{group} } ||= { path => $r->{group}, targets => 0, avSum => 0, downtimeSec => 0,
                                           lossMinutes => 0, incidents => 0, worst => undef };
         $g->{targets}++;
@@ -925,8 +953,10 @@ sub report {
           worstTarget => $g->{worst}{title} }
     } sort keys %grp;
 
-    @rows = sort { $a->{availability} <=> $b->{availability} || $a->{path} cmp $b->{path} } @rows;
-    my $n = scalar @rows;
+    @rows = sort { ($a->{availability} // 101) <=> ($b->{availability} // 101) || $a->{path} cmp $b->{path} } @rows;
+    my @measured = grep { defined $_->{availability} } @rows;
+    my $n = scalar @measured;
+    my $maintTotal = 0; $maintTotal += $_->{maintenanceSec} || 0 for @rows;
     return {
         generated => $now,
         range     => $range,
@@ -934,10 +964,11 @@ sub report {
         downLossPct => $DOWN_LOSS,
         summary   => {
             targets      => $n,
-            availability => $n ? _avg(map { $_->{availability} } @rows) : undef,
+            availability => $n ? _avg(map { $_->{availability} } @measured) : undef,
             downtimeSec  => (eval { my $s = 0; $s += $_->{downtimeSec} for @rows; $s } || 0),
             incidents    => (eval { my $s = 0; $s += $_->{incidents} for @rows; $s } || 0),
-            perfect      => scalar(grep { $_->{availability} >= 99.999 } @rows),
+            perfect      => scalar(grep { $_->{availability} >= 99.999 } @measured),
+            maintenanceSec => $maintTotal,
         },
         groups    => \@groups,
         targets   => \@rows,
@@ -970,12 +1001,13 @@ sub metrics_text {
     return $out unless $ok;
 
     my $s = eval { summary({}) } || { nodes => [], counts => {} };
-    my (@loss, @med, @sd, @st, @dat);
+    my (@loss, @med, @sd, @st, @dat, @mt);
     my %rank = (ok => 0, unknown => 0, warning => 1, critical => 2, down => 3);
     for my $n (@{ $s->{nodes} }) {
         my %l = (path => $n->{path}, title => $n->{title}, host => $n->{host});
         push @dat, [ _lbl(%l), $n->{hasData} ? 1 : 0 ];
         push @st,  [ _lbl(%l), $rank{ $n->{severity} } // 0 ];
+        push @mt,  [ _lbl(%l), $n->{maintenance} ? 1 : 0 ];
         push @loss, [ _lbl(%l), $n->{lossNowPct} + 0 ]            if defined $n->{lossNowPct};
         push @med,  [ _lbl(%l), sprintf('%.6f', $n->{medianNowMs} / 1000) ] if defined $n->{medianNowMs};
         push @sd,   [ _lbl(%l), sprintf('%.6f', $n->{stddevMs} / 1000) ]    if defined $n->{stddevMs};
@@ -984,6 +1016,8 @@ sub metrics_text {
     $emit->('smokeping_target_median_rtt_seconds', 'gauge', 'Current median round trip time per target.', \@med);
     $emit->('smokeping_target_rtt_stddev_seconds', 'gauge', 'RTT standard deviation over the last 3 h.', \@sd);
     $emit->('smokeping_target_status', 'gauge', 'Target status: 0 ok, 1 warning, 2 critical, 3 down.', \@st);
+    $emit->('smokeping_target_maintenance', 'gauge', 'Target is inside a planned maintenance window (1) - silence alerts with: ... unless on(path) smokeping_target_maintenance == 1.', \@mt);
+    $emit->('smokeping_maintenance_windows_active', 'gauge', 'Maintenance windows in effect now.', [ ['', scalar @{ $s->{maintenance} || [] }] ]);
     $emit->('smokeping_target_has_data', 'gauge', 'Target has an RRD with data.', \@dat);
     $emit->('smokeping_targets', 'gauge', 'Targets by status.',
             [ map { [ _lbl(status => $_), $s->{counts}{$_} + 0 ] } sort keys %{ $s->{counts} } ]);

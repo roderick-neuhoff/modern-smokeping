@@ -15,6 +15,7 @@ use IPC::Open3 ();
 use Symbol ();
 use POSIX ();
 use File::Temp ();
+use SmokepingModern::AlertRule ();
 
 my $CONFIG_DIR = $ENV{SMOKEPING_CONFIG_DIR} || '/config';
 my $MASTER     = $ENV{SMOKEPING_CONF}       || '/etc/smokeping/config';
@@ -66,6 +67,11 @@ sub handle {
         return target_add($body)                    if $sub eq 'add'    && $method eq 'POST';
         return target_edit($body)                   if $sub eq 'edit'   && $method eq 'POST';
         return target_remove($body)                 if $sub eq 'remove' && $method eq 'POST';
+    }
+    if ($route eq 'alertdefs') {
+        return (200, alertdefs_get())               if $method eq 'GET';
+        return alertdefs_save($body)                if $method eq 'POST' && $sub ne 'delete';
+        return alertdefs_delete($body)              if $method eq 'POST' && $sub eq 'delete';
     }
     if ($route eq 'acks') {
         return (200, acks_get())                    if $method eq 'GET';
@@ -1374,6 +1380,173 @@ sub test_notify {
     local $ENV{SPM_ONLY} = $b->{channel} // '';
     my ($out, $rc) = _capture(60, $NOTIFY_BIN, 'test', 'Test.Target', 'loss: 0%, 100%', 'rtt: 15ms, U', '127.0.0.1', 1);
     return { ok => ($rc == 0 ? \1 : \0), rc => $rc, output => ($out =~ s/\s+$//r) };
+}
+
+# ---------------------------------------------------------------------------
+# alert rule editor: the Alerts file as forms (minutes, not poll cycles)
+# ---------------------------------------------------------------------------
+
+# Database step (seconds per poll); rules are written in minutes and converted
+sub _db_step {
+    my $s = _slurp("$CONFIG_DIR/Database") // '';
+    return $1 + 0 if $s =~ /^\s*step\s*=\s*(\d+)/m;
+    return 300;
+}
+
+# -> (\@lines, \@blocks). A block is "+name" plus its "key = value" lines; the
+# comment/blank lines that follow the last property belong to whatever comes
+# next and are left alone when a block is rewritten or removed.
+sub _alerts_parse {
+    my $raw = _slurp("$CONFIG_DIR/Alerts");
+    $raw = "*** Alerts ***\nto = root\@localhost\nfrom = smokeping\@localhost\n" unless defined $raw;
+    $raw =~ s/\r\n?/\n/g;
+    my @lines = split /\n/, $raw, -1;
+    pop @lines if @lines && $lines[-1] eq '';
+    my @blocks;
+    for my $i (0 .. $#lines) {
+        if ($lines[$i] =~ /^\+\s*([A-Za-z0-9_.-]+)\s*$/) {
+            push @blocks, { name => $1, start => $i, props => {} };
+        }
+    }
+    for my $k (0 .. $#blocks) {
+        my $b = $blocks[$k];
+        my $limit = $k < $#blocks ? $blocks[$k + 1]{start} : scalar @lines;
+        my $end = $b->{start} + 1;
+        for my $i ($b->{start} + 1 .. $limit - 1) {
+            if ($lines[$i] =~ /^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/) {
+                $b->{props}{lc $1} = $2;
+                $end = $i + 1;
+            }
+        }
+        $b->{end} = $end;
+    }
+    return (\@lines, \@blocks);
+}
+
+# alert name => [where it is assigned] for every "alerts =" line in Targets
+sub _alert_usage {
+    my $s = _slurp("$CONFIG_DIR/Targets") // '';
+    $s =~ s/\r\n?/\n/g;
+    my (@stack, %use);
+    for my $line (split /\n/, $s) {
+        if ($line =~ /^\s*(\++)\s*(\S.*?)\s*$/) {
+            my ($d, $n) = (length $1, $2);
+            $#stack = $d - 2 if $d - 1 <= $#stack;
+            $stack[$d - 1] = $n;
+        }
+        elsif ($line =~ /^\s*alerts\s*=\s*(\S.*?)\s*$/) {
+            my $where = @stack ? '/' . join('/', @stack) : '(top level)';
+            push @{ $use{$_} }, $where for grep { length } split /\s*,\s*/, $1;
+        }
+    }
+    return \%use;
+}
+
+sub alertdefs_get {
+    my $step = _db_step();
+    my (undef, $blocks) = _alerts_parse();
+    my $use = _alert_usage();
+    my @out;
+    for my $b (@$blocks) {
+        my $p = $b->{props};
+        my $rule = SmokepingModern::AlertRule::parse($p->{type}, $p->{pattern}, $step);
+        push @out, {
+            name        => $b->{name},
+            type        => $p->{type},
+            pattern     => $p->{pattern},
+            comment     => $p->{comment},
+            edgetrigger => (($p->{edgetrigger} // 'no') =~ /^yes$/i ? \1 : \0),
+            priority    => (defined $p->{priority} && $p->{priority} =~ /^\d+$/ ? $p->{priority} + 0 : undef),
+            rule        => $rule,
+            human       => SmokepingModern::AlertRule::human($rule),
+            usedBy      => $use->{ $b->{name} } || [],
+        };
+    }
+    return { stepSec => $step, header => _read_alert_header(), alerts => \@out };
+}
+
+sub alertdefs_save {
+    my $b = shift || {};
+    my $name = $b->{name} // '';
+    die { status => 422, error => 'name must start with a letter and use only letters, digits and _ (max 40)' }
+        unless $name =~ /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
+    my $step = _db_step();
+    my $rule = SmokepingModern::AlertRule::build($b->{rule}, $step);
+
+    my $comment = $b->{comment} // '';
+    $comment =~ s/[\r\n]+/ /g; $comment =~ s/^\s+|\s+$//g;
+    my $prio = $b->{priority};
+    $prio = undef if defined $prio && $prio eq '';
+    die { status => 422, error => 'priority must be a whole number 1-99' }
+        if defined $prio && ($prio !~ /^\d+$/ || $prio < 1 || $prio > 99);
+    my $edge = ($b->{edgetrigger} && $b->{edgetrigger} !~ /^(?:no|false|0)$/i) ? 'yes' : 'no';
+
+    my %set = (type => $rule->{type}, pattern => $rule->{pattern}, edgetrigger => $edge);
+    $set{comment}  = $comment if length $comment;
+    $set{priority} = $prio + 0 if defined $prio;
+    my %drop = (comment => !length $comment, priority => !defined $prio);
+
+    my ($lines, $blocks) = _alerts_parse();
+    my ($cur) = grep { $_->{name} eq $name } @$blocks;
+    my $raw_before = _slurp("$CONFIG_DIR/Alerts");
+    die { status => 422, error => "an alert called '$name' already exists" } if $cur && $b->{create};
+    die { status => 404, error => "no alert called '$name'" } if !$cur && !$b->{create};
+
+    my @new = @$lines;
+    if ($cur) {
+        my (@out, %done);
+        for my $i ($cur->{start} + 1 .. $cur->{end} - 1) {
+            my $l = $new[$i];
+            if ($l =~ /^(\s*)([A-Za-z][A-Za-z0-9_]*)(\s*=\s*)/) {
+                my ($ind, $k) = ($1, lc $2);
+                if (exists $set{$k}) { $done{$k} = 1; push @out, "$ind$k = $set{$k}"; next }
+                if ($drop{$k})       { next }
+            }
+            push @out, $l;
+        }
+        for my $k (qw(type pattern comment edgetrigger priority)) {
+            push @out, "$k = $set{$k}" if exists $set{$k} && !$done{$k};
+        }
+        splice @new, $cur->{start} + 1, $cur->{end} - $cur->{start} - 1, @out;
+    } else {
+        push @new, '' if @new && $new[-1] ne '';
+        push @new, "+$name";
+        push @new, "$_ = $set{$_}" for grep { exists $set{$_} } qw(type pattern comment edgetrigger priority);
+    }
+    my $text = join("\n", @new) . "\n";
+
+    my $chk = _check_candidate('Alerts', $text);
+    return (422, { ok => \0, check => $chk, error => 'config check failed - nothing was changed' }) unless _passed($chk);
+    _spew("$CONFIG_DIR/Alerts.bak", $raw_before) if defined $raw_before;
+    _spew("$CONFIG_DIR/Alerts", $text, 0644);
+    my $rl = _hup();
+    return (200, { ok => \1, check => $chk, reload => $rl, name => $name,
+                   created => ($cur ? \0 : \1), pattern => $rule->{pattern}, type => $rule->{type} });
+}
+
+sub alertdefs_delete {
+    my $b = shift || {};
+    my $name = $b->{name} // '';
+    my ($lines, $blocks) = _alerts_parse();
+    my ($cur) = grep { $_->{name} eq $name } @$blocks;
+    die { status => 404, error => "no alert called '$name'" } unless $cur;
+    my $use = _alert_usage()->{$name};
+    return (422, { ok => \0, usedBy => $use,
+                   error => "'$name' is still assigned to " . scalar(@$use) . " target(s)/group(s) - remove it from them first" })
+        if $use && @$use;
+
+    my $raw_before = _slurp("$CONFIG_DIR/Alerts");
+    my @new = @$lines;
+    my $from = $cur->{start};
+    $from-- if $from > 0 && $new[$from - 1] =~ /^\s*$/;          # take one blank separator with it
+    splice @new, $from, $cur->{end} - $from;
+    my $text = join("\n", @new) . "\n";
+
+    my $chk = _check_candidate('Alerts', $text);
+    return (422, { ok => \0, check => $chk, error => 'config check failed - nothing was changed' }) unless _passed($chk);
+    _spew("$CONFIG_DIR/Alerts.bak", $raw_before) if defined $raw_before;
+    _spew("$CONFIG_DIR/Alerts", $text, 0644);
+    return (200, { ok => \1, check => $chk, reload => _hup(), name => $name });
 }
 
 sub reload {

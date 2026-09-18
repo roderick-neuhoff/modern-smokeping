@@ -24,8 +24,11 @@ use JSON::PP ();
 use RRDs;
 use Smokeping::Info;
 use Smokeping;
+use SmokepingModern::Events ();
 
-our $VERSION = '1.0.4';
+# stamped from the git tag at image build time (see Dockerfile); "dev" when run from a checkout
+our $VERSION = '__APP_VERSION__';
+$VERSION = 'dev' if $VERSION =~ /^__/;
 
 my $CONF     = $ENV{SMOKEPING_CONF} || '/etc/smokeping/config';
 my $LOGFILE  = $ENV{SMOKEPING_LOG}  || '';
@@ -55,7 +58,7 @@ sub run {
 
     # everything that writes (settings, config files, acks, tests, reload)
     # lives in SmokepingModern::Admin
-    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me oauth);
+    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me oauth alertdefs);
     if ($admin{$route}) {
         my ($status, $body) = eval {
             require SmokepingModern::Admin;
@@ -87,6 +90,10 @@ sub run {
             return _cached("node-$safe", 8, sub { node($q) });
         }
         return _cached('alerts', $ttl{alerts}, \&alerts)    if $route eq 'alerts';
+        return _cached('events-' . _safe_key($q->{target}, $q->{since}, $q->{limit}), 20, sub { events($q) }) if $route eq 'events';
+        return _cached('report-' . _safe_key($q->{range}), 60, sub { report($q) })  if $route eq 'report';
+        return alertpreview($q)                                                    if $route eq 'alertpreview';
+        return { __text => _cached_text('metrics', 10, \&metrics_text) }           if $route eq 'metrics';
         die { status => 404, error => "unknown route '$route'" };
     };
     if ($@) {
@@ -97,7 +104,26 @@ sub run {
         _emit($status, { error => $msg });
         return;
     }
+    if (ref $data eq 'HASH' && exists $data->{__text}) {          # Prometheus exposition format
+        print "Status: 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nCache-Control: no-store\r\n\r\n";
+        print $data->{__text};
+        return;
+    }
     _emit(200, $data);
+}
+
+sub _safe_key { my $k = join '.', map { $_ // '' } @_; $k =~ s/[^A-Za-z0-9._-]+/_/g; return $k }
+
+# same idea as _cached but for plain text (no JSON round trip)
+sub _cached_text {
+    my ($key, $ttl, $build) = @_;
+    my $file = "/tmp/spm-cache-$key.txt";
+    if (-f $file && (time - (stat $file)[9]) < $ttl && open my $fh, '<', $file) {
+        local $/; my $t = <$fh>; close $fh; return $t if defined $t && length $t;
+    }
+    my $t = $build->();
+    if (open my $fh, '>', "$file.$$") { print $fh $t; close $fh; rename "$file.$$", $file }
+    return $t;
 }
 
 sub _emit {
@@ -541,6 +567,7 @@ sub _avg { my $s = 0; $s += $_ for @_; return @_ ? $s / @_ : undef }
 sub alerts {
     my ($si, $cfg) = _boot();
     my @active;
+    eval { SmokepingModern::Events::ingest() };      # keep the persistent incident store current
 
     _each_leaf($cfg->{Targets}, '', sub {
         my ($n, $p) = @_;
@@ -720,6 +747,336 @@ sub _parse_syslog_ts {
     require POSIX;
     my @now = localtime;
     return eval { POSIX::mktime($5, $4, $3, $2, $mon{$1}, $now[5]) };
+}
+
+# ---------------------------------------------------------------------------
+# incident history (persistent, see SmokepingModern::Events)
+# ---------------------------------------------------------------------------
+
+# path => title for every leaf
+sub _title_map {
+    my ($si, $cfg) = _boot();
+    my %t;
+    _each_leaf($cfg->{Targets}, '', sub { my ($n, $p) = @_; $t{$p} = $n->{title} // (split m{/}, $p)[-1]; });
+    return \%t;
+}
+
+my %HIST_SEC = ('24h' => 86400, '7d' => 7 * 86400, '30d' => 30 * 86400, '90d' => 90 * 86400, '365d' => 365 * 86400);
+
+sub events {
+    my $q = shift;
+    eval { SmokepingModern::Events::ingest() };
+    my $now   = time;
+    my $range = $HIST_SEC{ $q->{range} || '' } ? $q->{range} : '30d';
+    my $since = _num($q->{since});
+    $since = $now - $HIST_SEC{$range} unless defined $since;
+    my $limit = _num($q->{limit}) || 500;
+    $limit = 2000 if $limit > 2000;
+
+    my $all  = SmokepingModern::Events::read_store();
+    my $inc  = SmokepingModern::Events::incidents($all, $now);
+    my $want = $q->{target} // '';
+    my $titles = _title_map();
+
+    my @rows = grep { ($_->{end} // $now) >= $since }                # overlaps the window
+               grep { !length $want || $_->{path} eq $want } @$inc;
+    @rows = reverse @rows;                                            # newest first
+    my $total = scalar @rows;
+    @rows = @rows[0 .. $limit - 1] if @rows > $limit;
+
+    my ($sum, $closed, $open, $longest) = (0, 0, 0, 0);
+    my %by;
+    for my $r (@rows) {
+        $r->{title} = $titles->{ $r->{path} } // (split m{/}, $r->{path})[-1];
+        $r->{open}  = _bool($r->{open});
+        $r->{level} = _bool($r->{level});
+        if ($r->{durationSec} !~ /^-/) {
+            $sum += $r->{durationSec}; $closed++;
+            $longest = $r->{durationSec} if $r->{durationSec} > $longest;
+        }
+        $open++ if $r->{open};
+        $by{ $r->{path} }++;
+    }
+    return {
+        generated => $now,
+        range     => $range,
+        since     => $since + 0,
+        total     => $total,
+        open      => $open,
+        avgSec    => $closed ? int($sum / $closed) : undef,
+        longestSec => $longest,
+        byTarget  => [ map { { path => $_, title => $titles->{$_} // $_, count => $by{$_} } }
+                       sort { $by{$b} <=> $by{$a} || $a cmp $b } keys %by ],
+        incidents => \@rows,
+        store     => SmokepingModern::Events::store_file(),
+    };
+}
+
+# ---------------------------------------------------------------------------
+# availability / SLA report
+# ---------------------------------------------------------------------------
+
+my %REPORT_SEC = %HIST_SEC;
+my $DOWN_LOSS  = 90;      # a slot with >= 90 % loss counts as "down"
+
+sub _pctile {
+    my ($sorted, $p) = @_;
+    return undef unless @$sorted;
+    return $sorted->[ int($p * $#$sorted + 0.5) ];
+}
+
+sub report {
+    my $q = shift;
+    my ($si, $cfg) = _boot();
+    my $now   = time;
+    my $range = $REPORT_SEC{ $q->{range} || '' } ? $q->{range} : '7d';
+    my $secs  = $REPORT_SEC{$range};
+
+    eval { SmokepingModern::Events::ingest() };
+    my $inc = SmokepingModern::Events::incidents(SmokepingModern::Events::read_store(), $now);
+    my %inc_n; my %inc_longest;
+    for my $i (@$inc) {
+        next if ($i->{end} // $now) < $now - $secs;
+        $inc_n{ $i->{path} }++;
+        $inc_longest{ $i->{path} } = $i->{durationSec} if ($inc_longest{ $i->{path} } // 0) < $i->{durationSec};
+    }
+
+    my (@rows, %grp);
+    _each_leaf($cfg->{Targets}, '', sub {
+        my ($n, $p) = @_;
+        my $rrd = _rrd_for($p);
+        return unless -f $rrd;
+        my $pings = _pings_for($n);
+        my ($start, $step, $names, $data) =
+            RRDs::fetch($rrd, 'AVERAGE', '--start', "-${secs}s", '--end', 'now');
+        return if RRDs::error() || !$data || !@$data;
+        my %col; $col{ $names->[$_] } = $_ for 0 .. $#$names;
+        return unless defined $col{loss} && defined $col{median};
+
+        my ($known, $downSlots, $lossSum, @med, %hour);
+        my $ts = $start;
+        for my $row (@$data) {
+            my ($t, $l, $m) = ($ts, $row->[ $col{loss} ], $row->[ $col{median} ]);
+            $ts += $step;
+            next unless defined $l;
+            my $lp = $l * 100 / $pings;
+            $lp = 100 if $lp > 100;
+            $known++;
+            $lossSum += $lp;
+            $downSlots++ if $lp >= $DOWN_LOSS;
+            push @med, $m * 1000 if defined $m;
+            my $h = $t - $t % 3600;
+            $hour{$h}[0] += $lp; $hour{$h}[1]++;
+        }
+        return unless $known;
+        my @sorted = sort { $a <=> $b } @med;
+        my ($worst, $worstLoss) = (undef, -1);
+        for my $h (keys %hour) {
+            my $avg = $hour{$h}[0] / $hour{$h}[1];
+            ($worst, $worstLoss) = ($h, $avg) if $avg > $worstLoss;
+        }
+        my $avgLoss = $lossSum / $known;
+        my $covered = $known * $step;
+        my $row = {
+            path         => $p,
+            title        => $n->{title} // (split m{/}, $p)[-1],
+            host         => $n->{host},
+            group        => (($p =~ m{^(.*)/[^/]+$}) ? $1 : ''),
+            availability => 100 - $avgLoss,                        # packet based: 100 - mean loss
+            downtimeSec  => int($downSlots * $step),               # time in >=90 % loss slots
+            lossMinutes  => $lossSum / 100 * $step / 60,           # "equivalent full-outage minutes"
+            avgLossPct   => $avgLoss,
+            avgMs        => @med ? _avg(@med) : undef,
+            p95Ms        => _pctile(\@sorted, 0.95),
+            maxMs        => @sorted ? $sorted[-1] : undef,
+            worstHour    => ($worstLoss > 0 ? { t => $worst + 0, lossPct => $worstLoss } : undef),
+            incidents    => $inc_n{$p} || 0,
+            longestSec   => $inc_longest{$p} || 0,
+            coveragePct  => min_(100, 100 * $covered / $secs),
+            stepSec      => $step + 0,
+        };
+        push @rows, $row;
+    });
+
+    # roll up per group (parent folder)
+    for my $r (@rows) {
+        my $g = $grp{ $r->{group} } ||= { path => $r->{group}, targets => 0, avSum => 0, downtimeSec => 0,
+                                          lossMinutes => 0, incidents => 0, worst => undef };
+        $g->{targets}++;
+        $g->{avSum}       += $r->{availability};
+        $g->{downtimeSec} += $r->{downtimeSec};
+        $g->{lossMinutes} += $r->{lossMinutes};
+        $g->{incidents}   += $r->{incidents};
+        $g->{worst} = $r if !$g->{worst} || $r->{availability} < $g->{worst}{availability};
+    }
+    my @groups = map {
+        my $g = $grp{$_};
+        { path => $g->{path}, title => (length $g->{path} ? (split m{/}, $g->{path})[-1] : 'Top level'),
+          targets => $g->{targets}, availability => $g->{avSum} / $g->{targets},
+          downtimeSec => $g->{downtimeSec}, lossMinutes => $g->{lossMinutes}, incidents => $g->{incidents},
+          worstTarget => $g->{worst}{title} }
+    } sort keys %grp;
+
+    @rows = sort { $a->{availability} <=> $b->{availability} || $a->{path} cmp $b->{path} } @rows;
+    my $n = scalar @rows;
+    return {
+        generated => $now,
+        range     => $range,
+        rangeSec  => $secs,
+        downLossPct => $DOWN_LOSS,
+        summary   => {
+            targets      => $n,
+            availability => $n ? _avg(map { $_->{availability} } @rows) : undef,
+            downtimeSec  => (eval { my $s = 0; $s += $_->{downtimeSec} for @rows; $s } || 0),
+            incidents    => (eval { my $s = 0; $s += $_->{incidents} for @rows; $s } || 0),
+            perfect      => scalar(grep { $_->{availability} >= 99.999 } @rows),
+        },
+        groups    => \@groups,
+        targets   => \@rows,
+    };
+}
+
+sub min_ { $_[0] < $_[1] ? $_[0] : $_[1] }
+
+# ---------------------------------------------------------------------------
+# Prometheus exposition
+# ---------------------------------------------------------------------------
+
+sub _lbl {
+    my %l = @_;
+    return '{' . join(',', map { my $v = $l{$_} // ''; $v =~ s/\\/\\\\/g; $v =~ s/"/\\"/g; $v =~ s/\n/\\n/g; qq($_="$v") } sort keys %l) . '}';
+}
+
+sub metrics_text {
+    eval { SmokepingModern::Events::ingest() };
+    my $out = '';
+    my $emit = sub {
+        my ($name, $type, $help, $rows) = @_;
+        return unless @$rows;
+        $out .= "# HELP $name $help\n# TYPE $name $type\n";
+        $out .= "$name$_->[0] $_->[1]\n" for @$rows;
+    };
+    my $ok = eval { _boot(); 1 } ? 1 : 0;
+    $emit->('smokeping_modern_up', 'gauge', 'API can read the SmokePing config (1) or not (0).', [ ['', $ok] ]);
+    $emit->('smokeping_modern_info', 'gauge', 'Modern UI version.', [ [ _lbl(version => $VERSION), 1 ] ]);
+    return $out unless $ok;
+
+    my $s = eval { summary({}) } || { nodes => [], counts => {} };
+    my (@loss, @med, @sd, @st, @dat);
+    my %rank = (ok => 0, unknown => 0, warning => 1, critical => 2, down => 3);
+    for my $n (@{ $s->{nodes} }) {
+        my %l = (path => $n->{path}, title => $n->{title}, host => $n->{host});
+        push @dat, [ _lbl(%l), $n->{hasData} ? 1 : 0 ];
+        push @st,  [ _lbl(%l), $rank{ $n->{severity} } // 0 ];
+        push @loss, [ _lbl(%l), $n->{lossNowPct} + 0 ]            if defined $n->{lossNowPct};
+        push @med,  [ _lbl(%l), sprintf('%.6f', $n->{medianNowMs} / 1000) ] if defined $n->{medianNowMs};
+        push @sd,   [ _lbl(%l), sprintf('%.6f', $n->{stddevMs} / 1000) ]    if defined $n->{stddevMs};
+    }
+    $emit->('smokeping_target_loss_percent', 'gauge', 'Current packet loss per target, percent.', \@loss);
+    $emit->('smokeping_target_median_rtt_seconds', 'gauge', 'Current median round trip time per target.', \@med);
+    $emit->('smokeping_target_rtt_stddev_seconds', 'gauge', 'RTT standard deviation over the last 3 h.', \@sd);
+    $emit->('smokeping_target_status', 'gauge', 'Target status: 0 ok, 1 warning, 2 critical, 3 down.', \@st);
+    $emit->('smokeping_target_has_data', 'gauge', 'Target has an RRD with data.', \@dat);
+    $emit->('smokeping_targets', 'gauge', 'Targets by status.',
+            [ map { [ _lbl(status => $_), $s->{counts}{$_} + 0 ] } sort keys %{ $s->{counts} } ]);
+
+    my $a = eval { _cached('alerts', 25, \&alerts) } || { active => [] };
+    $emit->('smokeping_alert_active', 'gauge', 'A configured alert currently matches (1).',
+            [ map { [ _lbl(alert => $_->{alert}, path => $_->{path}, severity => $_->{severity}), 1 ] } @{ $a->{active} } ]);
+    $emit->('smokeping_alerts_active', 'gauge', 'Number of alerts currently firing.', [ ['', scalar @{ $a->{active} }] ]);
+
+    my $now = time;
+    my $inc = SmokepingModern::Events::incidents(SmokepingModern::Events::read_store(), $now);
+    my $open = scalar grep { $_->{open} } @$inc;
+    my $last24 = scalar grep { ($_->{end} // $now) >= $now - 86400 } @$inc;
+    $emit->('smokeping_incidents_open', 'gauge', 'Incidents currently open.', [ ['', $open] ]);
+    $emit->('smokeping_incidents_24h', 'gauge', 'Incidents that were open at any time in the last 24 hours.', [ ['', $last24] ]);
+    return $out;
+}
+
+# ---------------------------------------------------------------------------
+# alert rule preview: what would this rule do on today's data?
+# ---------------------------------------------------------------------------
+
+sub alertpreview {
+    my $q = shift;
+    require SmokepingModern::AlertRule;
+    my ($si, $cfg) = _boot();
+    my $step = _step();
+    my $rule = SmokepingModern::AlertRule::build($q, $step);
+
+    # compile just this one rule with SmokePing's own alert compiler
+    my $fake = { Alerts => { preview => { type => $rule->{type}, pattern => $rule->{pattern} } } };
+    eval { Smokeping::init_alerts($fake); 1 }
+        or die { status => 422, error => "SmokePing rejects that rule: " . (split /\n/, "$@")[0] };
+    my $alert = $fake->{Alerts}{preview};
+    die { status => 422, error => 'rule did not compile' } unless ref $alert->{sub} eq 'CODE';
+    my $len = $alert->{maxlength} || 12;
+
+    my $replay_h = 20;                                   # hours replayed (fine-resolution RRA covers ~24 h)
+    my $fetch_s  = $replay_h * 3600 + ($len + 3) * $step;
+    my $stride   = $step < 60 ? int(60 / $step) : 1;     # evaluate about once a minute
+
+    my (@now, @rep, $total_raises);
+    my $count = 0;
+    _each_leaf($cfg->{Targets}, '', sub {
+        my ($n, $p) = @_;
+        return if $count >= 150;
+        my $rrd = _rrd_for($p);
+        return unless -f $rrd;
+        $count++;
+        my $pings = _pings_for($n);
+        my ($start, $rstep, $names, $data) =
+            RRDs::fetch($rrd, 'AVERAGE', '--start', "-${fetch_s}s", '--end', 'now');
+        return if RRDs::error() || !$data || !@$data;
+        my %col; $col{ $names->[$_] } = $_ for 0 .. $#$names;
+        return unless defined $col{loss} && defined $col{median};
+        my (@loss, @rtt);
+        for my $row (@$data) {
+            my ($l, $m) = ($row->[ $col{loss} ], $row->[ $col{median} ]);
+            push @loss, defined $l ? $l * 100 / $pings : undef;
+            push @rtt,  $m;
+        }
+        while (@loss && !defined $loss[-1] && !defined $rtt[-1]) { pop @loss; pop @rtt }
+        return unless @loss;
+        my $title = $n->{title} // (split m{/}, $p)[-1];
+
+        # firing right now (same evaluation as the live Alerts page)
+        my $w = $len + 3;
+        my $from = @loss > $w ? @loss - $w : 0;
+        my $x = { loss => [ @loss[$from .. $#loss] ], rtt => [ @rtt[$from .. $#rtt] ], prevmatch => 0 };
+        if (eval { $alert->{sub}->($x) }) {
+            push @now, { path => $p, title => $title,
+                         lossPct => defined $loss[-1] ? $loss[-1] + 0 : undef,
+                         rttMs   => defined $rtt[-1] ? $rtt[-1] * 1000 : undef };
+        }
+
+        # replay: slide over the history, feeding prevmatch back in like the daemon does
+        my ($prev, $raises, $firing, $first, $last) = (0, 0, 0, undef, undef);
+        my $t0 = $start;
+        for (my $i = $w; $i <= $#loss; $i += $stride) {
+            my $y = { loss => [ @loss[$i - $w + 1 .. $i] ], rtt => [ @rtt[$i - $w + 1 .. $i] ], prevmatch => $prev };
+            my $m = eval { $alert->{sub}->($y) } ? 1 : 0;
+            if ($m && !$prev) { $raises++; $first //= $t0 + $i * $rstep; $last = $t0 + $i * $rstep; }
+            $firing += $stride * $rstep if $m;
+            $prev = $m;
+        }
+        if ($raises || $prev) {
+            push @rep, { path => $p, title => $title, raises => $raises, firingMinutes => $firing / 60,
+                         first => $first, last => $last, stillFiring => _bool($prev) };
+            $total_raises += $raises;
+        }
+    });
+    @rep = sort { $b->{raises} <=> $a->{raises} || $b->{firingMinutes} <=> $a->{firingMinutes} } @rep;
+
+    return {
+        generated  => time,
+        rule       => { %$rule, human => SmokepingModern::AlertRule::human(SmokepingModern::AlertRule::parse($rule->{type}, $rule->{pattern}, $step)) },
+        stepSec    => $step + 0,
+        targetsChecked => $count,
+        firingNow  => \@now,
+        replay     => { hours => $replay_h, totalRaises => $total_raises || 0, targets => \@rep },
+    };
 }
 
 # ---------------------------------------------------------------------------

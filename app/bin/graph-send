@@ -21,6 +21,8 @@ use warnings;
 use JSON::PP ();
 use IPC::Open3 ();
 use Symbol ();
+use FindBin ();
+use lib "$FindBin::RealBin/../api/lib";
 
 my $CFG   = $ENV{SPM_GRAPH_CFG}   || '/config/modern-oauth.json';
 my $CACHE = $ENV{SPM_GRAPH_CACHE} || '/tmp/spm-graph-token.json';
@@ -87,6 +89,27 @@ fail('no valid recipients', 64) unless @rcpt;
 my $subject = defined $H{subject} ? $H{subject} : '(no subject)';
 my $ctype   = ($H{'content-type'} // '') =~ /html/i ? 'HTML' : 'Text';
 $body =~ s/\s+\z//;
+
+# recovery mails: say how long the outage lasted. SmokePing's subject is
+#   [SmokeAlert] <alert> was cleared on <target>
+# and it logs the clear before it mails, so the duration is already known.
+if ($subject =~ /^(\[SmokeAlert\]\s+)(\S+)\s+was cleared on\s+(\S+)/) {
+    my ($alert, $target) = ($2, $3);
+    my $dur = eval {
+        require SmokepingModern::Events;
+        my $s;
+        for my $try (1 .. 3) {
+            $s = SmokepingModern::Events::outage_duration($alert, $target);
+            last if defined $s;
+            select undef, undef, undef, 0.7;
+        }
+        defined $s ? SmokepingModern::Events::fmt_duration($s) : undef;
+    };
+    if (defined $dur) {
+        $subject .= " - back after $dur";
+        $body = "Outage duration: $dur\n\n$body";
+    }
+}
 
 # --- config --------------------------------------------------------------
 my $cfg = eval {

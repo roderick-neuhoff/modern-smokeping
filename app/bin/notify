@@ -17,6 +17,8 @@ use strict;
 use warnings;
 use JSON::PP ();
 use POSIX qw(strftime);
+use FindBin ();
+use lib "$FindBin::RealBin/../api/lib";
 
 my $CFG = $ENV{SPM_NOTIFY_CFG} || '/config/modern-notify.json';
 my $LOG = $ENV{SPM_NOTIFY_LOG} || '/config/log/notify.log';
@@ -41,18 +43,35 @@ my $cfg  = do {
     eval { $json->decode($raw) } || {};
 };
 
+# recovery: how long was it down? SmokePing logs the transition before it
+# runs us, so the log tail (or the persistent event store) has the answer.
+my ($dur_sec, $dur);
+if ($state eq 'CLEARED' && !$test) {
+    (my $t = $target) =~ s/\s.*$//;                     # drop the " [from slave]" suffix
+    eval {
+        require SmokepingModern::Events;
+        for my $try (1 .. 3) {
+            $dur_sec = SmokepingModern::Events::outage_duration($alert, $t);
+            last if defined $dur_sec;
+            select undef, undef, undef, 0.7;            # log line may still be in flight
+        }
+        $dur = SmokepingModern::Events::fmt_duration($dur_sec) if defined $dur_sec;
+    };
+}
+
 my $when  = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $short = "$target: $alert $state" . ($test ? ' (TEST)' : '');
+my $short = "$target: $alert $state" . (defined $dur ? " (back after $dur)" : '') . ($test ? ' (TEST)' : '');
 my $body  = join "\n",
     ($test ? "This is a TEST notification from modern-smokeping." : ()),
     "Target: $target" . ($host ? " ($host)" : ''),
     "Alert:  $alert",
     "State:  $state",
+    (defined $dur ? "Outage: $dur" : ()),
     ($loss ? "Loss:   $loss" : ()),
     ($rtt  ? "RTT:    $rtt"  : ()),
     "Time:   $when";
 my $emoji = $state eq 'CLEARED' ? "\x{2705}" : "\x{1F6A8}";
-my $title = "$emoji SmokePing $state: $target";
+my $title = "$emoji SmokePing $state: $target" . (defined $dur ? " - back after $dur" : '');
 
 my @results;
 for my $ch (sort keys %$cfg) {
@@ -105,6 +124,7 @@ sub send_channel {
             source => 'modern-smokeping', test => ($test ? JSON::PP::true : JSON::PP::false),
             alert => $alert, target => $target, host => $host, state => $state,
             loss => $loss, rtt => $rtt, time => $when, title => $title, message => $body,
+            (defined $dur_sec ? (durationSec => $dur_sec + 0, duration => $dur) : ()),
         }, @h);
     }
     die "unknown channel\n";

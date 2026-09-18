@@ -15,8 +15,9 @@ password, write) the same files. The classic CGI stays reachable at
 |--------------|----------------------------------|-----------------------------------------------------|
 | Layout       | frameset, fixed width            | responsive, mobile drawer, light / dark / auto      |
 | Graphs       | pre-rendered PNGs                | live canvas smoke charts, hover readout, drag-zoom  |
-| Alerts       | e-mail / log only                | **alerts page**: live state, history, acknowledgements |
-| Config       | edit files by hand               | **settings page**: SMTP, Discord/Telegram/ntfy/…, add & remove targets, validated config editor |
+| Alerts       | e-mail / log only                | **alerts page**: live state, persistent incident history with durations, acknowledgements, "back after 4m12s" recovery notices |
+| Reporting    | none                             | **availability / SLA report** (uptime %, downtime, p95, worst hour, CSV/print), **compare targets** on one chart, Prometheus `/api/metrics` |
+| Config       | edit files by hand               | **settings page**: SMTP, Discord/Telegram/ntfy/…, add & remove targets, **alert-rule form with live preview**, validated config editor |
 | Navigation   | full page reload per click       | single-page app, 15 s auto-refresh, wall display    |
 
 ---
@@ -213,6 +214,12 @@ chart (median coloured by loss, symmetric min–max / p10–p90 / p20–p80 smok
 the current chart's image or raw data points. The ⏸ button in the top bar
 pauses auto-refresh per browser; the refresh button always works.
 
+**Compare** (dashboard header, or *Compare…* on a target page, `#/compare`) overlays
+up to six targets on one chart — median latency on top, packet loss below, one
+hover readout for all of them — with a stats table underneath. The selection lives
+in the URL (`#/compare?paths=/A/x,/B/y&range=30h`), so a comparison is a link you
+can send to someone.
+
 **Keyboard:** `/` focuses the target filter; `Esc` clears it, closes an open
 dialog, or closes the mobile target drawer.
 
@@ -223,12 +230,31 @@ page reconstructs both:
 
 * **Active** — every target's `alerts = …` matchers are run against the latest
   rrd samples exactly the way `Smokeping::check_alerts` does. "Is it true right now."
-* **History** — raise/clear events parsed from `/config/log/smokeping.log`
-  (the bundled `svc-smokeping` override adds `--logfile`).
+* **Incident history** — raise/clear events from `/config/log/smokeping.log`
+  (the bundled `svc-smokeping` override adds `--logfile`) are tailed into a
+  persistent store (`/config/modern-events.jsonl`) and paired into **incidents
+  with start, end and duration**. The store survives log rotation and restarts,
+  covers 24 h → 90 d, and the same list appears (per target) on every target page.
+  Level-triggered alerts (no `edgetrigger`) never log a "cleared" line, so their
+  end is inferred from when they stopped being reported.
 * **Acknowledge** — silence for 1 h / 8 h / 24 h / 7 d / until cleared, with a note
   and who did it. Server-side, shared by everyone (`/config/modern-acks.json`).
 * **Export CSV** — on both the active-alerts table and the history list, downloads
   what's currently shown (respects the active table's filter/search).
+
+### Availability report (`#/report`)
+
+Pick 24 h / 7 d / 30 d / 90 d and get, per target and per group: **availability**,
+full-outage time, loss-minutes, average and p95 RTT, the worst hour, and incident
+count with the longest incident. **Export CSV** for spreadsheets, **Print** for a
+clean PDF (menus are hidden in print).
+
+* *Availability* = 100 % − average packet loss over the period (10 % loss for a
+  whole day counts as 10 % unavailable) — independent of RRD resolution.
+* *Full-outage time* = time in poll slots with ≥ 90 % loss, at the finest RRD
+  resolution that covers the range (10 s for 24 h, 5 min for a week, 1 h beyond 20 d),
+  so short blips are only visible on the short ranges.
+* *Loss-minutes* = the same loss expressed as minutes of total outage.
 
 ### Settings page (`#/settings`, password)
 
@@ -241,10 +267,35 @@ container restart.
 | **E-mail** | SMTP server / port / STARTTLS / TLS, sign-in method **password or OAuth2** (Google, Microsoft 365), alert *from* + recipient list, **Send test e-mail** — see [E-mail: OAuth2](#e-mail-oauth2) |
 | **Notifications** | Discord, Slack, Telegram, ntfy, Gotify, generic JSON webhook — each with **Save & send test**. Enable *Webhook notifications* on the E-mail tab to route alerts there |
 | **Targets** | **Add** a target under any group. **Edit** an existing target or group — menu, title, host, probe (a dropdown of the probes actually defined in the Probes file, validated server-side too — no more typo'd probe names) and its alerts (tick boxes for each defined alert); works on targets from an imported SmokePing config. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
+| **Alert rules** | the Alerts file as a form — **minutes instead of poll cycles** (it converts using your Database step). Rule types: *packet loss* (raise / clear thresholds), *host down*, *high latency*, *latency shift vs. baseline*, plus *custom* for raw patterns. A **live preview** shows which targets would be firing right now and replays the last 20 h to show how often the rule would have fired — tune it before you save. Existing rules are parsed back into the form (the sample alerts all round-trip); unknown patterns open as *custom*. A rule still assigned to a target can't be deleted. Assign rules to targets on the *Targets* tab |
 | **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves`; nothing is saved if the check fails. **Show changes** previews a line diff against the loaded version before you save |
 | **Access** | who you are, how the login is set, **Sign out** |
 
 Auto-refresh is off on this page so it can never wipe a half-filled form.
+
+### Recovery notices
+
+When an edge-triggered alert clears, the notification says how long it was down:
+`✅ SmokePing CLEARED: Sites.Google - back after 4m12s` (webhooks also get
+`durationSec` / `duration` fields), and the Microsoft Graph mail subject becomes
+`[SmokeAlert] hostdown was cleared on Sites.Google - back after 4m12s`. The duration
+comes from SmokePing's own log, which it writes *before* it sends the mail. (SMTP
+via msmtp sends SmokePing's mail unchanged.)
+
+### Prometheus metrics
+
+`GET /api/metrics` (open, read-only) exposes target status / loss / median RTT /
+jitter, the alerts firing now, and open/24 h incident counts:
+
+```yaml
+scrape_configs:
+  - job_name: smokeping
+    metrics_path: /api/metrics
+    static_configs: [{ targets: ['unraid:8480'] }]
+```
+
+Handy queries: `smokeping_target_status >= 2` (down or critical),
+`smokeping_alerts_active > 0`, `smokeping_target_loss_percent > 5`.
 
 ### E-mail: OAuth2
 
@@ -324,6 +375,7 @@ loss and sparkline, plus a status header and clock. Always live (ignores pause).
 | `ssmtp.conf` | SMTP (edited by Settings → E-mail; symlinked to `/etc/ssmtp/ssmtp.conf`) |
 | `modern-notify.json` | webhook channels (Settings → Notifications) |
 | `modern-acks.json` | acknowledgements |
+| `modern-events.jsonl`, `modern-events.state` | persistent alert/incident history and its log-tail offset |
 | `log/smokeping.log`, `log/notify.log` | alert history; notifier log |
 | `Targets.bak`, `Alerts.bak`, … | previous version of any file saved through the UI |
 
@@ -384,9 +436,10 @@ existing `.rrd` files** — to change it: stop the container, delete
 ```
 .github/workflows/docker-publish.yml   builds + publishes the image to ghcr.io on push/tag
 Dockerfile                      FROM lscr.io/linuxserver/smokeping + the files below
-app/web/                        single-page UI (plain ES modules, canvas charts, no build step)  -> /modern/ and /
+app/web/                        single-page UI (plain ES modules: app.js, views.js, chart.js; no build step)  -> /modern/ and /
 app/api/smokeping-api.cgi       JSON API, runs under mod_fcgid                                -> /api/
-app/api/lib/SmokepingModern/    Api.pm (read: tree, summary, node, alerts)  Admin.pm (write: settings, config, targets, acks)
+app/api/lib/SmokepingModern/    Api.pm (read: tree, summary, node, alerts, report, events, metrics)  Admin.pm (write: settings, config, targets, alert rules, acks)
+                                Events.pm (persistent incident store)  AlertRule.pm (minutes <-> SmokePing patterns)
 app/bin/notify                  webhook notifier, invoked by SmokePing as a |script alertee
 app/apache/                     Apache alias / fcgid / rewrite snippet
 root/custom-cont-init.d/        installs the snippet + login on every start
@@ -400,10 +453,11 @@ rather than reimplementing any of it.
 
 | Endpoint | |
 |----------|---|
-| `GET /api/health` `tree` `summary` `alerts` `acks` | open |
+| `GET /api/health` `tree` `summary` `alerts` `acks` `metrics` | open |
+| `GET /api/report?range=24h\|7d\|30d\|90d` `events?range=&target=` `alertpreview?kind=…` | open |
 | `GET /api/node?path=&range=` or `&start=&end=` | open |
-| `GET /api/settings` `me` `config/<file>` | password |
-| `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |
+| `GET /api/settings` `me` `config/<file>` `alertdefs` | password |
+| `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `alertdefs` `alertdefs/delete` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |
 
 ## License
 

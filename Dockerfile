@@ -27,7 +27,8 @@ COPY root/ /
 # the whole "build". docker-publish.yml sets APP_VERSION from the git tag
 # (or "latest-<sha>" for a plain push to main).
 ARG APP_VERSION=dev
-RUN sed -i "s/__APP_VERSION__/${APP_VERSION}/" /app/smokeping-modern/web/index.html
+RUN sed -i "s/__APP_VERSION__/${APP_VERSION}/" /app/smokeping-modern/web/index.html \
+ && sed -i "s/__APP_VERSION__/${APP_VERSION}/" /app/smokeping-modern/api/lib/SmokepingModern/Api.pm
 
 RUN chmod +x /app/smokeping-modern/api/smokeping-api.cgi \
              /app/smokeping-modern/bin/notify \

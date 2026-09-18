@@ -1,6 +1,7 @@
 // SmokePing Modern UI - app shell, router and views.
 import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs, seriesToCsv, toPngDataUrl } from './chart.js';
 import { diffLines } from './diff.js';
+import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules } from './views.js';
 
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
 const REFRESH_MS = 15_000;
@@ -228,6 +229,8 @@ function renderTree() {
   if (!state.tree) return;
   host.append(treeRow({ name: 'Dashboard', path: '#/', menu: 'Dashboard', _link: '#/' }, 0, true));
   host.append(treeRow({ name: 'Alerts', path: '#/alerts', menu: 'Alerts', _link: '#/alerts' }, 0, true));
+  host.append(treeRow({ name: 'Report', path: '#/report', menu: 'Availability report', _link: '#/report' }, 0, true));
+  host.append(treeRow({ name: 'Compare', path: '#/compare', menu: 'Compare targets', _link: '#/compare' }, 0, true));
   host.append(treeRow({ name: 'Wall', path: '#/wall', menu: 'Wall display', _link: '#/wall' }, 0, true));
   host.append(treeRow({ name: 'Settings', path: '#/settings', menu: 'Settings', _link: '#/settings' }, 0, true));
   host.append(el('div', { class: 'tree-children', style: 'margin:6px 0;border:0' },
@@ -387,6 +390,14 @@ function currentRoute() {
     return { name: 'alerts', sev: qs.get('sev') || 'all' };
   }
   if (h.startsWith('#/settings')) return { name: 'settings', tab: (h.split('/')[2] || 'mail').split('?')[0] };
+  if (h.startsWith('#/report')) {
+    const qs = new URLSearchParams(h.split('?')[1] || '');
+    return { name: 'report', range: qs.get('range') || localStorage.getItem('sp.reportRange') || '7d' };
+  }
+  if (h.startsWith('#/compare')) {
+    const qs = new URLSearchParams(h.split('?')[1] || '');
+    return { name: 'compare', paths: (qs.get('paths') || '').split(',').filter(Boolean), range: qs.get('range') || '' };
+  }
   if (h.startsWith('#/wall')) return { name: 'wall' };
   return { name: 'dashboard' };
 }
@@ -395,7 +406,7 @@ let lastRouteName = null;
 function render(fromRefresh) {
   const r = currentRoute();
   // a background data refresh must never rebuild Settings (it would wipe the forms)
-  if (fromRefresh && r.name === 'settings') return;
+  if (fromRefresh && (r.name === 'settings' || r.name === 'report' || r.name === 'compare')) return;
   // leaving Settings after a while: pull fresh data once, but only if we were away long enough to matter
   if (!fromRefresh && lastRouteName === 'settings' && r.name !== 'settings' && Date.now() - lastOk > REFRESH_MS) {
     bumpRefreshClock(); refresh();           // refresh() re-enters render(true) with fresh data
@@ -405,6 +416,8 @@ function render(fromRefresh) {
   if (r.name === 'node') renderNode(r.path);
   else if (r.name === 'alerts') renderAlerts(r.sev);
   else if (r.name === 'settings') renderSettings(r.tab);
+  else if (r.name === 'report') renderReport(document.getElementById('main'), r.range);
+  else if (r.name === 'compare') renderCompare(document.getElementById('main'), r);
   else if (r.name === 'wall') renderWall();
   else renderDashboard();
   decorateTree();
@@ -440,6 +453,7 @@ function renderDashboard() {
     el('h1', {}, 'Dashboard'),
     el('span', { class: 'sub' }, `${s.total} targets · updated ${ago(s.generated)}`),
     el('span', { class: 'spacer' }),
+    el('a', { class: 'chip', href: '#/compare', title: 'Overlay several targets on one chart' }, 'Compare'),
     sortControl(),
   ));
 
@@ -529,6 +543,7 @@ async function renderNode(path) {
       class: (r === nodeRange && !zoomed) ? 'on' : '',
       onclick: () => { nodeRange = r; localStorage.setItem('sp.range', r); zoom = { path, start: null, end: null }; renderNode(path); },
     }, r))),
+    el('a', { class: 'chip', href: compareHash([path], nodeRange), title: 'Overlay other targets on this chart' }, 'Compare…'),
     el('button', {
       class: 'chip', title: 'Save the chart as a PNG image',
       onclick: () => {
@@ -602,6 +617,8 @@ async function renderNode(path) {
     tc.append(el('div', { class: 'table-scroll' }, tbl));
     main.append(tc);
   }
+
+  main.append(incidentHistory({ target: path, compact: true, title: 'Recent incidents (30 days)' }));
 
   main.append(el('p', { class: 'note' },
     el('a', { href: d.legacyUrl, target: '_blank', rel: 'noopener' }, 'Open in classic SmokePing ↗')));
@@ -692,36 +709,8 @@ function renderAlerts(sevFilter) {
     });
   }
 
-  // history
-  const hist = a.recent || [];
-  const hc = el('div', { class: 'tablecard' },
-    el('div', { class: 'tablecard-head' }, el('h2', {}, 'Recent history'),
-      hist.length ? el('button', {
-        class: 'chip', title: 'Download the alert history as CSV',
-        onclick: () => downloadBlob(rowsToCsv(
-          ['time', 'event', 'alert', 'target', 'count', 'last'],
-          hist.map(ev => [ev.time ? new Date(ev.time * 1000).toISOString() : '', ev.event, ev.alert, ev.target, ev.count, ev.last ? new Date(ev.last * 1000).toISOString() : ''])),
-          'smokeping-alerts-history.csv'),
-      }, 'Export CSV') : null));
-  if (!a.logSource) {
-    hc.append(el('p', { class: 'note' },
-      'Alert history is unavailable — SmokePing has no alert database. Mount its log file and set ',
-      el('span', { class: 'pattern' }, 'SMOKEPING_LOG'), ' to see raise/clear events here.'));
-  } else if (!hist.length) {
-    hc.append(el('p', { class: 'note' }, 'No alert events found in the log yet.'));
-  } else {
-    const ul = el('ul', { class: 'timeline' });
-    for (const ev of hist.slice(0, 60)) {
-      ul.append(el('li', {},
-        el('span', { class: 'when' }, ev.time ? new Date(ev.time * 1000).toLocaleString() : '—'),
-        el('span', { class: 'ev ' + ev.event }, ev.event),
-        el('span', {}, el('strong', {}, ev.alert), ' · ', ev.target,
-          ev.count > 1 ? el('span', { class: 'sub', style: 'color:var(--text-faint);margin-left:8px' },
-            `×${ev.count}` + (ev.last && ev.time ? ` over ${Math.max(1, Math.round((ev.last - ev.time) / 60))} min` : '')) : null)));
-    }
-    hc.append(ul);
-  }
-  main.append(hc);
+  // persistent incident history (survives log rotation; durations paired from raise/clear)
+  main.append(incidentHistory({ title: 'Incident history' }));
 
   const si = document.getElementById('alertSearch');
   if (si) si.addEventListener('input', (e) => {
@@ -870,7 +859,7 @@ function signInDialog() {
 
 // --- settings view --------------------------------------------------
 
-const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Targets'], ['config', 'Config files'], ['access', 'Access']];
+const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Targets'], ['rules', 'Alert rules'], ['config', 'Config files'], ['access', 'Access']];
 let settingsData = null;
 
 async function renderSettings(tab) {
@@ -894,7 +883,7 @@ async function renderSettings(tab) {
     el('a', { class: 'segbtn' + (tab === k ? ' on' : ''), href: '#/settings/' + k }, l))));
   const pane = el('div', { class: 'settings-pane' });
   main.append(pane);
-  ({ mail: paneMail, notify: paneNotify, targets: paneTargets, config: paneConfig, access: paneAccess }[tab] || paneMail)(pane);
+  ({ mail: paneMail, notify: paneNotify, targets: paneTargets, rules: paneRules, config: paneConfig, access: paneAccess }[tab] || paneMail)(pane);
 }
 
 function field(label, input, help) {
@@ -1513,6 +1502,9 @@ function paneAccess(pane) {
     el('p', { class: 'sub' }, 'Viewing (dashboard, alerts, wall, classic UI) is open. The password guards only what changes things: this Settings page, config files, add-target, test mail/notify, reload and acknowledgements. It is set from the container environment, not from here:'),
     el('pre', { class: 'result ok', style: 'display:block' }, 'WEBUI_AUTH=on        # off disables the login\nWEBUI_USER=admin\nWEBUI_PASS=…          # blank = generated once, see /config/modern-auth/password.txt'),
     el('p', { class: 'sub' }, 'Change the values in .env and restart the container.'),
+    el('h2', {}, 'Prometheus metrics'),
+    el('p', { class: 'sub' }, 'Target status, loss, latency, active alerts and open incidents are exported in Prometheus text format (open, read-only, like the dashboard):'),
+    el('pre', { class: 'result ok', style: 'display:block' }, location.origin + API + '/metrics'),
     el('div', { class: 'modal-actions', style: 'justify-content:flex-start' },
       el('button', { class: 'chip', onclick: () => { signOut(); toast('Signed out for this session.'); location.hash = '#/'; } }, 'Sign out'),
       el('span', { class: 'sub', style: 'margin:0 0 0 8px' }, sessionAuth() ? '' : 'Credentials are currently supplied by the browser, not the app; closing the browser signs out.'))));
@@ -1641,6 +1633,8 @@ themeBtn.addEventListener('click', () => {
 });
 
 // --- boot ---------------------------------------------------
+
+initViews({ el, api, post, state, fmtPct, downloadBlob, rowsToCsv, toast, field, input, resultBox, showResult, renderTree });
 
 let booted = false;
 async function boot() {

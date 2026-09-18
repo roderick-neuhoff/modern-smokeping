@@ -26,6 +26,7 @@ function niceMax(v) {
 
 function fmtMs(v) {
   if (v == null || !isFinite(v)) return '–';
+  if (v === 0) return '0 ms';
   if (v < 1) return (v * 1000).toFixed(0) + ' µs';
   if (v < 10) return v.toFixed(2) + ' ms';
   if (v < 100) return v.toFixed(1) + ' ms';
@@ -244,6 +245,129 @@ export function attachSmokeHover(canvas, geom, tooltipEl) {
   canvas.onmousemove = move;
   canvas.ontouchmove = move;
   canvas.onmouseleave = () => { tooltipEl.hidden = true; };
+}
+
+// --- compare chart: several targets on one time axis -------------------------
+// list = [{ label, color, t[], median[] (ms), loss[] (%) }]. Top panel is
+// latency, bottom panel is packet loss, both sharing the x axis.
+
+export const COMPARE_COLORS = ['#2f6df6', '#e8590c', '#1f9d57', '#a83bd6', '#d6336c', '#0ca5b0'];
+
+export function drawCompare(canvas, list) {
+  const { ctx, w, h } = setupHiDPI(canvas);
+  ctx.clearRect(0, 0, w, h);
+  const pad = { l: 54, r: 12, t: 10, b: 24 };
+  const plotW = w - pad.l - pad.r;
+  const usable = (list || []).filter(s => s.t && s.t.length > 1);
+  if (!usable.length) {
+    ctx.fillStyle = css('--text-faint');
+    ctx.font = `13px ${css('--sans') || 'sans-serif'}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('No data in this range yet', w / 2, h / 2);
+    return null;
+  }
+  const t0 = Math.min(...usable.map(s => s.t[0]));
+  const t1 = Math.max(...usable.map(s => s.t[s.t.length - 1]));
+  const spanSec = (t1 - t0) || 1;
+  const gap = 16;
+  const totalH = h - pad.t - pad.b - gap;
+  const latH = Math.round(totalH * 0.68), lossH = totalH - latH;
+  const latTop = pad.t, lossTop = pad.t + latH + gap;
+
+  let lmax = 0, pmax = 0;
+  for (const s of usable) {
+    for (const v of s.median) if (v != null && v > lmax) lmax = v;
+    for (const v of s.loss) if (v != null && v > pmax) pmax = v;
+  }
+  lmax = niceMax(lmax * 1.1) || 1;
+  pmax = pmax > 0 ? Math.min(100, niceMax(pmax * 1.1)) : 5;
+
+  const X = (ts) => pad.l + ((ts - t0) / spanSec) * plotW;
+  const panels = [
+    { top: latTop, height: latH, max: lmax, fmt: fmtMs },
+    { top: lossTop, height: lossH, max: pmax, fmt: (v) => v.toFixed(v < 10 && v % 1 ? 1 : 0) + ' %' },
+  ];
+  ctx.font = `11px ${css('--mono') || 'monospace'}`;
+  for (const p of panels) {
+    p.Y = (v) => p.top + p.height - (v / p.max) * p.height;
+    const rows = p === panels[0] ? 4 : 2;
+    ctx.strokeStyle = css('--grid'); ctx.fillStyle = css('--text-faint');
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.lineWidth = 1;
+    for (let i = 0; i <= rows; i++) {
+      const v = (p.max / rows) * i, y = p.Y(v);
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+      ctx.fillText(p.fmt(v), pad.l - 8, y);
+    }
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  const ticks = Math.max(1, Math.min(6, Math.floor(plotW / 90)));
+  for (let i = 0; i <= ticks; i++) {
+    const ts = t0 + (spanSec / ticks) * i, x = X(ts);
+    ctx.strokeStyle = css('--grid');
+    for (const p of panels) { ctx.beginPath(); ctx.moveTo(x, p.top); ctx.lineTo(x, p.top + p.height); ctx.stroke(); }
+    ctx.fillStyle = css('--text-faint');
+    ctx.fillText(fmtTimeAxis(ts, spanSec), x, lossTop + lossH + 6);
+  }
+
+  const line = (s, key, p) => {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.8; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    let open = false;
+    ctx.beginPath();
+    for (let i = 0; i < s.t.length; i++) {
+      const v = s[key][i];
+      if (v == null) { open = false; continue; }
+      const x = X(s.t[i]), y = p.Y(Math.min(v, p.max));
+      if (open) ctx.lineTo(x, y); else { ctx.moveTo(x, y); open = true; }
+    }
+    ctx.stroke();
+  };
+  for (const s of usable) { line(s, 'loss', panels[1]); }
+  for (const s of usable) { line(s, 'median', panels[0]); }
+
+  ctx.fillStyle = css('--text-faint'); ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('latency (median)', pad.l + 4, latTop + 2);
+  ctx.fillText('packet loss', pad.l + 4, lossTop + 2);
+  return { X, panels, t0, t1, spanSec, pad, plotW, plotTop: latTop, plotBottom: lossTop + lossH, list: usable };
+}
+
+// nearest sample index by timestamp (t ascending)
+function nearestIdx(t, ts) {
+  let lo = 0, hi = t.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (t[mid] < ts) lo = mid; else hi = mid; }
+  return Math.abs(t[lo] - ts) <= Math.abs(t[hi] - ts) ? lo : hi;
+}
+
+export function attachCompareHover(canvas, geom, tooltipEl, crossEl) {
+  if (!geom) { tooltipEl.hidden = true; if (crossEl) crossEl.hidden = true; return; }
+  const { X, pad, t0, spanSec, plotW, list } = geom;
+  const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const move = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+    if (mx < pad.l || mx > rect.width - pad.r) { tooltipEl.hidden = true; if (crossEl) crossEl.hidden = true; return; }
+    const ts = t0 + ((mx - pad.l) / plotW) * spanSec;
+    let html = `<b>${new Date(ts * 1000).toLocaleString()}</b>`;
+    for (const s of list) {
+      const i = nearestIdx(s.t, ts);
+      const lp = s.loss[i];
+      html += `<br><span style="color:${s.color}">●</span> ${esc(s.label)}: ${fmtMs(s.median[i])}` +
+              ` · ${lp == null ? '–' : lp.toFixed(lp < 10 && lp % 1 ? 1 : 0) + ' %'}`;
+    }
+    tooltipEl.hidden = false;
+    tooltipEl.innerHTML = html;
+    const left = Math.min(mx + 14, rect.width - 220);
+    tooltipEl.style.left = (canvas.offsetLeft + Math.max(4, left)) + 'px';
+    tooltipEl.style.top = (canvas.offsetTop + 8) + 'px';
+    if (crossEl) {
+      crossEl.hidden = false;
+      crossEl.style.left = (canvas.offsetLeft + mx) + 'px';
+      crossEl.style.top = (canvas.offsetTop + geom.plotTop) + 'px';
+      crossEl.style.height = (geom.plotBottom - geom.plotTop) + 'px';
+    }
+  };
+  canvas.onmousemove = move;
+  canvas.ontouchmove = move;
+  canvas.onmouseleave = () => { tooltipEl.hidden = true; if (crossEl) crossEl.hidden = true; };
 }
 
 // --- sparkline -------------------------------------------------------

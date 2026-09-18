@@ -753,6 +753,15 @@ sub _parse_syslog_ts {
 # incident history (persistent, see SmokepingModern::Events)
 # ---------------------------------------------------------------------------
 
+# Incidents for targets that still exist. A target removed while an alert was
+# raised never logs a "cleared" line and would otherwise stay "open" forever.
+sub _live_incidents {
+    my ($now, $titles) = @_;
+    $titles ||= _title_map();
+    my $inc = SmokepingModern::Events::incidents(SmokepingModern::Events::read_store(), $now);
+    return [ grep { exists $titles->{ $_->{path} } } @$inc ];
+}
+
 # path => title for every leaf
 sub _title_map {
     my ($si, $cfg) = _boot();
@@ -773,10 +782,9 @@ sub events {
     my $limit = _num($q->{limit}) || 500;
     $limit = 2000 if $limit > 2000;
 
-    my $all  = SmokepingModern::Events::read_store();
-    my $inc  = SmokepingModern::Events::incidents($all, $now);
-    my $want = $q->{target} // '';
     my $titles = _title_map();
+    my $inc  = _live_incidents($now, $titles);
+    my $want = $q->{target} // '';
 
     my @rows = grep { ($_->{end} // $now) >= $since }                # overlaps the window
                grep { !length $want || $_->{path} eq $want } @$inc;
@@ -833,7 +841,7 @@ sub report {
     my $secs  = $REPORT_SEC{$range};
 
     eval { SmokepingModern::Events::ingest() };
-    my $inc = SmokepingModern::Events::incidents(SmokepingModern::Events::read_store(), $now);
+    my $inc = _live_incidents($now);
     my %inc_n; my %inc_longest;
     for my $i (@$inc) {
         next if ($i->{end} // $now) < $now - $secs;
@@ -986,7 +994,7 @@ sub metrics_text {
     $emit->('smokeping_alerts_active', 'gauge', 'Number of alerts currently firing.', [ ['', scalar @{ $a->{active} }] ]);
 
     my $now = time;
-    my $inc = SmokepingModern::Events::incidents(SmokepingModern::Events::read_store(), $now);
+    my $inc = _live_incidents($now);
     my $open = scalar grep { $_->{open} } @$inc;
     my $last24 = scalar grep { ($_->{end} // $now) >= $now - 86400 } @$inc;
     $emit->('smokeping_incidents_open', 'gauge', 'Incidents currently open.', [ ['', $open] ]);

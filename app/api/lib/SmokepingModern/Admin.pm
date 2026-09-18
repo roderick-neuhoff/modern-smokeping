@@ -17,6 +17,8 @@ use POSIX ();
 use File::Temp ();
 use SmokepingModern::AlertRule ();
 use SmokepingModern::Maintenance ();
+use SmokepingModern::Goals ();
+use SmokepingModern::Backup ();
 
 my $CONFIG_DIR = $ENV{SMOKEPING_CONFIG_DIR} || '/config';
 my $MASTER     = $ENV{SMOKEPING_CONF}       || '/etc/smokeping/config';
@@ -73,6 +75,15 @@ sub handle {
         return (200, alertdefs_get())               if $method eq 'GET';
         return alertdefs_save($body)                if $method eq 'POST' && $sub ne 'delete';
         return alertdefs_delete($body)              if $method eq 'POST' && $sub eq 'delete';
+    }
+    if ($route eq 'backup') {
+        return (200, backup_get($q))                if $method eq 'GET';
+        return backup_restore($body)                if $method eq 'POST' && $sub eq 'restore';
+    }
+    if ($route eq 'goals') {
+        return (200, goals_get())                   if $method eq 'GET';
+        return (200, goals_save($body))             if $method eq 'POST' && $sub ne 'delete';
+        return (200, goals_delete($body))           if $method eq 'POST' && $sub eq 'delete';
     }
     if ($route eq 'maintenance') {
         return (200, maintenance_get())             if $method eq 'GET';
@@ -1600,6 +1611,82 @@ sub maintenance_delete {
     die { status => 404, error => 'no such maintenance window' } if @keep == @$all;
     SmokepingModern::Maintenance::save(\@keep);
     return { ok => \1, %{ maintenance_get() } };
+}
+
+# ---------------------------------------------------------------------------
+# uptime goals (see SmokepingModern::Goals)
+# ---------------------------------------------------------------------------
+
+sub goals_get {
+    my $goals = SmokepingModern::Goals::load();
+    my @out = map { { %$_, allowedPerMonthSec => SmokepingModern::Goals::budget_seconds($_->{target}, 30 * 86400) } }
+              sort { $a->{path} cmp $b->{path} } @$goals;
+    return { goals => \@out };
+}
+
+sub goals_save {
+    my $b = shift || {};
+    my $g = SmokepingModern::Goals::normalize($b);
+    my $all = SmokepingModern::Goals::load();
+    my ($i) = grep { SmokepingModern::Goals::norm_path($all->[$_]{path}) eq $g->{path} } 0 .. $#$all;
+    if (defined $i) { $all->[$i] = $g } else { push @$all, $g }
+    SmokepingModern::Goals::save($all);
+    return { ok => \1, %{ goals_get() } };
+}
+
+sub goals_delete {
+    my $b = shift || {};
+    my $path = SmokepingModern::Goals::norm_path($b->{path});
+    my $all = SmokepingModern::Goals::load();
+    my @keep = grep { SmokepingModern::Goals::norm_path($_->{path}) ne $path } @$all;
+    die { status => 404, error => 'no goal for that scope' } if @keep == @$all;
+    SmokepingModern::Goals::save(\@keep);
+    return { ok => \1, %{ goals_get() } };
+}
+
+# ---------------------------------------------------------------------------
+# backup / restore (see SmokepingModern::Backup)
+# ---------------------------------------------------------------------------
+
+sub backup_get {
+    my $q = shift || {};
+    my $ver = eval { $SmokepingModern::Api::VERSION } // '';
+    return SmokepingModern::Backup::collect($CONFIG_DIR, secrets => (($q->{secrets} // '') eq '1'), appVersion => $ver);
+}
+
+sub backup_restore {
+    my $b = shift || {};
+    my $arch = $b->{archive};
+    SmokepingModern::Backup::verify($arch);                      # dies 422 on anything odd
+    my $info = SmokepingModern::Backup::analyze($arch, $CONFIG_DIR);
+    if ($b->{dryRun}) {
+        return (200, { ok => \1, dryRun => \1, created => $arch->{created}, host => $arch->{host}, appVersion => $arch->{appVersion},
+                       includesSecrets => ($arch->{includesSecrets} ? \1 : \0), files => $info });
+    }
+
+    _verify_password($b->{password});                             # restoring overwrites live config: ask again
+    my %ok = map { $_ => 1 } @SmokepingModern::Backup::GROUP_ORDER;
+    my @parts = grep { $ok{$_} } (ref $b->{parts} eq 'ARRAY' ? @{ $b->{parts} } : ());
+    die { status => 422, error => 'choose what to restore' } unless @parts;
+    my %want = map { $_ => 1 } @parts;
+    die { status => 422, error => 'this backup contains no credentials' }
+        if $want{secrets} && !grep { $_->{group} eq 'secrets' } @{ $arch->{files} };
+
+    # every SmokePing config file must pass `smokeping --check` before anything is written
+    if ($want{config}) {
+        for my $f (grep { $_->{group} eq 'config' && $EDITABLE{ $_->{name} } } @{ $arch->{files} }) {
+            my $text = SmokepingModern::Backup::file_bytes($f);
+            utf8::decode($text);
+            my $chk = _check_candidate($f->{name}, $text);
+            return (422, { ok => \0, check => $chk, error => "config check failed for '$f->{name}' - nothing was restored" })
+                unless _passed($chk);
+        }
+    }
+
+    my $written = SmokepingModern::Backup::apply($arch, $CONFIG_DIR, \@parts);
+    SmokepingModern::Events::rebuild_state() if $want{history} && grep { $_ eq 'modern-events.jsonl' } @$written;
+    my $reload = $want{config} ? _hup() : undef;
+    return (200, { ok => \1, written => $written, unchanged => scalar(@{ $arch->{files} }) - scalar(@$written), reload => $reload });
 }
 
 sub reload {

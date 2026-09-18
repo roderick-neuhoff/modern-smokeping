@@ -26,6 +26,7 @@ use Smokeping::Info;
 use Smokeping;
 use SmokepingModern::Events ();
 use SmokepingModern::Maintenance ();
+use SmokepingModern::Goals ();
 
 # stamped from the git tag at image build time (see Dockerfile); "dev" when run from a checkout
 our $VERSION = '__APP_VERSION__';
@@ -59,7 +60,7 @@ sub run {
 
     # everything that writes (settings, config files, acks, tests, reload)
     # lives in SmokepingModern::Admin
-    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me oauth alertdefs maintenance);
+    my %admin = map { $_ => 1 } qw(settings config targets acks test reload me oauth alertdefs maintenance goals backup);
     if ($admin{$route}) {
         my ($status, $body) = eval {
             require SmokepingModern::Admin;
@@ -142,7 +143,7 @@ sub _emit {
 sub _read_body {
     my $len = $ENV{CONTENT_LENGTH} || 0;
     return undef unless $len > 0;
-    die { status => 400, error => 'body too large' } if $len > 1_000_000;
+    die { status => 400, error => 'body too large' } if $len > 32_000_000;
     my $raw = '';
     my $got = read(STDIN, $raw, $len);
     return undef unless defined $got && length $raw;
@@ -848,10 +849,67 @@ sub _pctile {
 
 sub report {
     my $q = shift;
-    my ($si, $cfg) = _boot();
     my $now   = time;
     my $range = $REPORT_SEC{ $q->{range} || '' } ? $q->{range} : '7d';
     my $secs  = $REPORT_SEC{$range};
+    my $r = _report_core($secs, $now);
+    $r->{range} = $range;
+    _annotate_goals($r, $now);
+    return $r;
+}
+
+# calendar-month-to-date report, the basis of the downtime budgets
+sub _month_report {
+    my $now = shift;
+    my ($ms, $me) = SmokepingModern::Goals::month_bounds($now);
+    my $secs = $now - $ms;
+    $secs = 3600 if $secs < 3600;
+    my $r = _cached('reportmonth-' . $ms, 60, sub { _report_core($secs, $now) });
+    return ($r, $ms, $me);
+}
+
+# add goal / pass-fail / monthly budget to every group and target row
+sub _annotate_goals {
+    my ($r, $now) = @_;
+    my $goals = SmokepingModern::Goals::load();
+    $r->{goals} = { defined => scalar(@$goals) + 0 };
+    return unless @$goals;
+
+    my ($mr, $ms, $me) = _month_report($now);
+    $r->{month} = { start => $ms, end => $me, now => $now };
+    my %mt = map { $_->{path} => $_ } @{ $mr->{targets} };
+    my %mg = map { $_->{path} => $_ } @{ $mr->{groups} };
+
+    my ($met, $total, $risk, $breach) = (0, 0, 0, 0);
+    my $annotate = sub {
+        my ($row, $mrow, $is_target) = @_;
+        my $g = SmokepingModern::Goals::effective($row->{path}, $goals) or return;
+        $row->{goal}      = $g->{target} + 0;
+        $row->{goalScope} = $g->{path};
+        my $meets = defined $row->{availability} ? ($row->{availability} >= $g->{target} ? 1 : 0) : undef;
+        $row->{meets} = defined $meets ? _bool($meets) : undef;
+        if ($is_target && defined $meets) { $total++; $met += $meets }
+        if ($mrow && defined $mrow->{availability}) {
+            my $b = SmokepingModern::Goals::budget_state(
+                target => $g->{target}, availability => $mrow->{availability}, observedSec => $mrow->{observedSec} || 0,
+                monthStart => $ms, monthEnd => $me, now => $now);
+            $b->{availability} = $mrow->{availability};
+            $row->{budget} = $b;
+            if ($is_target) { $risk++ if $b->{status} eq 'at_risk'; $breach++ if $b->{status} eq 'breached' }
+        }
+    };
+    $annotate->($_, $mt{ $_->{path} }, 1) for @{ $r->{targets} };
+    $annotate->($_, $mg{ $_->{path} }, 0) for @{ $r->{groups} };
+    @$r{qw(goalsMet goalsTotal budgetAtRisk budgetBreached)} = ($met, $total, $risk, $breach);
+    $r->{summary}{goalsMet} = $met;
+    $r->{summary}{goalsTotal} = $total;
+    $r->{summary}{budgetAtRisk} = $risk;
+    $r->{summary}{budgetBreached} = $breach;
+}
+
+sub _report_core {
+    my ($secs, $now) = @_;
+    my ($si, $cfg) = _boot();
 
     eval { SmokepingModern::Events::ingest() };
     my $inc = _live_incidents($now);
@@ -930,6 +988,7 @@ sub report {
             coveragePct  => min_(100, 100 * $covered / $secs),
             stepSec      => $step + 0,
             maintenanceSec => int($maintSlots * $step),            # left out of every number above
+            observedSec  => int($known * $step),
         };
         push @rows, $row;
     });
@@ -937,8 +996,9 @@ sub report {
     # roll up per group (parent folder)
     for my $r (grep { defined $_->{availability} } @rows) {
         my $g = $grp{ $r->{group} } ||= { path => $r->{group}, targets => 0, avSum => 0, downtimeSec => 0,
-                                          lossMinutes => 0, incidents => 0, worst => undef };
+                                          lossMinutes => 0, incidents => 0, worst => undef, obs => 0 };
         $g->{targets}++;
+        $g->{obs}         += $r->{observedSec} || 0;
         $g->{avSum}       += $r->{availability};
         $g->{downtimeSec} += $r->{downtimeSec};
         $g->{lossMinutes} += $r->{lossMinutes};
@@ -948,7 +1008,7 @@ sub report {
     my @groups = map {
         my $g = $grp{$_};
         { path => $g->{path}, title => (length $g->{path} ? (split m{/}, $g->{path})[-1] : 'Top level'),
-          targets => $g->{targets}, availability => $g->{avSum} / $g->{targets},
+          targets => $g->{targets}, availability => $g->{avSum} / $g->{targets}, observedSec => int($g->{obs} / $g->{targets}),
           downtimeSec => $g->{downtimeSec}, lossMinutes => $g->{lossMinutes}, incidents => $g->{incidents},
           worstTarget => $g->{worst}{title} }
     } sort keys %grp;
@@ -959,7 +1019,6 @@ sub report {
     my $maintTotal = 0; $maintTotal += $_->{maintenanceSec} || 0 for @rows;
     return {
         generated => $now,
-        range     => $range,
         rangeSec  => $secs,
         downLossPct => $DOWN_LOSS,
         summary   => {
@@ -1028,6 +1087,24 @@ sub metrics_text {
     $emit->('smokeping_alerts_active', 'gauge', 'Number of alerts currently firing.', [ ['', scalar @{ $a->{active} }] ]);
 
     my $now = time;
+    my $goals = SmokepingModern::Goals::load();
+    if (@$goals) {
+        my ($mr, $ms, $me) = eval { _month_report($now) };
+        my (@gt, @gu, @gr);
+        for my $row (@{ $mr->{targets} || [] }, @{ $mr->{groups} || [] }) {
+            my $g = SmokepingModern::Goals::effective($row->{path}, $goals) or next;
+            next unless defined $row->{availability};
+            my $b = SmokepingModern::Goals::budget_state(target => $g->{target}, availability => $row->{availability},
+                observedSec => $row->{observedSec} || 0, monthStart => $ms, monthEnd => $me, now => $now);
+            my $l = _lbl(path => (length $row->{path} ? $row->{path} : '/'), title => ($row->{title} // $row->{path} // ''));
+            push @gt, [ $l, $g->{target} + 0 ];
+            push @gu, [ $l, sprintf('%.0f', $b->{usedSec}) ];
+            push @gr, [ $l, sprintf('%.0f', $b->{remainingSec}) ];
+        }
+        $emit->('smokeping_goal_target_percent', 'gauge', 'Availability goal for the path, percent.', \@gt);
+        $emit->('smokeping_budget_used_seconds', 'gauge', 'Downtime used this calendar month against the goal.', \@gu);
+        $emit->('smokeping_budget_remaining_seconds', 'gauge', 'Downtime budget left this calendar month (negative = goal missed).', \@gr);
+    }
     my $inc = _live_incidents($now);
     my $open = scalar grep { $_->{open} } @$inc;
     my $last24 = scalar grep { ($_->{end} // $now) >= $now - 86400 } @$inc;

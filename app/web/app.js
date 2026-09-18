@@ -1,7 +1,7 @@
 // SmokePing Modern UI - app shell, router and views.
 import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs, seriesToCsv, toPngDataUrl } from './chart.js';
 import { diffLines } from './diff.js';
-import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules, paneMaintenance, fmtUntil } from './views.js';
+import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules, paneMaintenance, paneGoals, paneBackup, fmtUntil } from './views.js';
 
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
 const REFRESH_MS = 15_000;
@@ -885,7 +885,7 @@ function signInDialog() {
 
 // --- settings view --------------------------------------------------
 
-const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Targets'], ['rules', 'Alert rules'], ['maintenance', 'Maintenance'], ['config', 'Config files'], ['access', 'Access']];
+const SETTINGS_TABS = [['mail', 'E-mail'], ['notify', 'Notifications'], ['targets', 'Targets'], ['rules', 'Alert rules'], ['maintenance', 'Maintenance'], ['goals', 'Uptime goals'], ['backup', 'Backup'], ['config', 'Config files'], ['access', 'Access']];
 let settingsData = null;
 
 async function renderSettings(tab) {
@@ -909,7 +909,7 @@ async function renderSettings(tab) {
     el('a', { class: 'segbtn' + (tab === k ? ' on' : ''), href: '#/settings/' + k }, l))));
   const pane = el('div', { class: 'settings-pane' });
   main.append(pane);
-  ({ mail: paneMail, notify: paneNotify, targets: paneTargets, rules: paneRules, maintenance: paneMaintenance, config: paneConfig, access: paneAccess }[tab] || paneMail)(pane);
+  ({ mail: paneMail, notify: paneNotify, targets: paneTargets, rules: paneRules, maintenance: paneMaintenance, goals: paneGoals, backup: paneBackup, config: paneConfig, access: paneAccess }[tab] || paneMail)(pane);
 }
 
 function field(label, input, help) {

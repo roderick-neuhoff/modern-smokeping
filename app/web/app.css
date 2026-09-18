@@ -498,3 +498,7 @@ body.wall-mode[data-density="large"] .wall-head { padding: 16px 24px; }
 .maint-tree { max-height: 240px; overflow-y: auto; margin-top: 8px; padding: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-sunken); }
 .maint-node { display: block; font-size: 13px; padding: 2px 0; }
 .seg-label { padding: 5px 10px; font-size: 12px; color: var(--text-faint); background: var(--bg-sunken); align-self: center; }
+
+/* goals / budgets / backup --------------------------------------------- */
+.budget-text { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+.availbar .track i.critical { background: var(--crit); }

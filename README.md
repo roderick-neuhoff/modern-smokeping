@@ -16,6 +16,7 @@ password, write) the same files. The classic CGI stays reachable at
 | Layout       | frameset, fixed width            | responsive, mobile drawer, light / dark / auto      |
 | Graphs       | pre-rendered PNGs                | live canvas smoke charts, hover readout, drag-zoom  |
 | Alerts       | e-mail / log only                | **alerts page**: live state, persistent incident history with durations, acknowledgements, "back after 4m12s" recovery notices |
+| SLAs         | none                             | **uptime goals** per group / target with pass-fail and a monthly downtime budget; **one-file backup & restore** |
 | Planned work | none                             | **maintenance windows**: silence alerts + leave downtime out of the report, one-off or weekly |
 | Reporting    | none                             | **availability / SLA report** (uptime %, downtime, p95, worst hour, CSV/print), **compare targets** on one chart, Prometheus `/api/metrics` |
 | Config       | edit files by hand               | **settings page**: SMTP, Discord/Telegram/ntfy/…, add & remove targets, **alert-rule form with live preview**, validated config editor |
@@ -268,6 +269,46 @@ stops paging anybody and stops counting against your uptime:
 
 Windows are stored in `/config/modern-maintenance.json`.
 
+### Uptime goals (Settings → Uptime goals)
+
+Set the availability a group or target should reach — e.g. `WAN` 99.9 %, one critical
+link 99.99 %, everything else 99 %. Shortcut buttons for 99 / 99.5 / 99.9 / 99.95 / 99.99
+show what each allows (99.9 % = **43 min 12 s** of downtime per 30 days).
+
+* A target follows the **most specific** goal covering it: its own, else its group's,
+  else the default (`Everything`).
+* The **Availability report** gets *Goal* and *Budget this month* columns: **Meets / Misses**
+  for the selected period, and the **downtime budget** for the calendar month so far —
+  `31m left of 43m`, or `over budget by 6m`. **At risk** means over 75 % of the budget is
+  used *or* the month is on course to exceed it; **breached** means it already has.
+  (Early in the month the projection is not extrapolated, so one bad hour on the 1st
+  doesn't cry wolf.)
+* Availability is the report's packet-based figure with maintenance windows already left out.
+* Prometheus: `smokeping_goal_target_percent`, `smokeping_budget_used_seconds`,
+  `smokeping_budget_remaining_seconds` per path — alert when the remaining budget goes low.
+
+Goals live in `/config/modern-goals.json`.
+
+### Backup & restore (Settings → Backup)
+
+**Download backup** gives one JSON file with your configuration (`Targets`, `Alerts`,
+`Probes`, `Database`, `General`, `Presentation`, `Slaves`, `pathnames`), acknowledgements,
+maintenance windows, uptime goals and the incident history. Credentials (mail passwords,
+OAuth secrets, webhook URLs) are **left out unless you tick the box** — treat such a file like
+the passwords themselves. It does *not* contain the measurement data (`/data`, back that
+folder up as files), logs, or the login password.
+
+**Restore** never writes blindly: choose a file and it first shows every file as
+*same / changed / new* compared with what is live. Then pick the parts to restore
+(configuration · acknowledgements, maintenance & goals · incident history · credentials),
+confirm with your password, and:
+
+* every config file must pass `smokeping --check` or **nothing** is written;
+* each replaced file is kept as `<name>.bak`;
+* every file carries a SHA-256 that is verified, and only known file names are accepted
+  (a doctored archive can't write anywhere else);
+* SmokePing is reloaded with `SIGHUP`, no container restart.
+
 ### Availability report (`#/report`)
 
 Pick 24 h / 7 d / 30 d / 90 d and get, per target and per group: **availability**,
@@ -295,6 +336,8 @@ container restart.
 | **Targets** | **Add** a target under any group. **Edit** an existing target or group — menu, title, host, probe (a dropdown of the probes actually defined in the Probes file, validated server-side too — no more typo'd probe names) and its alerts (tick boxes for each defined alert); works on targets from an imported SmokePing config. **Remove** a target or a whole group — asks for the password *again* and verifies it server-side; optionally deletes the rrd data |
 | **Alert rules** | the Alerts file as a form — **minutes instead of poll cycles** (it converts using your Database step). Rule types: *packet loss* (raise / clear thresholds), *host down*, *high latency*, *latency shift vs. baseline*, plus *custom* for raw patterns. A **live preview** shows which targets would be firing right now and replays the last 20 h to show how often the rule would have fired — tune it before you save. Existing rules are parsed back into the form (the sample alerts all round-trip); unknown patterns open as *custom*. A rule still assigned to a target can't be deleted. Assign rules to targets on the *Targets* tab |
 | **Maintenance** | planned-work windows — see [Maintenance windows](#maintenance-windows-settings--maintenance) |
+| **Uptime goals** | availability goals per group / target — see [Uptime goals](#uptime-goals-settings--uptime-goals) |
+| **Backup** | one-file backup and a previewed, validated restore — see [Backup & restore](#backup--restore-settings--backup) |
 | **Config files** | raw editor for `Targets`, `Alerts`, `Probes`, `Database`, `General`, `Presentation`, `Slaves`; nothing is saved if the check fails. **Show changes** previews a line diff against the loaded version before you save |
 | **Access** | who you are, how the login is set, **Sign out** |
 
@@ -404,6 +447,7 @@ loss and sparkline, plus a status header and clock. Always live (ignores pause).
 | `modern-notify.json` | webhook channels (Settings → Notifications) |
 | `modern-acks.json` | acknowledgements |
 | `modern-maintenance.json` | maintenance windows |
+| `modern-goals.json` | uptime goals |
 | `modern-events.jsonl`, `modern-events.state` | persistent alert/incident history and its log-tail offset |
 | `log/smokeping.log`, `log/notify.log` | alert history; notifier log |
 | `Targets.bak`, `Alerts.bak`, … | previous version of any file saved through the UI |
@@ -468,7 +512,7 @@ Dockerfile                      FROM lscr.io/linuxserver/smokeping + the files b
 app/web/                        single-page UI (plain ES modules: app.js, views.js, chart.js; no build step)  -> /modern/ and /
 app/api/smokeping-api.cgi       JSON API, runs under mod_fcgid                                -> /api/
 app/api/lib/SmokepingModern/    Api.pm (read: tree, summary, node, alerts, report, events, metrics)  Admin.pm (write: settings, config, targets, alert rules, acks)
-                                Events.pm (persistent incident store)  Maintenance.pm (windows)  AlertRule.pm (minutes <-> SmokePing patterns)
+                                Events.pm (persistent incident store)  Maintenance.pm (windows)  Goals.pm (SLO budgets)  Backup.pm (archive)  AlertRule.pm (minutes <-> SmokePing patterns)
 app/bin/notify                  webhook notifier, invoked by SmokePing as a |script alertee
 app/bin/maint-check             drops alert mail for targets in a maintenance window (used by bin/sendmail)
 app/apache/                     Apache alias / fcgid / rewrite snippet
@@ -483,11 +527,11 @@ rather than reimplementing any of it.
 
 | Endpoint | |
 |----------|---|
-| `GET /api/health` `tree` `summary` `alerts` `acks` `maintenance` `metrics` | open |
+| `GET /api/health` `tree` `summary` `alerts` `acks` `maintenance` `goals` `metrics` | open |
 | `GET /api/report?range=24h\|7d\|30d\|90d` `events?range=&target=` `alertpreview?kind=…` | open |
 | `GET /api/node?path=&range=` or `&start=&end=` | open |
 | `GET /api/settings` `me` `config/<file>` `alertdefs` | password |
-| `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `alertdefs` `alertdefs/delete` `maintenance` `maintenance/delete` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |
+| `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `alertdefs` `alertdefs/delete` `maintenance` `maintenance/delete` `goals` `goals/delete` `backup` `backup/restore` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |
 
 ## License
 

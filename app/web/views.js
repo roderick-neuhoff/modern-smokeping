@@ -62,7 +62,12 @@ export async function renderReport(main, range) {
   ));
 
   const s = r.summary || {};
+  const hasGoals = !!(r.goals && r.goals.defined);
+  const monthName = r.month ? new Date(r.month.start * 1000).toLocaleString([], { month: 'long', year: 'numeric' }) : '';
   main.append(el('div', { class: 'statgrid' },
+    hasGoals && s.goalsTotal ? kpi('Goals met', `${s.goalsMet} / ${s.goalsTotal}`, s.goalsMet === s.goalsTotal ? 'ok' : 'critical', 'targets, in this period') : null,
+    hasGoals && s.goalsTotal ? kpi('Budget ' + monthName, s.budgetBreached ? `${s.budgetBreached} breached` : s.budgetAtRisk ? `${s.budgetAtRisk} at risk` : 'on track',
+      s.budgetBreached ? 'critical' : s.budgetAtRisk ? 'warning' : 'ok', 'downtime budget, month to date') : null,
     kpi('Overall availability', fmtAvail(s.availability), availClass(s.availability)),
     kpi('Full-outage time', fmtDur(s.downtimeSec), s.downtimeSec ? 'warning' : 'ok', 'summed over all targets'),
     kpi('Incidents', String(s.incidents ?? 0), s.incidents ? 'warning' : 'ok'),
@@ -74,13 +79,15 @@ export async function renderReport(main, range) {
   if ((r.groups || []).length > 1) {
     const rows = r.groups.slice().sort((a, b) => a.availability - b.availability);
     const tbl = el('table', { class: 'data' },
-      el('thead', {}, el('tr', {}, ...['Group', 'Targets', 'Availability', 'Full-outage', 'Incidents', 'Weakest target'].map(h => el('th', {}, h)))));
+      el('thead', {}, el('tr', {}, ...['Group', 'Targets', 'Availability', ...(hasGoals ? ['Goal', 'Budget this month'] : []), 'Full-outage', 'Incidents', 'Weakest target'].map(h => el('th', {}, h)))));
     const tb = el('tbody');
     for (const g of rows) {
       tb.append(el('tr', {},
         el('td', {}, g.title),
         el('td', { class: 'num' }, String(g.targets)),
         el('td', {}, availCell(g.availability)),
+        hasGoals ? el('td', {}, goalCell(g)) : null,
+        hasGoals ? el('td', {}, budgetCell(g)) : null,
         el('td', { class: 'num' }, fmtDur(g.downtimeSec)),
         el('td', { class: 'num' }, String(g.incidents)),
         el('td', {}, g.worstTarget || '–')));
@@ -97,7 +104,7 @@ export async function renderReport(main, range) {
     const rows = r.targets.filter(t => !q || (t.title + ' ' + t.path + ' ' + (t.host || '')).toLowerCase().includes(q));
     if (!rows.length) { holder.append(el('p', { class: 'note' }, 'No targets match.')); return; }
     const tbl = el('table', { class: 'data' },
-      el('thead', {}, el('tr', {}, ...['Target', 'Availability', 'Full-outage', 'Loss-minutes', 'Avg loss', 'Avg RTT', 'p95 RTT', 'Worst hour', 'Incidents'].map(h => el('th', {}, h)))));
+      el('thead', {}, el('tr', {}, ...['Target', 'Availability', ...(hasGoals ? ['Goal', 'Budget this month'] : []), 'Full-outage', 'Loss-minutes', 'Avg loss', 'Avg RTT', 'p95 RTT', 'Worst hour', 'Incidents'].map(h => el('th', {}, h)))));
     const tb = el('tbody');
     for (const t of rows) {
       const wh = t.worstHour;
@@ -106,6 +113,8 @@ export async function renderReport(main, range) {
           t.host ? el('div', { class: 'cell-sub' }, t.host) : null),
         el('td', {}, availCell(t.availability),
           t.maintenanceSec ? el('div', { class: 'cell-sub' }, `excludes ${fmtDur(t.maintenanceSec)} maintenance`) : null),
+        hasGoals ? el('td', {}, goalCell(t)) : null,
+        hasGoals ? el('td', {}, budgetCell(t)) : null,
         el('td', { class: 'num' }, fmtDur(t.downtimeSec)),
         el('td', { class: 'num' }, t.lossMinutes < 0.05 ? '0' : t.lossMinutes.toFixed(1)),
         el('td', { class: 'num' }, D.fmtPct(t.avgLossPct)),
@@ -126,7 +135,8 @@ export async function renderReport(main, range) {
   main.append(el('p', { class: 'note' },
     `Availability is 100 % minus the average packet loss over the period (so 10 % loss for a whole day counts as 10 % unavailable). ` +
     `Full-outage time is the time spent in poll slots with ${r.downLossPct} % or more loss, at the RRD resolution available for that range (${r.targets[0] ? r.targets[0].stepSec + ' s' : 'n/a'} steps). ` +
-    `Loss-minutes is the same loss expressed as minutes of total outage. Incidents come from the persistent alert history. Time inside a maintenance window is left out of every figure, and incidents that began during one are not counted.`));
+    `Loss-minutes is the same loss expressed as minutes of total outage. Incidents come from the persistent alert history. Time inside a maintenance window is left out of every figure, and incidents that began during one are not counted.` +
+    (hasGoals ? ` Goals are judged on the period above; the downtime budget is always the calendar month to date (${monthName}), i.e. the allowed unavailability of the goal over the whole month, minus what has been used so far. "At risk" means over 75 % used, or on course to exceed the budget by month end.` : '')));
 }
 
 function kpi(k, v, cls, hint) {
@@ -874,4 +884,234 @@ function maintenanceEditor({ w, preset, onClose, onSaved }) {
     res);
   draw();
   return card;
+}
+
+// ============================================================================
+// Settings -> Uptime goals
+// ============================================================================
+
+const GOAL_PRESETS = [99, 99.5, 99.9, 99.95, 99.99];
+const allowedDowntime = (target) => 30 * 86400 * (100 - target) / 100;
+const scopeLabel = (p) => (!p || p === '/') ? 'Everything (default)' : p;
+
+export async function paneGoals(pane) {
+  const { el } = D;
+  let data;
+  try { data = await D.api('/goals'); }
+  catch (e) { pane.append(el('div', { class: 'empty' }, 'Could not load goals: ' + e.message)); return; }
+
+  const listHost = el('div');
+  const formHost = el('div');
+  pane.append(listHost, formHost);
+
+  const drawList = () => {
+    listHost.innerHTML = '';
+    const card = el('div', { class: 'card-plain' });
+    card.append(el('h2', {}, 'Uptime goals'),
+      el('p', { class: 'sub' },
+        'Set the availability each group or target should reach. The Availability report then shows pass / fail and how much of this month’s downtime budget is left. ' +
+        'A target follows the most specific goal that covers it: its own, else its group’s, else the default.'));
+    if (!data.goals.length) card.append(el('p', { class: 'note' }, 'No goals yet - add one below (99.9 % is a common start).'));
+    else {
+      const tbl = el('table', { class: 'data' },
+        el('thead', {}, el('tr', {}, ...['Applies to', 'Goal', 'Allowed downtime', 'Note', ''].map(h => el('th', {}, h)))));
+      const tb = el('tbody');
+      for (const g of data.goals) {
+        tb.append(el('tr', {},
+          el('td', {}, el('strong', {}, scopeLabel(g.path))),
+          el('td', { class: 'num' }, g.target + ' %'),
+          el('td', { class: 'num' }, fmtDur(g.allowedPerMonthSec) + ' / 30 days'),
+          el('td', {}, g.note || ''),
+          el('td', {}, el('div', { class: 'row-actions' },
+            el('button', { class: 'chip', onclick: () => drawForm(g) }, 'Edit'),
+            el('button', { class: 'chip danger', onclick: () => remove(g) }, 'Delete')))));
+      }
+      tbl.append(tb);
+      card.append(el('div', { class: 'table-scroll' }, tbl));
+    }
+    listHost.append(card);
+  };
+
+  async function remove(g) {
+    if (!confirm(`Remove the goal for ${scopeLabel(g.path)}?`)) return;
+    try { data = await D.post('/goals/delete', { path: g.path }); D.toast('Goal removed.'); drawList(); }
+    catch (e) { D.toast(e.message, true); }
+  }
+
+  const drawForm = (g) => {
+    formHost.innerHTML = '';
+    const tree = flatTree();
+    const scope = el('select', { class: 'input' },
+      el('option', { value: '/' }, 'Everything (default)'),
+      ...tree.map(t => el('option', { value: t.path }, `${'  '.repeat(t.depth)}${t.label}${t.isLeaf ? '' : '  (group)'}`)));
+    scope.value = g ? g.path : '/';
+    const target = D.input({ type: 'number', step: '0.001', min: '50', max: '99.9999', value: g ? g.target : 99.9 });
+    const note = D.input({ placeholder: 'optional, e.g. "customer SLA"', value: g && g.note ? g.note : '', maxlength: '200' });
+    const hint = el('span', { class: 'field-help' });
+    const upd = () => {
+      const t = parseFloat(target.value);
+      hint.textContent = isFinite(t) && t >= 50 && t < 100 ? `Allows about ${fmtDur(allowedDowntime(t))} of downtime per 30-day month.` : 'Enter a percentage between 50 and 99.9999.';
+    };
+    target.addEventListener('input', upd);
+    const presets = el('div', { class: 'seg', style: 'flex-wrap:wrap' },
+      ...GOAL_PRESETS.map(p => el('button', { onclick: () => { target.value = p; upd(); } }, p + ' %')));
+    const res = D.resultBox();
+    formHost.append(el('div', { class: 'card-plain rule-editor' },
+      el('h2', {}, g ? 'Edit goal' : 'Add a goal'),
+      el('div', { class: 'form-grid' },
+        D.field('Applies to', scope, 'a group covers every target below it'),
+        D.field('Availability goal (%)', el('div', {}, target, hint)),
+        D.field('Note', note)),
+      presets,
+      el('div', { class: 'modal-actions' },
+        el('button', { class: 'chip', onclick: () => { formHost.innerHTML = ''; } }, 'Cancel'),
+        el('button', { class: 'chip on', onclick: async (e) => {
+          const btn = e.currentTarget; btn.disabled = true;
+          try {
+            data = await D.post('/goals', { path: scope.value, target: target.value, note: note.value });
+            D.toast('Goal saved.'); formHost.innerHTML = ''; drawList();
+          } catch (err) { D.showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); btn.disabled = false; }
+        } }, 'Save goal')),
+      res));
+    upd();
+  };
+
+  drawList();
+  drawForm(null);
+}
+
+// report cells -------------------------------------------------------------------
+
+function goalCell(row) {
+  const { el } = D;
+  if (row.goal == null) return el('span', { class: 'sub' }, '–');
+  const badge = row.meets == null ? null
+    : el('span', { class: 'statusbadge ' + (row.meets ? 'ok' : 'critical') }, el('span', { class: 'dot' }), row.meets ? 'Meets' : 'Misses');
+  return el('div', {}, el('span', { class: 'num', style: 'margin-right:6px' }, row.goal + ' %'), badge);
+}
+
+function budgetCell(row) {
+  const { el } = D;
+  const b = row.budget;
+  if (!b) return el('span', { class: 'sub' }, row.goal == null ? '–' : 'no data yet');
+  const cls = b.status === 'breached' ? 'critical' : b.status === 'at_risk' ? 'warning' : 'ok';
+  const pct = Math.max(0, Math.min(100, b.usedPct));
+  const text = b.remainingSec >= 0 ? `${fmtDur(b.remainingSec)} left of ${fmtDur(b.budgetSec)}` : `over budget by ${fmtDur(-b.remainingSec)}`;
+  const tip = `used ${fmtDur(b.usedSec)} of ${fmtDur(b.budgetSec)}; at this pace the month ends at ${fmtDur(b.projectedSec)}`;
+  return el('div', { class: 'availbar', title: tip },
+    el('span', { class: 'track' }, el('i', { class: cls, style: `width:${pct}%` })),
+    el('span', { class: 'budget-text' }, text));
+}
+
+// ============================================================================
+// Settings -> Backup
+// ============================================================================
+
+const BACKUP_GROUPS = [
+  ['config', 'Configuration', 'Targets, Alerts, Probes, Database, General, Presentation, Slaves, pathnames - validated with smokeping --check first'],
+  ['state', 'Acknowledgements, maintenance windows, uptime goals', ''],
+  ['history', 'Incident history', 'replaces the current history'],
+  ['secrets', 'Credentials', 'mail passwords / OAuth secrets and webhook URLs'],
+];
+
+const stampName = () => {
+  const d = new Date();
+  return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}`;
+};
+const fmtBytes = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+
+export function paneBackup(pane) {
+  const { el } = D;
+
+  // --- download ------------------------------------------------------------
+  const secrets = el('input', { type: 'checkbox' });
+  const dres = D.resultBox();
+  pane.append(el('div', { class: 'card-plain' },
+    el('h2', {}, 'Download a backup'),
+    el('p', { class: 'sub' },
+      'One file with your SmokePing configuration, acknowledgements, maintenance windows, uptime goals and the incident history. ' +
+      'It does not include the measurement data (the RRD files in /data - back that folder up separately), logs or the login password.'),
+    el('label', { class: 'switch' }, secrets, ' include credentials (mail passwords, OAuth secrets, webhook URLs)'),
+    el('p', { class: 'field-help' }, 'Leave this off unless you need a full disaster-recovery copy. A backup with credentials must be kept as safe as the passwords themselves.'),
+    el('div', { class: 'modal-actions', style: 'justify-content:flex-start' },
+      el('button', { class: 'chip on', onclick: async (e) => {
+        const btn = e.currentTarget; btn.disabled = true;
+        try {
+          const arch = await D.api('/backup?secrets=' + (secrets.checked ? '1' : '0'), { timeout: 90_000 });
+          D.downloadBlob(JSON.stringify(arch, null, 1), `modern-smokeping-backup-${stampName()}.json`, 'application/json');
+          D.showResult(dres, { ok: true }, `Downloaded ${arch.files.length} files (${fmtBytes(arch.files.reduce((n, f) => n + f.bytes, 0))}).`);
+        } catch (err) { D.showResult(dres, { ok: false, error: err.message }); }
+        btn.disabled = false;
+      } }, 'Download backup')),
+    dres));
+
+  // --- restore -------------------------------------------------------------
+  const fileIn = el('input', { type: 'file', accept: '.json,application/json', class: 'input' });
+  const preview = el('div');
+  pane.append(el('div', { class: 'card-plain danger' },
+    el('h2', {}, 'Restore from a backup'),
+    el('p', { class: 'sub' },
+      'Pick a backup file to see exactly what would change before anything is written. Configuration is validated first and a .bak copy of every replaced file is kept.'),
+    fileIn, preview));
+
+  let archive = null;
+  fileIn.addEventListener('change', async () => {
+    preview.innerHTML = ''; archive = null;
+    const f = fileIn.files && fileIn.files[0];
+    if (!f) return;
+    let info;
+    try {
+      archive = JSON.parse(await f.text());
+      info = await D.post('/backup/restore', { archive, dryRun: true });
+    } catch (err) {
+      preview.append(el('pre', { class: 'result bad' }, 'Cannot use that file: ' + (err.message || err)));
+      archive = null; return;
+    }
+    drawPreview(info);
+  });
+
+  function drawPreview(info) {
+    preview.innerHTML = '';
+    const groupsPresent = new Set(info.files.map(f => f.group));
+    const chosen = new Set(BACKUP_GROUPS.filter(([g]) => g !== 'secrets' && groupsPresent.has(g) && info.files.some(f => f.group === g && f.status !== 'same')).map(([g]) => g));
+    preview.append(el('p', { class: 'sub', style: 'margin-top:12px' },
+      `Backup from ${info.host || 'unknown host'}, ${info.created ? new Date(info.created * 1000).toLocaleString() : ''}` +
+      (info.appVersion ? `, version ${info.appVersion}` : '') + (info.includesSecrets ? ' - contains credentials' : '') + '.'));
+    const tbl = el('table', { class: 'data' },
+      el('thead', {}, el('tr', {}, ...['File', 'Part', 'Size', 'Compared to now'].map(h => el('th', {}, h)))));
+    const tb = el('tbody');
+    for (const f of info.files) {
+      tb.append(el('tr', { class: f.status === 'same' ? 'row-muted' : '' },
+        el('td', {}, f.name, f.secret ? el('span', { class: 'statusbadge warning', style: 'margin-left:6px' }, 'credentials') : null),
+        el('td', {}, f.group), el('td', { class: 'num' }, fmtBytes(f.bytes)),
+        el('td', {}, el('span', { class: 'statusbadge ' + (f.status === 'same' ? 'ok' : f.status === 'new' ? 'unknown' : 'warning') }, f.status))));
+    }
+    tbl.append(tb);
+    preview.append(el('div', { class: 'table-scroll' }, tbl));
+
+    const boxes = BACKUP_GROUPS.filter(([g]) => groupsPresent.has(g)).map(([g, label, help]) => {
+      const cb = el('input', { type: 'checkbox' }); cb.checked = chosen.has(g);
+      cb.addEventListener('change', () => { cb.checked ? chosen.add(g) : chosen.delete(g); });
+      return el('label', { class: 'alert-check', title: help }, cb, ' ', label);
+    });
+    const pw = D.input({ type: 'password', placeholder: 'Settings password', autocomplete: 'current-password' });
+    const res = D.resultBox();
+    preview.append(D.field('Restore these parts', el('div', { class: 'alert-checks' }, ...boxes)),
+      D.field('Confirm with your password', pw, 'restoring overwrites the live configuration'),
+      el('div', { class: 'modal-actions' },
+        el('button', { class: 'chip danger', onclick: async (e) => {
+          const btn = e.currentTarget;
+          if (!chosen.size) { D.showResult(res, { ok: false, error: 'Tick at least one part to restore.' }); return; }
+          if (!confirm('Restore the selected parts now? Current files are kept as .bak copies.')) return;
+          btn.disabled = true;
+          try {
+            const r = await D.post('/backup/restore', { archive, parts: [...chosen], password: pw.value });
+            D.showResult(res, { ok: true, ...r }, r.written.length
+              ? `Restored ${r.written.join(', ')}.` : 'Nothing needed restoring - everything already matched.');
+            try { D.state.tree = await D.api('/tree'); D.renderTree(); } catch {}
+          } catch (err) { D.showResult(res, { ok: false, error: err.message, ...(err.data || {}) }); }
+          btn.disabled = false;
+        } }, 'Restore selected')),
+      res);
+  }
 }

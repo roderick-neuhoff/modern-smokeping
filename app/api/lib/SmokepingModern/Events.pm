@@ -203,6 +203,26 @@ sub ingest {
     return scalar @out;
 }
 
+# After the store was replaced from a backup: treat the current log as already
+# consumed and re-derive which incidents are still open, so the next ingest
+# neither replays the log into duplicates nor forgets an open incident.
+sub rebuild_state {
+    my ($ino, $size) = (undef, 0);
+    my $log = log_file();
+    if ($log && (my @st = stat $log)) { ($ino, $size) = ($st[1], $st[7]) }
+    my %open;
+    for my $e (@{ read_store() }) {
+        my $k = key($e->{alert}, $e->{target});
+        if ($e->{event} eq 'raised') { $open{$k} //= $e->{t} }
+        elsif ($e->{event} eq 'cleared') { delete $open{$k} }
+    }
+    open my $sfh, '+>>', state_file() or return 0;
+    flock $sfh, LOCK_EX;
+    _write_state($sfh, { file => $log, ino => $ino, offset => $size, open => \%open, active => {} });
+    close $sfh;
+    return 1;
+}
+
 # ---------------------------------------------------------------------------
 # reading
 # ---------------------------------------------------------------------------

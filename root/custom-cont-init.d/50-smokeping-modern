@@ -35,13 +35,13 @@ else
     # add-target, test mail/notify, reload, and ack writes.
     cat > "$AUTH_INC" <<EOF
 # written by modern-smokeping init - do not edit (set WEBUI_USER/WEBUI_PASS/WEBUI_AUTH instead)
-<LocationMatch "^/api/(settings|config|targets|test|reload|me|oauth|alertdefs)(/|$)">
+<LocationMatch "^/api/(settings|config|targets|test|reload|me|oauth|alertdefs|backup)(/|$)">
     AuthType Basic
     AuthName "SmokePing settings"
     AuthUserFile $HTPASSWD
     Require valid-user
 </LocationMatch>
-<LocationMatch "^/api/(acks|maintenance)(/|$)">
+<LocationMatch "^/api/(acks|maintenance|goals)(/|$)">
     AuthType Basic
     AuthName "SmokePing settings"
     AuthUserFile $HTPASSWD

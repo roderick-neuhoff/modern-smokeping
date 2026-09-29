@@ -324,9 +324,9 @@ function decorateTree() {
   const cur = location.hash.startsWith('#/node/') ? location.hash.slice(6) : null;
   document.querySelectorAll('.tree-row').forEach(r => {
     const nav = r.dataset.navlink;
-    r.classList.toggle('is-current',
+    r.classList.toggle('is-current', !!(
       (cur && r.dataset.path === cur) ||
-      (nav && (nav === '#/' ? (location.hash === '' || location.hash === '#/') : location.hash.startsWith(nav))));
+      (nav && (nav === '#/' ? (location.hash === '' || location.hash === '#/') : location.hash.startsWith(nav)))));
   });
 }
 function cssEsc(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/["\\]/g, '\\$&'); }
@@ -405,11 +405,13 @@ function currentRoute() {
   return { name: 'dashboard' };
 }
 
+// views that fetch their own data and hold form state: a background refresh must not rebuild them
+const NO_REFRESH_VIEWS = new Set(['settings', 'report', 'compare']);
 let lastRouteName = null;
 function render(fromRefresh) {
   const r = currentRoute();
   // a background data refresh must never rebuild Settings (it would wipe the forms)
-  if (fromRefresh && (r.name === 'settings' || r.name === 'report' || r.name === 'compare')) return;
+  if (fromRefresh && NO_REFRESH_VIEWS.has(r.name)) return;
   // leaving Settings after a while: pull fresh data once, but only if we were away long enough to matter
   if (!fromRefresh && lastRouteName === 'settings' && r.name !== 'settings' && Date.now() - lastOk > REFRESH_MS) {
     bumpRefreshClock(); refresh();           // refresh() re-enters render(true) with fresh data
@@ -501,7 +503,7 @@ function healthBanners() {
     const where = f.channel === 'mail' ? '#/settings/mail' : '#/settings/notify';
     out.push(el('a', { class: 'health-banner bad', href: where },
       el('strong', {}, `${name} notifications are failing. `),
-      `The last ${f.fails > 1 ? f.fails + ' sends' : 'send'} failed (${f.lastError || 'error'}), ${ago(f.lastFail)}` +
+      `The last ${f.fails > 1 ? f.fails + ' sends' : 'send'} failed - ${f.lastError || 'error'} - ${ago(f.lastFail)}` +
       (f.lastOk ? `; last success ${ago(f.lastOk)}.` : '; it has never worked.') + ' Alerts sent there are being lost - open Settings to fix it.'));
   }
   return out;
@@ -1732,9 +1734,10 @@ async function boot() {
     return;
   }
   await refresh();
-  // refresh() renders via render(true), which deliberately skips Settings -
-  // so a direct load / reload of #/settings must be rendered here.
-  if (currentRoute().name === 'settings') render(false);
+  // refresh() renders via render(true), which deliberately skips the views
+  // that manage their own data (Settings, Report, Compare) - so a direct load
+  // or reload of one of those must be rendered here.
+  if (NO_REFRESH_VIEWS.has(currentRoute().name)) render(false);
   bumpRefreshClock();
 }
 boot();

@@ -124,6 +124,14 @@ const errors = [];
 window.addEventListener('error', (e) => errors.push('window error: ' + (e.error && e.error.stack || e.message)));
 const noop = () => {};
 const ctxProxy = new Proxy({}, { get: (t, k) => (k in t ? t[k] : (k === 'measureText' ? () => ({ width: 10 }) : noop)), set: (t, k, v) => { t[k] = v; return true; } });
+// Real browsers treat classList.toggle(cls, undefined) as a plain toggle (flip);
+// jsdom treats it as "remove". Behave like Edge/Chrome so that bug class is caught.
+{
+  const orig = window.DOMTokenList.prototype.toggle;
+  window.DOMTokenList.prototype.toggle = function (token, force) {
+    return (arguments.length > 1 && force === undefined) ? orig.call(this, token) : orig.apply(this, arguments);
+  };
+}
 window.HTMLCanvasElement.prototype.getContext = () => ctxProxy;
 window.HTMLCanvasElement.prototype.toDataURL = () => 'data:,';
 window.Element.prototype.getBoundingClientRect = function () { return { left: 0, top: 0, width: 800, height: 320, right: 800, bottom: 320 }; };
@@ -137,7 +145,7 @@ window.fetch = async (url, init) => {
   const status = body && body.__status || 200;
   return { ok: status < 400, status, json: async () => body };
 };
-window.eval(bundle + '\n;window.__test = { state, render, api, post, refreshNow: () => { lastRefreshAt = 0; return refresh(); } };');
+window.eval(bundle + '\n;window.__test = { state, render, api, post, refreshNow: () => { lastRefreshAt = 0; return refresh(); }, decorateTree };');
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 async function go(hash, wait = 250) {
@@ -419,6 +427,15 @@ ok(/Failing: HTTP 000 \(curl rc=7\) - 4 attempts in a row/.test(text()), 'notify
 ok(/Nothing sent through this channel yet/.test(text()), 'notify pane: unused channel line');
 await go('#/settings/mail', 500);
 ok(/Working - last send (\d+s|1m) ago, 12 sent in total/.test(text()), 'mail pane: delivery status line: ' + ((main().querySelector('.delivery-line') || {}).textContent || 'none'));
+
+// --- sidebar: exactly one highlighted row, and refreshes must not flip it -----------------------------
+await go('#/', 300);
+const current = () => [...window.document.querySelectorAll('.tree-row.is-current')].map(r => r.textContent.trim());
+const h1 = current();
+const seen = [];
+for (let i = 0; i < 3; i++) { window.__test.decorateTree(); seen.push(current().length); }   // one update at a time: a flip shows up
+const h2 = current();
+ok(h1.length === 1 && h1[0] === 'Dashboard' && JSON.stringify(h1) === JSON.stringify(h2) && seen.every(n => n === 1), `sidebar highlight stays on Dashboard across updates: ${JSON.stringify(h1)} -> ${JSON.stringify(seen)} highlighted rows per update`);
 
 // --- other settings tabs still render ------------------------------------------------------------
 for (const tab of ['mail', 'notify', 'targets', 'rules', 'maintenance', 'goals', 'backup', 'config', 'access']) {

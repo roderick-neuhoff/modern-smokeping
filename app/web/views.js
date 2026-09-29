@@ -335,7 +335,7 @@ export function incidentHistory(opts = {}) {
     body.append(el('p', { class: 'note', style: 'padding-bottom:4px' },
       `${last.total} incident${last.total === 1 ? '' : 's'}` + (last.open ? ` · ${last.open} ongoing` : '') +
       (last.avgSec != null ? ` · average ${fmtDur(last.avgSec)}` : '') + (last.longestSec ? ` · longest ${fmtDur(last.longestSec)}` : '')));
-    if (!opts.target && !opts.compact && last.byTarget.length > 1) {
+    if (!opts.target && !opts.compact && last.byTarget.length > 1 && last.byTarget[0].count > 1) {
       body.append(el('div', { class: 'offenders' }, el('span', { class: 'sub' }, 'Most incidents: '),
         ...last.byTarget.slice(0, 5).map(b => el('a', { class: 'chip', href: '#/node' + b.path }, `${b.title} ×${b.count}`))));
     }

@@ -422,8 +422,11 @@ body.wall-mode[data-density="large"] .wall-head { padding: 16px 24px; }
 }
 @media (max-width: 560px) {
   .main { padding: 14px; }
-  .brand span { display: none; }
-  .search input { width: 90px; }
+  .brand span, .brand em { display: none; }
+  .topbar { gap: 8px; padding: 0 10px; }
+  .topbar-tools { gap: 6px; min-width: 0; }
+  .search { min-width: 0; }
+  .search input { width: 100%; min-width: 60px; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation-duration: .001s !important; transition: none !important; } }
 
@@ -433,7 +436,7 @@ body.wall-mode[data-density="large"] .wall-head { padding: 16px 24px; }
 .row-actions { display: flex; gap: 6px; }
 .offenders { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 0 14px 10px; }
 .offenders .chip { text-decoration: none; }
-.pattern-sub { font-family: var(--mono); }
+.pattern-sub { font-family: var(--mono); white-space: normal; overflow-wrap: anywhere; }
 
 .stat.kpi-ok .v { color: var(--ok); }
 .stat.kpi-warning .v { color: var(--warn); }

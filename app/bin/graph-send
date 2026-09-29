@@ -31,7 +31,9 @@ my $CURL  = '/usr/bin/curl';
 my $J     = JSON::PP->new->utf8;
 
 sub logline { my $l = shift; if (open my $fh, '>>', $LOG) { print $fh scalar(localtime), " graph-send: $l\n"; close $fh } }
-sub fail    { my ($m, $rc) = @_; print STDERR "graph-send: $m\n"; logline("FAILED: $m"); exit($rc // 75) }
+my $IS_TEST = 0;
+sub delivery { my ($ok, $m) = @_; eval { require SmokepingModern::Delivery; SmokepingModern::Delivery::record('mail', $ok, $m, test => $IS_TEST) } }
+sub fail    { my ($m, $rc) = @_; print STDERR "graph-send: $m\n"; logline("FAILED: $m"); delivery(0, $m); exit($rc // 75) }
 sub urlenc  { my $s = shift // ''; $s =~ s/([^A-Za-z0-9_.\@~-])/sprintf('%%%02X', ord $1)/ge; $s }
 
 # run @cmd, feed $stdin, return (stdout, exit-code)
@@ -87,6 +89,7 @@ if ($tflag) {
 fail('no valid recipients', 64) unless @rcpt;
 
 my $subject = defined $H{subject} ? $H{subject} : '(no subject)';
+$IS_TEST = $subject =~ /\bTEST\b/ ? 1 : 0;
 my $ctype   = ($H{'content-type'} // '') =~ /html/i ? 'HTML' : 'Text';
 $body =~ s/\s+\z//;
 
@@ -181,7 +184,7 @@ sub send_once {
 my ($code, $out) = send_once(cached_token() || fetch_token());
 if ($code eq '401') { unlink $CACHE; ($code, $out) = send_once(fetch_token()); }
 
-if ($code eq '202') { logline("sent to @rcpt"); exit 0; }
+if ($code eq '202') { logline("sent to @rcpt"); delivery(1, "sent to @rcpt"); exit 0; }
 my $msg = eval { $J->decode($out)->{error}{message} } // (length $out ? substr($out, 0, 300) : "HTTP $code");
 if ($code eq '403') {
     $msg .= "  [Exchange is blocking this app for $cfg->{account}: check Test-ApplicationAccessPolicy,"

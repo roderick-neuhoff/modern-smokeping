@@ -1,0 +1,19 @@
+#!/usr/bin/perl
+# delivery-record <channel> <exit-code>   (message on stdin, to spot tests)
+# Records a send outcome for shell senders (bin/sendmail); see Delivery.pm.
+use strict;
+use warnings;
+use FindBin ();
+use lib "$FindBin::RealBin/../api/lib";
+use SmokepingModern::Delivery ();
+
+my ($ch, $rc) = @ARGV;
+my $test = 0;
+while (my $l = <STDIN>) {
+    last if $l =~ /^\r?\n$/;
+    $test = 1 if $l =~ /^Subject:.*\bTEST\b/i;
+}
+my %why = (64 => 'bad recipient', 65 => 'bad message', 69 => 'server unavailable', 75 => 'temporary failure (network / server)',
+           77 => 'authentication or permission refused', 78 => 'mail not configured');
+SmokepingModern::Delivery::record($ch, ($rc // 1) == 0 ? 1 : 0,
+    ($rc // 1) == 0 ? 'sent' : 'msmtp exit ' . $rc . ($why{$rc} ? " - $why{$rc}" : '') . ' (see /config/log/msmtp.log)', test => $test);

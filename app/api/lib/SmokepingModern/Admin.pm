@@ -308,7 +308,9 @@ sub settings_get {
     };
     my $hdr = _read_alert_header();
     my $notify = _read_notify();
+    my $delivery = eval { require SmokepingModern::Delivery; SmokepingModern::Delivery::load()->{channels} } || {};
     return {
+        delivery => $delivery,
         smtp     => $smtp,
         alerts   => { to => $hdr->{emails}, from => $hdr->{from}, webhooks => $hdr->{webhooks}, extra => $hdr->{pipes} },
         notify   => $notify,
@@ -524,7 +526,7 @@ sub _b64url { my $s = MIME::Base64::encode_base64($_[0], ''); $s =~ tr{+/}{-_}; 
 sub _rand_str {
     my $n = shift || 48;
     open my $r, '<', '/dev/urandom' or die { status => 500, error => 'no urandom' };
-    read $r, my $buf, $n; close $r;
+    my $buf; read $r, $buf, $n; close $r;
     return _b64url($buf);
 }
 

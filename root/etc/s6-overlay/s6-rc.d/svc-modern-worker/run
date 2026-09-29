@@ -1,0 +1,5 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Runs bin/worker once a minute (incident history + "polling stopped" watch).
+# A short perl run each time instead of a resident daemon keeps memory flat.
+exec s6-setuidgid abc /bin/sh -c 'sleep 30; while true; do /usr/bin/perl /app/smokeping-modern/bin/worker; sleep 60; done'

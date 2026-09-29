@@ -27,6 +27,7 @@ use Smokeping;
 use SmokepingModern::Events ();
 use SmokepingModern::Maintenance ();
 use SmokepingModern::Goals ();
+use SmokepingModern::Delivery ();
 
 # stamped from the git tag at image build time (see Dockerfile); "dev" when run from a checkout
 our $VERSION = '__APP_VERSION__';
@@ -114,12 +115,23 @@ sub run {
     _emit(200, $data);
 }
 
+# what the background worker (bin/worker) last reported
+sub _worker_state {
+    my $f = ($ENV{SMOKEPING_CONFIG_DIR} || '/config') . '/modern-worker.json';
+    open my $fh, '<', $f or return undef;
+    local $/;
+    my $d = eval { $JSON->decode(<$fh>) };
+    close $fh;
+    return undef unless ref $d eq 'HASH';
+    return { lastRun => $d->{lastRun}, ok => _bool(($d->{lastRun} // 0) > time - 300) };
+}
+
 sub _safe_key { my $k = join '.', map { $_ // '' } @_; $k =~ s/[^A-Za-z0-9._-]+/_/g; return $k }
 
 # same idea as _cached but for plain text (no JSON round trip)
 sub _cached_text {
     my ($key, $ttl, $build) = @_;
-    my $file = "/tmp/spm-cache-$key.txt";
+    my $file = _cache_dir() . "/spm-cache-$key.txt";
     if (-f $file && (time - (stat $file)[9]) < $ttl && open my $fh, '<', $file) {
         local $/; my $t = <$fh>; close $fh; return $t if defined $t && length $t;
     }
@@ -153,13 +165,14 @@ sub _read_body {
 }
 
 # after a config write the cached tree/summary/alerts are stale
-sub _invalidate_cache { unlink glob('/tmp/spm-cache-*.json'); }
+sub _invalidate_cache { unlink glob(_cache_dir() . '/spm-cache-*.json'); }
+sub _cache_dir { $ENV{SPM_CACHE_DIR} || '/tmp' }
 
 # tiny on-disk response cache so a room full of dashboards does not stampede
 # the rrd files. keyed by route; node detail is never cached.
 sub _cached {
     my ($key, $ttl, $build) = @_;
-    my $file = "/tmp/spm-cache-$key.json";
+    my $file = _cache_dir() . "/spm-cache-$key.json";
     if ($ttl && -f $file && (time - (stat $file)[9]) < $ttl) {
         if (open my $fh, '<', $file) {
             local $/;
@@ -456,12 +469,17 @@ sub summary {
 
     my (@nodes, %counts);
     $counts{$_} = 0 for qw(ok warning critical down unknown maintenance);
+    my $stale_after = 10 * _step();
+    $stale_after = 300 if $stale_after < 300;
+    my ($newest, $nstale, $nrrd) = (0, 0, 0);
 
     _each_leaf($cfg->{Targets}, '', sub {
         my ($n, $p) = @_;
         my $rrd = _rrd_for($p);
-        my ($lossNow, $medNow, $medAvg, $stddev, $spark);
+        my ($lossNow, $medNow, $medAvg, $stddev, $spark, $last);
         if (-f $rrd) {
+            $last = RRDs::last($rrd);
+            $last = undef if RRDs::error();
             my $pings = _pings_for($n);
             my $s = $si->stat_node({ path => $p, pings => $pings }, "-${secs}s", 'now');
             $lossNow = _num($s->{loss_now});
@@ -484,12 +502,21 @@ sub summary {
             $sev = 'warning'  if $sev eq 'ok' || $sev eq 'unknown';
             $sev = 'critical' if $as eq 'critical' && $sev ne 'down';
         }
+        # SmokePing rewrites every rrd each step, even for an unreachable host;
+        # an rrd that stopped moving means nothing is measuring it any more
+        my $stale = defined $last && ($now - $last) > $stale_after ? 1 : 0;
+        $sev = 'unknown' if $stale;
         my $mw = SmokepingModern::Maintenance::covers($p, $now, $maint);
         $counts{ $mw ? 'maintenance' : $sev }++;      # a planned window is not a problem
+        $newest = $last if defined $last && $last > $newest;
+        $nstale++ if $stale;
+        $nrrd++ if defined $last;
 
         push @nodes, {
             path        => $p,
             maintenance => $mw ? { id => $mw->{id}, title => $mw->{title}, until => $mw->{until}, note => $mw->{note} } : undef,
+            lastUpdate  => $last,
+            stale       => _bool($stale),
             title       => $n->{title} // (split m{/}, $p)[-1],
             host        => $n->{host},
             severity    => $sev,
@@ -511,6 +538,14 @@ sub summary {
         total        => scalar @nodes,
         counts       => \%counts,
         maintenance  => [ SmokepingModern::Maintenance::active($now, $maint) ],
+        polling      => {
+            lastUpdate  => ($newest || undef),
+            staleAfter  => $stale_after,
+            staleTargets => $nstale,
+            stopped     => _bool($nrrd && $nstale == $nrrd),     # nothing is being measured at all
+        },
+        delivery     => SmokepingModern::Delivery::failing(),
+        worker       => _worker_state(),
         nodes        => \@nodes,
         worstLoss    => [ grep { ($_->{lossNowPct}  // 0) > 0 } @by_loss[0 .. 7] ],
         worstLatency => [ grep { defined $_->{medianNowMs} } @by_latency[0 .. 7] ],
@@ -934,7 +969,7 @@ sub _report_core {
         my %col; $col{ $names->[$_] } = $_ for 0 .. $#$names;
         return unless defined $col{loss} && defined $col{median};
 
-        my ($known, $downSlots, $lossSum, @med, %hour);
+        my ($known, $downSlots, $lossSum, @med, %hour) = (0, 0, 0);
         my $maintSlots = 0;
         my @iv = SmokepingModern::Maintenance::intervals($p, $start - $step, $now + $step, $maint);
         my $ts = $start;
@@ -1077,6 +1112,13 @@ sub metrics_text {
     $emit->('smokeping_target_status', 'gauge', 'Target status: 0 ok, 1 warning, 2 critical, 3 down.', \@st);
     $emit->('smokeping_target_maintenance', 'gauge', 'Target is inside a planned maintenance window (1) - silence alerts with: ... unless on(path) smokeping_target_maintenance == 1.', \@mt);
     $emit->('smokeping_maintenance_windows_active', 'gauge', 'Maintenance windows in effect now.', [ ['', scalar @{ $s->{maintenance} || [] }] ]);
+    $emit->('smokeping_target_stale', 'gauge', 'Target RRD has not been updated recently - nothing is measuring it (1).',
+            [ map { [ _lbl(path => $_->{path}, title => $_->{title}, host => $_->{host}), $_->{stale} ? 1 : 0 ] } @{ $s->{nodes} } ]);
+    $emit->('smokeping_polling_stopped', 'gauge', 'SmokePing has stopped recording measurements for every target (1).',
+            [ ['', ($s->{polling} && $s->{polling}{stopped}) ? 1 : 0] ]);
+    $emit->('smokeping_notification_channel_failing', 'gauge', 'Consecutive failed sends per notification channel (0 = last send worked).',
+            [ map { [ _lbl(channel => $_), (SmokepingModern::Delivery::load()->{channels}{$_}{fails} // 0) + 0 ] }
+              sort keys %{ SmokepingModern::Delivery::load()->{channels} } ]);
     $emit->('smokeping_target_has_data', 'gauge', 'Target has an RRD with data.', \@dat);
     $emit->('smokeping_targets', 'gauge', 'Targets by status.',
             [ map { [ _lbl(status => $_), $s->{counts}{$_} + 0 ] } sort keys %{ $s->{counts} } ]);

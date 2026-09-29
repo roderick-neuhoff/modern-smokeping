@@ -82,7 +82,8 @@ my $body  = join "\n",
     (defined $dur ? "Outage: $dur" : ()),
     ($loss ? "Loss:   $loss" : ()),
     ($rtt  ? "RTT:    $rtt"  : ()),
-    "Time:   $when";
+    "Time:   $when",
+    (length($ENV{SPM_MESSAGE} // '') ? ('', $ENV{SPM_MESSAGE}) : ());
 my $emoji = $state eq 'CLEARED' ? "\x{2705}" : "\x{1F6A8}";
 my $title = "$emoji SmokePing $state: $target" . (defined $dur ? " - back after $dur" : '');
 
@@ -93,6 +94,7 @@ for my $ch (sort keys %$cfg) {
     next if $only && $ch ne $only;
     my ($ok, $msg) = eval { send_channel($ch, $c) };
     ($ok, $msg) = (0, "error: $@") if $@;
+    eval { require SmokepingModern::Delivery; SmokepingModern::Delivery::record($ch, $ok, $msg, test => $test) };
     push @results, sprintf('%-8s %s %s', $ch, ($ok ? 'ok  ' : 'FAIL'), $msg // '');
 }
 push @results, 'no channels enabled' unless @results;

@@ -1,0 +1,109 @@
+#!/usr/bin/perl
+# modern-smokeping background worker - run once a minute by svc-modern-worker.
+#
+#   1. tails the SmokePing log into the persistent incident store, so history
+#      stays complete even when nobody has the UI open
+#   2. watches that SmokePing is still recording measurements; when no RRD has
+#      been updated for a while it sends a "polling stopped" notice (webhooks +
+#      e-mail, same recipients as the alerts) and a recovery notice afterwards
+#
+# Deliberately short-lived and light: it loads no SmokePing modules and exits.
+use strict;
+use warnings;
+use FindBin ();
+use lib "$FindBin::RealBin/../api/lib";
+use JSON::PP ();
+use POSIX qw(strftime);
+use SmokepingModern::Events ();
+
+my $CONFIG = SmokepingModern::Events::config_dir();
+my $DATA   = $ENV{SMOKEPING_DATA_DIR} || '/data';
+my $STATE  = $ENV{SPM_WORKER_STATE} || "$CONFIG/modern-worker.json";
+my $NOTIFY = "$FindBin::RealBin/notify";
+my $J = JSON::PP->new->utf8->canonical(1);
+my $now = time;
+
+sub slurp { my $f = shift; open my $fh, '<', $f or return undef; local $/; my $s = <$fh>; close $fh; $s }
+
+my $state = eval { $J->decode(slurp($STATE) // '{}') } || {};
+
+# --- 1. incident history ------------------------------------------------------
+my $added = eval { SmokepingModern::Events::ingest() } // 0;
+
+# --- 2. is SmokePing still measuring? -------------------------------------------
+my $step = ((slurp("$CONFIG/Database") // '') =~ /^\s*step\s*=\s*(\d+)/m) ? $1 : 300;
+my $threshold = 10 * $step;
+$threshold = 300 if $threshold < 300;
+
+my ($newest, $count) = (0, 0);
+my @dirs = ($DATA);
+while (my $d = shift @dirs) {
+    opendir my $dh, $d or next;
+    for my $e (readdir $dh) {
+        next if $e =~ /^\./ || $e =~ /^__/;
+        my $p = "$d/$e";
+        if (-d $p) { push @dirs, $p; next }
+        next unless $e =~ /\.rrd$/;
+        my $m = (stat $p)[9] or next;          # SmokePing rewrites every rrd each step
+        $count++;
+        $newest = $m if $m > $newest;
+    }
+    closedir $dh;
+}
+
+my $stale = $count && ($now - $newest) > $threshold;
+# don't cry wolf in the first minutes after a (re)start
+my $uptime = (split ' ', (slurp('/proc/uptime') // '0'))[0] || 0;
+$stale = 0 if $stale && $uptime < $threshold && $newest > $now - $uptime - $threshold;
+
+if ($stale && !$state->{pollingStopped}) {
+    $state->{pollingStopped} = $newest;
+    announce(1, "SmokePing has not recorded a measurement since " . strftime('%Y-%m-%d %H:%M:%S', localtime $newest)
+        . " (" . SmokepingModern::Events::fmt_duration($now - $newest) . " ago). The graphs and alerts are frozen until it is running again.");
+}
+elsif (!$stale && $state->{pollingStopped}) {
+    my $since = delete $state->{pollingStopped};
+    announce(0, "SmokePing is recording measurements again - back after " . SmokepingModern::Events::fmt_duration($now - $since) . ".");
+}
+
+$state->{lastRun} = $now;
+$state->{eventsAdded} = $added + 0;
+$state->{newestSample} = $newest || undef;
+$state->{rrdCount} = $count;
+if (open my $fh, '>', "$STATE.$$") { print $fh $J->encode($state); close $fh; rename "$STATE.$$", $STATE }
+exit 0;
+
+# ---------------------------------------------------------------------------------
+# a notice through the same routes as the alerts: every "|script" in the Alerts
+# "to" line (normally bin/notify -> webhooks) and every e-mail address.
+sub announce {
+    my ($raised, $text) = @_;
+    my $what = $raised ? 'raised' : 'cleared';
+    my $alerts = slurp("$CONFIG/Alerts") // '';
+    my ($head) = split /^\s*\+/m, $alerts, 2;
+    my ($to)   = ($head // '') =~ /^\s*to\s*=\s*(.*?)\s*$/m;
+    my ($from) = ($head // '') =~ /^\s*from\s*=\s*(.*?)\s*$/m;
+    my @addr = grep { length } map { s/^\s+|\s+$//gr } split /,/, ($to // '');
+
+    my @mail = grep { !/^\|/ && /\@/ && $_ ne 'root@localhost' } @addr;
+    for my $pipe (grep { /^\|/ } @addr) {
+        (my $cmd = $pipe) =~ s/^\|//;
+        next unless -x $cmd;
+        local $ENV{SPM_MESSAGE} = $text;
+        system $cmd, 'polling', 'SmokePing', '', '', '', ($raised ? 1 : 0);
+    }
+    if (@mail) {
+        my ($sendmail) = (slurp("$CONFIG/pathnames") // '') =~ /^\s*sendmail\s*=\s*(\S+)/m;
+        $sendmail ||= '/usr/sbin/sendmail';
+        if (-x $sendmail && open my $sm, '|-', $sendmail, '-f', ($from || 'smokeping@localhost'), @mail) {
+            print $sm "To: " . join(', ', @mail) . "\nFrom: " . ($from || 'smokeping@localhost') . "\n"
+                . "Subject: [SmokeAlert] polling was $what on SmokePing\n"
+                . "Content-Type: text/plain; charset=utf-8\n\n$text\n";
+            close $sm;
+        }
+    }
+    if (open my $lf, '>>', "$CONFIG/log/notify.log") {
+        print $lf strftime('%Y-%m-%d %H:%M:%S', localtime) . " SmokePing: polling " . uc($what) . " - $text\n";
+        close $lf;
+    }
+}

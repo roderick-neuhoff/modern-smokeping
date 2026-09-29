@@ -1,7 +1,7 @@
 // SmokePing Modern UI - app shell, router and views.
 import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs, seriesToCsv, toPngDataUrl } from './chart.js';
 import { diffLines } from './diff.js';
-import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules, paneMaintenance, paneGoals, paneBackup, fmtUntil } from './views.js';
+import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules, paneMaintenance, paneGoals, paneBackup, fmtUntil, fmtDur } from './views.js';
 
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
 const REFRESH_MS = 15_000;
@@ -460,7 +460,7 @@ function renderDashboard() {
     sortControl(),
   ));
 
-  main.append(...maintenanceBanners());
+  main.append(...healthBanners(), ...maintenanceBanners());
 
   if (!nodes.length) { main.append(el('div', { class: 'empty' }, 'No targets match your filter.')); return; }
 
@@ -475,6 +475,36 @@ function renderDashboard() {
   requestAnimationFrame(() => {
     for (const [cv, spark] of draws) if (cv && spark) drawSpark(cv, spark);
   });
+}
+
+const CHANNEL_LABEL = { mail: 'E-mail', discord: 'Discord', slack: 'Slack', telegram: 'Telegram', ntfy: 'ntfy', gotify: 'Gotify', webhook: 'Generic webhook' };
+function sinceText(ts) { return ts ? fmtDur(Date.now() / 1000 - ts) : '?'; }
+
+// things that mean "you are not being told about problems": SmokePing stopped
+// measuring, or notifications are failing to go out
+function healthBanners() {
+  const s = state.summary;
+  if (!s) return [];
+  const out = [];
+  const pol = s.polling || {};
+  if (pol.stopped) {
+    out.push(el('div', { class: 'health-banner bad', role: 'alert' },
+      el('strong', {}, 'SmokePing has stopped measuring. '),
+      `No target has recorded a measurement for ${sinceText(pol.lastUpdate)}. Graphs and alerts are frozen until the SmokePing process is running again (check the container log).`));
+  } else if (pol.staleTargets) {
+    out.push(el('div', { class: 'health-banner warn' },
+      el('strong', {}, `${pol.staleTargets} target${pol.staleTargets === 1 ? ' is' : 's are'} not being measured. `),
+      'Their graphs stopped updating - usually a probe that is not defined or not working. They are marked "No data" below.'));
+  }
+  for (const f of (s.delivery || [])) {
+    const name = CHANNEL_LABEL[f.channel] || f.channel;
+    const where = f.channel === 'mail' ? '#/settings/mail' : '#/settings/notify';
+    out.push(el('a', { class: 'health-banner bad', href: where },
+      el('strong', {}, `${name} notifications are failing. `),
+      `The last ${f.fails > 1 ? f.fails + ' sends' : 'send'} failed (${f.lastError || 'error'}), ${ago(f.lastFail)}` +
+      (f.lastOk ? `; last success ${ago(f.lastOk)}.` : '; it has never worked.') + ' Alerts sent there are being lost - open Settings to fix it.'));
+  }
+  return out;
 }
 
 // one banner per maintenance window in effect right now
@@ -512,6 +542,7 @@ function card(n) {
     el('span', {}, 'loss ', el('b', {}, fmtPct(n.lossNowPct))),
     n.stddevMs != null ? el('span', {}, 'jitter ', el('b', {}, fmtMs(n.stddevMs))) : null,
   ));
+  if (n.stale) c.append(el('div', { class: 'card-stale' }, `no measurement for ${sinceText(n.lastUpdate)}`));
   return c;
 }
 
@@ -667,6 +698,8 @@ function renderAlerts(sevFilter) {
     el('h1', {}, 'Alerts'),
     el('span', { class: 'sub' }, `${active.length} active · checked ${ago(a.generated)}`),
   ));
+
+  main.append(...healthBanners());
 
   const sevChips = ['all', 'critical', 'down', 'warning'];
   main.append(el('div', { class: 'alert-filters' },
@@ -1189,6 +1222,7 @@ function paneMail(pane) {
 
   pane.append(el('div', { class: 'card-plain' },
     el('h2', {}, 'Outgoing mail (SMTP)'),
+    deliveryLine((settingsData.delivery || {}).mail),
     el('p', { class: 'sub' }, 'Alert e-mails are sent through msmtp. Gmail and Microsoft 365 both prefer OAuth2 over passwords; an app password still works for Gmail accounts with 2-step verification.'),
     el('div', { class: 'form-grid' },
       field('Sign-in method', f.method),
@@ -1253,12 +1287,25 @@ const CHANNELS = [
   ['webhook',  'Generic webhook', [['url', 'URL (JSON POST)', 'https://…'], ['secret', 'X-Webhook-Secret header (optional)', '']]],
 ];
 
+// "last sent 5m ago" / "failing: HTTP 000 (curl rc=7), 3 attempts" under a channel heading
+function deliveryLine(dl) {
+  if (!dl || !dl.lastAttempt) return el('p', { class: 'delivery-line' }, 'Nothing sent through this channel yet.');
+  if (dl.fails) {
+    return el('p', { class: 'delivery-line bad' },
+      `Failing: ${dl.lastError || 'error'} - ${dl.fails} attempt${dl.fails === 1 ? '' : 's'} in a row, last ${ago(dl.lastFail)}` +
+      (dl.lastOk ? ` (last worked ${ago(dl.lastOk)})` : ' (never worked)') + '.');
+  }
+  return el('p', { class: 'delivery-line ok' }, `Working - last ${dl.test ? 'test ' : ''}send ${ago(dl.lastOk)}, ${dl.sent} sent in total.`);
+}
+
 function paneNotify(pane) {
   const n = settingsData.notify || {};
   const res = resultBox();
   const forms = {};
+  const deliv = settingsData.delivery || {};
   const cards = CHANNELS.map(([key, label, fields]) => {
     const c = n[key] || {};
+    const dl = deliv[key];
     const en = el('input', { type: 'checkbox' }); en.checked = c.enabled === true;
     const inputs = {};
     const tRes = resultBox();
@@ -1267,6 +1314,7 @@ function paneNotify(pane) {
     return el('div', { class: 'card-plain' },
       el('div', { class: 'card-top' }, el('h2', { style: 'margin:0' }, label), el('span', { class: 'spacer', style: 'flex:1' }),
         el('label', { class: 'switch' }, en, ' enabled')),
+      deliveryLine(dl),
       el('div', { class: 'form-grid' }, ...fields.map(([fk, fl]) => field(fl, inputs[fk]))),
       el('div', { class: 'modal-actions' }, el('button', { class: 'chip', onclick: async (e) => {
         const btn = e.currentTarget;
@@ -1565,6 +1613,7 @@ function renderWall() {
   const nodes = problemsOnly ? allNodes.filter(n => n.severity !== 'ok' && n.severity !== 'maintenance') : allNodes;
   main.innerHTML = '';
   document.body.dataset.density = state.wallDensity;
+  if (s.polling && s.polling.stopped) main.append(...healthBanners().slice(0, 1));
   main.append(el('div', { class: 'wall-head ' + worst },
     el('span', { class: 'wall-title' }, state.tree && state.tree.title || 'SmokePing', el('em', { class: 'wall-version' }, APP_VERSION)),
     el('span', { class: 'wall-counts' },

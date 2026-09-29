@@ -17,3 +17,6 @@ if WINDOW=$(/usr/bin/perl /app/smokeping-modern/bin/maint-check < "$TMP" 2>/dev/
     exit 0
 fi
 /usr/bin/msmtp -C "$CONF" "$@" < "$TMP"
+RC=$?
+/usr/bin/perl /app/smokeping-modern/bin/delivery-record mail "$RC" < "$TMP" 2>/dev/null
+exit $RC

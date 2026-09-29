@@ -1,0 +1,8 @@
+{
+  "name": "modern-smokeping-webtest",
+  "private": true,
+  "description": "Runs the real SPA in jsdom and checks every view (node t/web/rendercheck.mjs)",
+  "type": "module",
+  "scripts": { "test": "node rendercheck.mjs" },
+  "dependencies": { "jsdom": "^26.1.0" }
+}

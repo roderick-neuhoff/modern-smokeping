@@ -3,3 +3,4 @@ data/
 *.rrd
 *.log
 .DS_Store
+node_modules/

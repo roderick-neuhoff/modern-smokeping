@@ -17,6 +17,7 @@ password, write) the same files. The classic CGI stays reachable at
 | Graphs       | pre-rendered PNGs                | live canvas smoke charts, hover readout, drag-zoom  |
 | Alerts       | e-mail / log only                | **alerts page**: live state, persistent incident history with durations, acknowledgements, "back after 4m12s" recovery notices |
 | SLAs         | none                             | **uptime goals** per group / target with pass-fail and a monthly downtime budget; **one-file backup & restore** |
+| Self-checks  | none                             | **"SmokePing stopped measuring" alarm**, per-target *no data* marking, **notification delivery status** (banner when a webhook or mail keeps failing) |
 | Planned work | none                             | **maintenance windows**: silence alerts + leave downtime out of the report, one-off or weekly |
 | Reporting    | none                             | **availability / SLA report** (uptime %, downtime, p95, worst hour, CSV/print), **compare targets** on one chart, Prometheus `/api/metrics` |
 | Config       | edit files by hand               | **settings page**: SMTP, Discord/Telegram/ntfy/…, add & remove targets, **alert-rule form with live preview**, validated config editor |
@@ -343,6 +344,31 @@ container restart.
 
 Auto-refresh is off on this page so it can never wipe a half-filled form.
 
+### Is anybody actually being told? (self-checks)
+
+Two failure modes used to be silent: SmokePing itself stopping (the graphs just go
+flat) and a notification channel that no longer delivers (wrong webhook URL, expired
+mail secret). Both are now watched:
+
+* **Polling stopped** — a small background job (`bin/worker`, run once a minute by
+  the `svc-modern-worker` service; it starts, does its work and exits, so it holds no
+  memory in between) checks that the RRD files keep being written. If nothing has been
+  recorded for 10 poll steps (at least 5 minutes) it sends **"polling was raised on
+  SmokePing"** to the same webhooks and e-mail addresses as your alerts, and a
+  *back after …* notice when measurements resume. The dashboard, alerts page and wall
+  show a red banner meanwhile. A single target that stops updating (e.g. a probe that
+  is not defined) is marked *No data* with "no measurement for 30m" instead of
+  showing its last good value.
+* **Delivery status** — every webhook and e-mail send is recorded
+  (`/config/modern-delivery.json`). Settings → Notifications / E-mail shows
+  *Working — last send 5m ago* or *Failing: HTTP 000 (curl rc=7) — 4 attempts in a row*
+  per channel, and a failing channel puts a banner on the dashboard and alerts page
+  until a send succeeds again.
+* The same worker keeps the **incident history** current even when no browser has the
+  UI open.
+* Prometheus: `smokeping_polling_stopped`, `smokeping_target_stale{path=…}`,
+  `smokeping_notification_channel_failing{channel=…}` (consecutive failures).
+
 ### Recovery notices
 
 When an edge-triggered alert clears, the notification says how long it was down:
@@ -448,6 +474,8 @@ loss and sparkline, plus a status header and clock. Always live (ignores pause).
 | `modern-acks.json` | acknowledgements |
 | `modern-maintenance.json` | maintenance windows |
 | `modern-goals.json` | uptime goals |
+| `modern-delivery.json` | last send result per notification channel |
+| `modern-worker.json` | background worker heartbeat + "polling stopped" state |
 | `modern-events.jsonl`, `modern-events.state` | persistent alert/incident history and its log-tail offset |
 | `log/smokeping.log`, `log/notify.log` | alert history; notifier log |
 | `Targets.bak`, `Alerts.bak`, … | previous version of any file saved through the UI |
@@ -514,6 +542,8 @@ app/api/smokeping-api.cgi       JSON API, runs under mod_fcgid                  
 app/api/lib/SmokepingModern/    Api.pm (read: tree, summary, node, alerts, report, events, metrics)  Admin.pm (write: settings, config, targets, alert rules, acks)
                                 Events.pm (persistent incident store)  Maintenance.pm (windows)  Goals.pm (SLO budgets)  Backup.pm (archive)  AlertRule.pm (minutes <-> SmokePing patterns)
 app/bin/notify                  webhook notifier, invoked by SmokePing as a |script alertee
+app/bin/worker                  once-a-minute job: incident history + "polling stopped" watch (svc-modern-worker)
+app/bin/delivery-record         records e-mail send results for the msmtp path
 app/bin/maint-check             drops alert mail for targets in a maintenance window (used by bin/sendmail)
 app/apache/                     Apache alias / fcgid / rewrite snippet
 root/custom-cont-init.d/        installs the snippet + login on every start
@@ -532,6 +562,18 @@ rather than reimplementing any of it.
 | `GET /api/node?path=&range=` or `&start=&end=` | open |
 | `GET /api/settings` `me` `config/<file>` `alertdefs` | password |
 | `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `alertdefs` `alertdefs/delete` `maintenance` `maintenance/delete` `goals` `goals/delete` `backup` `backup/restore` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |
+
+## Development / tests
+
+```sh
+sh t/run-all.sh                 # every test; the web part needs: cd t/web && npm ci
+```
+
+`t/*.t` exercise the Perl side with SmokePing and RRDs replaced by small stand-ins
+(`t/lib`), so they run anywhere with a stock Perl. `t/web/rendercheck.mjs` loads the
+real single-page app in jsdom against fixture API responses and clicks through every
+view and settings pane. GitHub Actions runs the lot on every push; no image is built
+or published unless they pass.
 
 ## License
 

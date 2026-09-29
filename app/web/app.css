@@ -502,3 +502,13 @@ body.wall-mode[data-density="large"] .wall-head { padding: 16px 24px; }
 /* goals / budgets / backup --------------------------------------------- */
 .budget-text { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
 .availbar .track i.critical { background: var(--crit); }
+
+/* health: polling / delivery ------------------------------------------- */
+.health-banner { display: block; margin-bottom: 12px; padding: 9px 14px; border-radius: 8px; font-size: 13px; color: var(--text); border: 1px solid; }
+a.health-banner:hover { text-decoration: none; }
+.health-banner.bad { background: var(--crit-weak); border-color: var(--crit); }
+.health-banner.warn { background: var(--warn-weak); border-color: var(--warn); }
+.card-stale { font-size: 12px; color: var(--warn); font-weight: 600; }
+.delivery-line { margin: 4px 0 10px; font-size: 12.5px; color: var(--text-faint); }
+.delivery-line.ok { color: var(--ok); }
+.delivery-line.bad { color: var(--crit); font-weight: 600; }

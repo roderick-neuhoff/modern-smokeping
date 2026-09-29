@@ -1115,3 +1115,297 @@ export function paneBackup(pane) {
       res);
   }
 }
+
+// ============================================================================
+// shared outages: several targets failing within minutes of each other
+// ============================================================================
+
+// incidents -> [{ start, end, targets: [path], groups: [title], incidents }]
+// A cluster keeps growing while the next incident starts within `gapSec` of
+// the previous one; it counts when at least `min` different targets are in it.
+export function sharedOutages(incidents, { gapSec = 180, min = 3, now = Date.now() / 1000 } = {}) {
+  const inc = incidents.filter(i => !i.maintenance).slice().sort((a, b) => a.start - b.start);
+  const out = [];
+  let cur = null;
+  const close = () => {
+    if (cur && new Set(cur.incidents.map(i => i.path)).size >= min) {
+      const paths = [...new Set(cur.incidents.map(i => i.path))];
+      out.push({ start: cur.start, end: cur.end, targets: paths, incidents: cur.incidents,
+                 groups: [...new Set(paths.map(p => groupTitle(p)))] });
+    }
+  };
+  for (const i of inc) {
+    const end = i.end || now;
+    if (cur && i.start - cur.lastStart <= gapSec) {
+      cur.incidents.push(i); cur.lastStart = i.start; cur.end = Math.max(cur.end, end);
+    } else {
+      close();
+      cur = { start: i.start, lastStart: i.start, end, incidents: [i] };
+    }
+  }
+  close();
+  return out.reverse();                              // newest first
+}
+
+// parent group path of a target ('/WAN/Quad9' -> '/WAN', '/Top' -> '')
+export const parentPath = (p) => (p.match(/^(.*)\/[^/]+$/) || [, ''])[1];
+
+// display title of a tree path (falls back to its last segment)
+export function treeTitle(path) {
+  const find = (node) => {
+    if (node.path === path) return node;
+    for (const c of node.children || []) { const f = find(c); if (f) return f; }
+    return null;
+  };
+  const n = D.state.tree ? find(D.state.tree.root) : null;
+  return n ? (n.menu || n.title || n.name) : (path.split('/').filter(Boolean).pop() || 'Top level');
+}
+export const groupTitle = (p) => { const g = parentPath(p); return g ? treeTitle(g) : 'Top level'; };
+
+// leaves in tree order, with their group
+function leavesInOrder() {
+  const out = [];
+  const walk = (node) => {
+    for (const c of node.children || []) {
+      if (c.isLeaf) out.push({ path: c.path, title: c.menu || c.title || c.name, group: parentPath(c.path) });
+      else walk(c);
+    }
+  };
+  if (D.state.tree) walk(D.state.tree.root);
+  return out;
+}
+
+const fmtShort = (t) => new Date(t * 1000).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+// ============================================================================
+// outage timeline (#/timeline)
+// ============================================================================
+
+const TL_RANGES = [['24h', '24 h', 86400], ['7d', '7 days', 7 * 86400], ['30d', '30 days', 30 * 86400]];
+let tlOnlyAffected = false;
+
+export async function renderTimeline(main, route) {
+  const { el, api } = D;
+  let range = TL_RANGES.some(([k]) => k === route.range) ? route.range : (localStorage.getItem('sp.tlRange') || '7d');
+  if (!TL_RANGES.some(([k]) => k === range)) range = '7d';
+  try { localStorage.setItem('sp.tlRange', range); } catch {}
+  const focus = route.start && route.end ? { start: +route.start, end: +route.end } : null;
+
+  main.innerHTML = '<div class="loading">Loading timeline…</div>';
+  let ev;
+  try { ev = await api('/events?range=' + range + '&limit=2000'); }
+  catch (e) { main.innerHTML = ''; main.append(el('div', { class: 'empty' }, 'Could not load incidents: ' + e.message)); return; }
+
+  const now = Math.floor(Date.now() / 1000);
+  const rangeSec = TL_RANGES.find(([k]) => k === range)[2];
+  const t0 = focus ? focus.start : now - rangeSec;
+  const t1 = focus ? focus.end : now;
+  const span = Math.max(60, t1 - t0);
+  const pos = (t) => Math.max(0, Math.min(100, (t - t0) / span * 100));
+
+  const incidents = ev.incidents || [];
+  const shared = sharedOutages(incidents, { now });
+  const byPath = new Map();
+  for (const i of incidents) { if (!byPath.has(i.path)) byPath.set(i.path, []); byPath.get(i.path).push(i); }
+
+  main.innerHTML = '';
+  main.append(el('div', { class: 'page-head' },
+    el('h1', {}, 'Outage timeline'),
+    el('span', { class: 'sub' }, focus ? `${fmtShort(t0)} – ${fmtShort(t1)}` : `last ${TL_RANGES.find(([k]) => k === range)[1]} · ${incidents.length} incident${incidents.length === 1 ? '' : 's'}`),
+    el('span', { class: 'spacer' }),
+    focus ? el('a', { class: 'chip on', href: '#/timeline?range=' + range }, '⟲ Back to ' + TL_RANGES.find(([k]) => k === range)[1]) : null,
+    seg(TL_RANGES.map(([k, l]) => [k, l]), focus ? '' : range, (k) => { location.hash = '#/timeline?range=' + k; }),
+    el('label', { class: 'switch', title: 'Hide targets that had no incident in this period' },
+      Object.assign(el('input', { type: 'checkbox', onchange: (e) => { tlOnlyAffected = e.target.checked; renderTimeline(main, route); } }), { checked: tlOnlyAffected }),
+      ' only affected')));
+
+  // --- shared outages -------------------------------------------------------------------
+  if (shared.length) {
+    const box = el('div', { class: 'tablecard shared-card' },
+      el('div', { class: 'tablecard-head' }, el('h2', {}, `Shared outages (${shared.length})`),
+        el('span', { class: 'sub' }, 'several targets failing within minutes of each other - usually one upstream cause (router, ISP, DNS)')));
+    const list = el('div', { class: 'shared-list' });
+    for (const c of shared.slice(0, 8)) {
+      const pad = Math.max(1800, (c.end - c.start) * 2);
+      list.append(el('a', { class: 'shared-item', href: `#/timeline?range=${range}&start=${Math.floor(c.start - pad)}&end=${Math.ceil(c.end + pad)}`, title: 'Zoom the timeline to this outage' },
+        el('span', { class: 'statusbadge critical' }, el('span', { class: 'dot' }), `${c.targets.length} targets`),
+        el('strong', {}, fmtShort(c.start)),
+        el('span', {}, `for ${fmtDur(c.end - c.start)}`),
+        el('span', { class: 'sub' }, c.groups.join(', '))));
+    }
+    box.append(list);
+    main.append(box);
+  }
+
+  // --- the timeline itself ---------------------------------------------------------------
+  const leaves = leavesInOrder();
+  const rows = tlOnlyAffected ? leaves.filter(l => (byPath.get(l.path) || []).some(i => (i.end || now) > t0 && i.start < t1)) : leaves;
+  const tl = el('div', { class: 'tl' });
+  const axis = () => {
+    const a = el('div', { class: 'tl-axis' });
+    const ticks = 6;
+    for (let k = 0; k <= ticks; k++) {
+      const t = t0 + span * k / ticks;
+      const d = new Date(t * 1000);
+      const lbl = span <= 2 * 86400 ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                                    : d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + (span <= 8 * 86400 ? ' ' + d.toLocaleTimeString([], { hour: '2-digit' }) : '');
+      a.append(el('span', { class: 'tl-tick', style: `left:${k / ticks * 100}%` }, lbl));
+    }
+    return el('div', { class: 'tl-row tl-axis-row' }, el('div', { class: 'tl-label' }), el('div', { class: 'tl-track-wrap' }, a));
+  };
+  tl.append(axis());
+
+  const maint = ev.maintWindows || [];
+  let lastGroup = null;
+  for (const r of rows) {
+    if (r.group !== lastGroup) {
+      tl.append(el('div', { class: 'tl-group' }, r.group ? treeTitle(r.group) : 'Top level'));
+      lastGroup = r.group;
+    }
+    const track = el('div', { class: 'tl-track' });
+    for (const c of shared) {
+      if (c.end < t0 || c.start > t1) continue;
+      track.append(el('div', { class: 'tl-shared', style: `left:${pos(c.start)}%;width:${Math.max(0.3, pos(c.end) - pos(c.start))}%` }));
+    }
+    for (const m of maint) {
+      if (m.end < t0 || m.start > t1) continue;
+      const covers = !m.paths.length || m.paths.some(p => r.path === p || r.path.startsWith(p + '/'));
+      if (!covers) continue;
+      track.append(el('div', { class: 'tl-maint', title: `🔧 ${m.title}\n${fmtShort(m.start)} – ${fmtShort(m.end)}`, style: `left:${pos(m.start)}%;width:${Math.max(0.3, pos(m.end) - pos(m.start))}%` }));
+    }
+    for (const i of byPath.get(r.path) || []) {
+      const end = i.end || now;
+      if (end < t0 || i.start > t1) continue;
+      const padS = Math.max(1800, (end - i.start) * 3);
+      track.append(el('a', {
+        class: 'tl-bar' + (i.open ? ' open' : '') + (i.maintenance ? ' planned' : ''),
+        href: `#/node${r.path}?start=${Math.floor(i.start - padS)}&end=${Math.ceil(Math.min(now, end + padS))}`,
+        title: `${i.alert}${i.maintenance ? ' (during maintenance)' : ''}\n${fmtShort(i.start)} – ${i.open ? 'ongoing' : fmtShort(end)}\n${fmtDur(end - i.start)}${i.open ? ' so far' : ''}\nclick to open the graph at that time`,
+        style: `left:${pos(i.start)}%;width:${Math.max(0.25, pos(end) - pos(i.start))}%`,
+      }));
+    }
+    const count = (byPath.get(r.path) || []).filter(i => (i.end || now) > t0 && i.start < t1).length;
+    tl.append(el('div', { class: 'tl-row' },
+      el('a', { class: 'tl-label', href: '#/node' + r.path, title: r.path }, r.title, count ? el('span', { class: 'tl-count' }, String(count)) : null),
+      el('div', { class: 'tl-track-wrap' }, track)));
+  }
+  if (!rows.length) tl.append(el('p', { class: 'note' }, 'No target had an incident in this period.'));
+  tl.append(axis());
+  main.append(el('div', { class: 'tablecard tl-card' }, tl,
+    el('div', { class: 'chart-legend', style: 'padding:0 14px 12px' },
+      el('span', {}, el('i', { style: 'background:var(--crit)' }), 'incident (click for the graph)'),
+      el('span', {}, el('i', { class: 'lg-maint' }), 'maintenance'),
+      el('span', {}, el('i', { style: 'background:var(--span-shared)' }), 'shared outage'))));
+}
+
+// ============================================================================
+// quick jump (Ctrl+K)
+// ============================================================================
+
+function paletteItems() {
+  const pages = [
+    ['Dashboard', '#/'], ['Alerts', '#/alerts'], ['Outage timeline', '#/timeline'], ['Availability report', '#/report'],
+    ['Compare targets', '#/compare'], ['Wall display', '#/wall'],
+    ['Settings: E-mail', '#/settings/mail'], ['Settings: Notifications', '#/settings/notify'], ['Settings: Targets (add / edit / remove)', '#/settings/targets'],
+    ['Settings: Alert rules', '#/settings/rules'], ['Settings: Maintenance windows', '#/settings/maintenance'], ['Settings: Uptime goals', '#/settings/goals'],
+    ['Settings: Backup & restore', '#/settings/backup'], ['Settings: Config files', '#/settings/config'], ['Settings: Access / sign out', '#/settings/access'],
+  ].map(([label, href]) => ({ label, href, kind: 'page' }));
+  const nodes = (D.state.summary && D.state.summary.nodes) || [];
+  const targets = nodes.map(n => ({ label: n.title, sub: `${n.host || ''}  ${n.path}`, href: '#/node' + n.path, kind: 'target', sev: n.severity }));
+  return [...targets, ...pages];
+}
+
+function paletteMatch(items, q) {
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return items.slice(0, 40);
+  const scored = [];
+  for (const it of items) {
+    const hay = (it.label + ' ' + (it.sub || '')).toLowerCase();
+    if (!words.every(w => hay.includes(w))) continue;
+    const l = it.label.toLowerCase();
+    scored.push([(l.startsWith(words[0]) ? 0 : l.includes(words[0]) ? 1 : 2) + (it.kind === 'target' ? 0 : 0.5), it]);
+  }
+  return scored.sort((a, b) => a[0] - b[0] || a[1].label.localeCompare(b[1].label)).map(s => s[1]).slice(0, 40);
+}
+
+export function openPalette() {
+  const { el } = D;
+  if (document.querySelector('.palette-scrim')) return;
+  const items = paletteItems();
+  const input = el('input', { class: 'palette-input', type: 'text', placeholder: 'Jump to a target, page or setting…', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Quick jump' });
+  const list = el('div', { class: 'palette-list', role: 'listbox' });
+  const scrim = el('div', { class: 'modal-scrim palette-scrim' }, el('div', { class: 'palette', role: 'dialog', 'aria-label': 'Quick jump' }, input, list,
+    el('div', { class: 'palette-hint' }, '↑ ↓ to move · Enter to open · Esc to close')));
+  let shown = [], sel = 0;
+  const close = () => scrim.remove();
+  const go = (it) => { close(); if (it) location.hash = it.href; };
+  const draw = () => {
+    shown = paletteMatch(items, input.value);
+    sel = Math.min(sel, Math.max(0, shown.length - 1));
+    list.innerHTML = '';
+    if (!shown.length) list.append(el('div', { class: 'palette-empty' }, 'Nothing matches.'));
+    shown.forEach((it, i) => {
+      const row = el('button', { class: 'palette-item' + (i === sel ? ' sel' : ''), role: 'option', 'aria-selected': String(i === sel), onclick: () => go(it) },
+        it.kind === 'target' ? el('span', { class: 'sev sev-' + (it.sev || 'unknown') }) : el('span', { class: 'palette-kind' }, '›'),
+        el('span', { class: 'palette-label' }, it.label),
+        it.sub ? el('span', { class: 'palette-sub' }, it.sub) : null);
+      row.addEventListener('mousemove', () => { if (sel !== i) { sel = i; draw(); } });
+      list.append(row);
+    });
+    const cur = list.children[sel];
+    if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest' });
+  };
+  input.addEventListener('input', () => { sel = 0; draw(); });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(shown.length - 1, sel + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(0, sel - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); go(shown[sel]); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+  });
+  scrim.addEventListener('mousedown', (e) => { if (e.target === scrim) close(); });
+  document.body.append(scrim);
+  draw();
+  input.focus();
+}
+
+// ============================================================================
+// grouped dashboard
+// ============================================================================
+
+const dashCollapsed = (() => { try { return new Set(JSON.parse(localStorage.getItem('sp.dashCollapsed') || '[]')); } catch { return new Set(); } })();
+
+// nodes (already filtered) -> sections in tree order, cards sorted by status inside
+export function groupedSections(nodes, cardFn, sevSortFn, redraw) {
+  const { el } = D;
+  const order = new Map(leavesInOrder().map((l, i) => [l.path, i]));
+  const groups = new Map();
+  for (const n of nodes.slice().sort((a, b) => (order.get(a.path) ?? 1e9) - (order.get(b.path) ?? 1e9))) {
+    const g = parentPath(n.path);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(n);
+  }
+  const out = [], draws = [];
+  for (const [g, list] of groups) {
+    const counts = {};
+    for (const n of list) counts[n.severity] = (counts[n.severity] || 0) + 1;
+    const collapsed = dashCollapsed.has(g);
+    const worst = ['critical', 'down', 'warning', 'unknown', 'maintenance', 'ok'].find(s => counts[s]) || 'ok';
+    const summary = ['critical', 'down', 'warning', 'unknown', 'maintenance', 'ok'].filter(s => counts[s])
+      .map(s => el('span', { class: 'group-count', 'data-sev': s }, el('span', { class: 'dot' }), `${counts[s]} ${D.SEV_LABEL[s] ? D.SEV_LABEL[s].toLowerCase() : s}`));
+    const head = el('button', { class: 'group-head sev-edge-' + worst, 'aria-expanded': String(!collapsed), onclick: () => {
+      dashCollapsed.has(g) ? dashCollapsed.delete(g) : dashCollapsed.add(g);
+      try { localStorage.setItem('sp.dashCollapsed', JSON.stringify([...dashCollapsed])); } catch {}
+      redraw();
+    } },
+      el('span', { class: 'caret' + (collapsed ? ' collapsed' : ''), html: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M9 6l6 6-6 6"/></svg>' }),
+      el('span', { class: 'group-title' }, g ? treeTitle(g) : 'Top level'),
+      el('span', { class: 'group-summary' }, ...summary));
+    out.push(head);
+    if (!collapsed) {
+      const grid = el('div', { class: 'grid' });
+      for (const n of list.sort(sevSortFn)) { const c = cardFn(n); draws.push([c.querySelector('canvas'), n.spark]); grid.append(c); }
+      out.push(grid);
+    }
+  }
+  return { elements: out, draws };
+}

@@ -93,7 +93,7 @@ sub run {
             return _cached("node-$safe", 8, sub { node($q) });
         }
         return _cached('alerts', $ttl{alerts}, \&alerts)    if $route eq 'alerts';
-        return _cached('events-' . _safe_key($q->{target}, $q->{since}, $q->{limit}), 20, sub { events($q) }) if $route eq 'events';
+        return _cached('events-' . _safe_key($q->{target}, $q->{range}, $q->{since}, $q->{limit}), 20, sub { events($q) }) if $route eq 'events';
         return _cached('report-' . _safe_key($q->{range}), 60, sub { report($q) })  if $route eq 'report';
         return alertpreview($q)                                                    if $route eq 'alertpreview';
         return { __text => _cached_text('metrics', 10, \&metrics_text) }           if $route eq 'metrics';
@@ -865,8 +865,23 @@ sub events {
         byTarget  => [ map { { path => $_, title => $titles->{$_} // $_, count => $by{$_} } }
                        sort { $by{$b} <=> $by{$a} || $a cmp $b } keys %by ],
         incidents => \@rows,
+        maintWindows => _maint_windows($since, $now, $want),
         store     => SmokepingModern::Events::store_file(),
     };
+}
+
+# every maintenance occurrence overlapping [from, to) - for the timeline and
+# graph markers; with a target path, only the windows that cover it
+sub _maint_windows {
+    my ($from, $to, $path) = @_;
+    my @out;
+    for my $w (@{ SmokepingModern::Maintenance::load() }) {
+        next if length($path // '') && !SmokepingModern::Maintenance::_applies($w, $path);
+        for my $iv (SmokepingModern::Maintenance::window_intervals($w, $from, $to)) {
+            push @out, { title => $w->{title}, paths => $w->{paths} || [], start => $iv->[0] + 0, end => $iv->[1] + 0 };
+        }
+    }
+    return [ sort { $a->{start} <=> $b->{start} } @out ];
 }
 
 # ---------------------------------------------------------------------------

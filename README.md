@@ -15,6 +15,7 @@ password, write) the same files. The classic CGI stays reachable at
 |--------------|----------------------------------|-----------------------------------------------------|
 | Layout       | frameset, fixed width            | responsive, mobile drawer, light / dark / auto      |
 | Graphs       | pre-rendered PNGs                | live canvas smoke charts, hover readout, drag-zoom  |
+| Overview     | one page per target              | **grouped dashboard**, **outage timeline** with shared-outage detection, incident/maintenance markers on graphs, `Ctrl+K` quick jump |
 | Alerts       | e-mail / log only                | **alerts page**: live state, persistent incident history with durations, acknowledgements, "back after 4m12s" recovery notices |
 | SLAs         | none                             | **uptime goals** per group / target with pass-fail and a monthly downtime budget; **one-file backup & restore** |
 | Self-checks  | none                             | **"SmokePing stopped measuring" alarm**, per-target *no data* marking, **notification delivery status** (banner when a webhook or mail keeps failing) |
@@ -216,6 +217,28 @@ chart (median coloured by loss, symmetric min–max / p10–p90 / p20–p80 smok
 `3h / 30h / 10d / 360d`. **Export PNG** / **Export CSV** on a target page save
 the current chart's image or raw data points. The ⏸ button in the top bar
 pauses auto-refresh per browser; the refresh button always works.
+
+The dashboard is **grouped** by default (Local / Internet / … in the order of your
+Targets file), each group with a one-line health summary ("5 ok · 1 warning") and
+collapsible; *Status / Name / Loss / Latency / Jitter* switch to a flat, sorted grid.
+
+A target's graph shades **incidents** (red, with a red cap so even a short one is
+visible) and **maintenance windows** (grey hatching) behind the data, and the hover
+readout names them.
+
+**Quick jump:** `Ctrl+K` (or the *Ctrl K* button in the search box) opens a search over
+every target, page and settings tab — type a few letters, Enter.
+
+### Outage timeline (`#/timeline`)
+
+One row per target, grouped like the dashboard, with every incident as a bar on a
+shared time axis (24 h / 7 days / 30 days) and maintenance windows as grey bands.
+When several targets fail within a few minutes of each other it is listed as a
+**shared outage** ("8 targets, 27 Sept 00:05, for 4m32s — Internet, Web sites") and
+drawn as a band across all rows — usually one upstream cause (router, ISP, DNS) rather
+than many separate problems. Click a shared outage to zoom the timeline to it; click
+a bar to open that target's graph zoomed to the moment. *Only affected* hides quiet
+targets.
 
 **Compare** (dashboard header, or *Compare…* on a target page, `#/compare`) overlays
 up to six targets on one chart — median latency on top, packet loss below, one
@@ -558,7 +581,7 @@ rather than reimplementing any of it.
 | Endpoint | |
 |----------|---|
 | `GET /api/health` `tree` `summary` `alerts` `acks` `maintenance` `goals` `metrics` | open |
-| `GET /api/report?range=24h\|7d\|30d\|90d` `events?range=&target=` `alertpreview?kind=…` | open |
+| `GET /api/report?range=24h\|7d\|30d\|90d` `events?range=&target=` (incidents + maintenance occurrences) `alertpreview?kind=…` | open |
 | `GET /api/node?path=&range=` or `&start=&end=` | open |
 | `GET /api/settings` `me` `config/<file>` `alertdefs` | password |
 | `POST /api/settings/{smtp,notify}` `config/<file>` `targets/{add,remove}` `alertdefs` `alertdefs/delete` `maintenance` `maintenance/delete` `goals` `goals/delete` `backup` `backup/restore` `test/{mail,notify}` `reload` `acks` `acks/delete` | password + `X-Requested-With` |

@@ -82,6 +82,16 @@ ok(@{ $s->{delivery} } == 0, 'summary: a successful send clears the failure');
 # --- events -----------------------------------------------------------------------------
 my $e = $A->can('events')->({});
 ok(defined $e->{total} && ref $e->{incidents} eq 'ARRAY', 'events: shape');
+SmokepingModern::Maintenance::save([
+    { id => 'a', title => 'WAN work', mode => 'once', start => time - 7200, end => time - 3600, paths => ['/Sites'] },
+    { id => 'b', title => 'Nightly', mode => 'weekly', days => [0 .. 6], time => '03:00', durationMin => 60, paths => [] },
+]);
+$e = $A->can('events')->({ range => '7d' });
+my @mw = @{ $e->{maintWindows} };
+ok((grep { $_->{title} eq 'WAN work' } @mw) == 1 && (grep { $_->{title} eq 'Nightly' } @mw) >= 7, 'events: maintenance occurrences in range (one-off + 7 nightly): ' . scalar(@mw));
+$e = $A->can('events')->({ range => '7d', target => '/Top' });
+ok(!(grep { $_->{title} eq 'WAN work' } @{ $e->{maintWindows} }) && (grep { $_->{title} eq 'Nightly' } @{ $e->{maintWindows} }), 'events: per-target maintenance only lists windows covering it');
+SmokepingModern::Maintenance::save([]);
 
 print $fails ? "\nFAILED: $fails\n" : "\nALL OK\n";
 exit($fails ? 1 : 0);

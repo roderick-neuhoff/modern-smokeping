@@ -86,6 +86,14 @@ const archive = { format: 'modern-smokeping-backup', version: 1, created: now, h
 const dry = { ok: true, dryRun: true, created: now, host: 'Tower', appVersion: '1.6.0', includesSecrets: true, files: [
   { name: 'Targets', group: 'config', bytes: 120, secret: 0, status: 'same' }, { name: 'Alerts', group: 'config', bytes: 80, secret: 0, status: 'changed' },
   { name: 'modern-acks.json', group: 'state', bytes: 20, secret: 0, status: 'new' }, { name: 'modern-notify.json', group: 'secrets', bytes: 90, secret: 1, status: 'changed' }] };
+const timelineEvents = { generated: now, range: '7d', total: 4, open: 0, byTarget: [],
+  maintWindows: [{ title: 'Nightly backup', paths: ['/Sites'], start: now - 20000, end: now - 16400 }],
+  incidents: [
+    { alert: 'hostdown', path: '/Sites/Google', title: 'Google', start: now - 260000, end: now - 259700, durationSec: 300, open: false },
+    { alert: 'hostdown', path: '/Sites/Cloudflare', title: 'Cloudflare', start: now - 259960, end: now - 259690, durationSec: 270, open: false },
+    { alert: 'hostdown', path: '/Quad9', title: 'Quad9', start: now - 259900, end: now - 259650, durationSec: 250, open: false },
+    { alert: 'lossdetect', path: '/Sites/Google', title: 'Google', start: now - 5000, end: now - 4800, durationSec: 200, open: false },
+  ] };
 const calls = [];
 function route(url, init) {
   const u = new URL(url, 'http://localhost');
@@ -109,7 +117,10 @@ function route(url, init) {
     case '/acks': return { acks: {} };
     case '/node': return node(u.searchParams.get('path'), u.searchParams.get('path').split('/').pop());
     case '/report': return report;
-    case '/events': return u.searchParams.get('target') ? { ...events, incidents: events.incidents.filter(i => i.path === u.searchParams.get('target')) } : events;
+    case '/events':
+      if (u.searchParams.get('limit') === '2000') return timelineEvents;
+      if (u.searchParams.get('target') === '/Quad9') return { ...events, incidents: [], maintWindows: [{ title: 'Router swap', paths: ['/Quad9'], start: now - 900, end: now + 3600 }] };
+      return u.searchParams.get('target') ? { ...events, incidents: events.incidents.filter(i => i.path === u.searchParams.get('target')) } : events;
     case '/alertdefs': return defs;
     case '/alertpreview': return preview;
     case '/settings': return settings;
@@ -427,6 +438,73 @@ ok(/Failing: HTTP 000 \(curl rc=7\) - 4 attempts in a row/.test(text()), 'notify
 ok(/Nothing sent through this channel yet/.test(text()), 'notify pane: unused channel line');
 await go('#/settings/mail', 500);
 ok(/Working - last send (\d+s|1m) ago, 12 sent in total/.test(text()), 'mail pane: delivery status line: ' + ((main().querySelector('.delivery-line') || {}).textContent || 'none'));
+
+// --- outage timeline ---------------------------------------------------------------------------
+await go('#/timeline?range=7d', 500);
+ok(/Outage timeline/.test(text()) && /4 incidents/.test(text()), 'timeline renders');
+ok(/Shared outages \(1\)/.test(text()) && /3 targets/.test(text()), 'three targets failing within minutes = one shared outage');
+ok(main().querySelectorAll('.tl-bar').length === 4, 'one bar per incident');
+ok(main().querySelectorAll('.tl-group').length === 2, 'rows grouped (Sites, Top level)');
+ok(main().querySelectorAll('.tl-maint').length === 2, 'maintenance band only on the covered group (2 Sites rows)');
+ok(main().querySelectorAll('.tl-row .tl-track .tl-shared').length === 3, 'shared-outage band drawn across the target rows');
+const bar = main().querySelector('.tl-bar');
+ok(/^#\/node\/Sites\/Google\?start=\d+&end=\d+$/.test(bar.getAttribute('href')) && /hostdown/.test(bar.title), 'a bar links to the zoomed graph: ' + bar.getAttribute('href'));
+const zoomLink = main().querySelector('.shared-item').getAttribute('href');
+await go(zoomLink, 500);
+ok(/Back to 7 days/.test(text()) && main().querySelectorAll('.tl-bar').length >= 3, 'clicking a shared outage zooms the timeline to it');
+ok(window.document.querySelector('.tree-row.is-current') && /Outage timeline/.test(window.document.querySelector('.tree-row.is-current').textContent), 'sidebar entry for the timeline');
+await go('#/timeline?range=24h', 500);
+ok(main().querySelectorAll('.tl-row a.tl-label').length === 3, '24 h: every target has a row');
+[...main().querySelectorAll('.page-head input[type=checkbox]')][0].click();
+await sleep(500);
+ok(main().querySelectorAll('.tl-row a.tl-label').length === 1, '"only affected" keeps just the target with an incident in range: ' + [...main().querySelectorAll('.tl-row a.tl-label')].map(a => a.textContent).join('|') + ' hash=' + window.location.hash);
+[...main().querySelectorAll('.page-head input[type=checkbox]')][0].click();
+await sleep(400);
+
+// --- node page: zoom link + graph markers ------------------------------------------------------------
+calls.length = 0;
+await go('#/node/Quad9?start=' + (now - 7200) + '&end=' + (now - 600), 600);
+ok(calls.some(c => c.startsWith('/node?') && c.includes('start=' + (now - 7200)) && c.includes('end=' + (now - 600))), 'node link with start/end opens the zoomed window');
+ok(/Reset zoom/.test(text()), 'zoomed view offers reset');
+await go('#/node/Quad9', 600);
+ok(main().querySelector('.chart-legend .lg-maint') !== null, 'graph legend shows the maintenance marker when one overlaps');
+await go('#/node/Sites/Google', 600);
+ok(main().querySelector('.chart-legend .lg-incident') !== null, 'graph legend shows the incident marker for an ongoing incident');
+
+// --- quick jump (Ctrl+K) ------------------------------------------------------------------------------
+await go('#/', 300);
+window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }));
+await sleep(100);
+const pal = window.document.querySelector('.palette');
+ok(pal !== null && window.document.activeElement === pal.querySelector('input'), 'Ctrl+K opens the quick jump with focus in the box');
+const pin = pal.querySelector('input');
+pin.value = 'clou'; pin.dispatchEvent(new window.Event('input', { bubbles: true }));
+ok(pal.querySelector('.palette-item.sel') && /Cloudflare/.test(pal.querySelector('.palette-item.sel').textContent), 'typing narrows to the matching target');
+pin.value = 'maint'; pin.dispatchEvent(new window.Event('input', { bubbles: true }));
+ok(/Maintenance windows/.test(pal.querySelector('.palette-item.sel').textContent), 'pages and settings are searchable too');
+pin.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+await sleep(500);
+ok(window.location.hash === '#/settings/maintenance' && !window.document.querySelector('.palette'), 'Enter opens it and closes the dialog');
+await go('#/', 300);
+window.document.getElementById('paletteBtn').click();
+await sleep(100);
+window.document.querySelector('.palette input').dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+ok(!window.document.querySelector('.palette'), 'the Ctrl K button opens it, Esc closes it');
+
+// --- grouped dashboard ---------------------------------------------------------------------------------
+window.localStorage.removeItem('sp.dashCollapsed');
+await go('#/', 300);
+const heads = [...main().querySelectorAll('.group-head')];
+ok(heads.length === 2 && /Sites/.test(heads[0].textContent) && /Top level/.test(heads[1].textContent), 'dashboard grouped in tree order: ' + heads.map(h => h.querySelector('.group-title').textContent).join(', '));
+ok(/2 ok/.test(heads[0].textContent), 'group header summarises its targets');
+ok(main().querySelectorAll('.card').length === 3, 'all cards still shown');
+heads[0].click(); await sleep(200);
+ok(main().querySelectorAll('.card').length === 1 && main().querySelector('.group-head').getAttribute('aria-expanded') === 'false', 'a group collapses');
+main().querySelector('.group-head').click(); await sleep(200);
+ok(main().querySelectorAll('.card').length === 3, '... and expands again');
+[...main().querySelectorAll('.seg button')].find(b => b.textContent === 'Status').click(); await sleep(200);
+ok(!main().querySelector('.group-head') && main().querySelectorAll('.card').length === 3, 'Status sort shows the flat grid');
+[...main().querySelectorAll('.seg button')].find(b => b.textContent === 'Groups').click(); await sleep(200);
 
 // --- sidebar: exactly one highlighted row, and refreshes must not flip it -----------------------------
 await go('#/', 300);

@@ -1,7 +1,8 @@
 // SmokePing Modern UI - app shell, router and views.
 import { drawSmoke, attachSmokeHover, attachSmokeZoom, drawSpark, fmtMs, seriesToCsv, toPngDataUrl } from './chart.js';
 import { diffLines } from './diff.js';
-import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules, paneMaintenance, paneGoals, paneBackup, fmtUntil, fmtDur } from './views.js';
+import { initViews, renderReport, renderCompare, compareHash, incidentHistory, paneRules, paneMaintenance, paneGoals, paneBackup, fmtUntil, fmtDur,
+  renderTimeline, openPalette, groupedSections } from './views.js';
 
 const API = (location.pathname.replace(/\/modern\/?$/, '') || '') + '/api';
 const REFRESH_MS = 15_000;
@@ -18,7 +19,7 @@ const state = {
   collapsed: loadSet('sp.collapsed'),
   acks: {},             // server-side acknowledgements: key -> {until, note, by}
   filter: '',
-  sort: localStorage.getItem('sp.sort') || 'severity',
+  sort: localStorage.getItem('sp.sort') || 'group',
   online: true,
   wallProblems: localStorage.getItem('sp.wallProblems') === '1',
   wallDensity: localStorage.getItem('sp.wallDensity') || 'small',
@@ -232,6 +233,7 @@ function renderTree() {
   if (!state.tree) return;
   host.append(treeRow({ name: 'Dashboard', path: '#/', menu: 'Dashboard', _link: '#/' }, 0, true));
   host.append(treeRow({ name: 'Alerts', path: '#/alerts', menu: 'Alerts', _link: '#/alerts' }, 0, true));
+  host.append(treeRow({ name: 'Timeline', path: '#/timeline', menu: 'Outage timeline', _link: '#/timeline' }, 0, true));
   host.append(treeRow({ name: 'Report', path: '#/report', menu: 'Availability report', _link: '#/report' }, 0, true));
   host.append(treeRow({ name: 'Compare', path: '#/compare', menu: 'Compare targets', _link: '#/compare' }, 0, true));
   host.append(treeRow({ name: 'Wall', path: '#/wall', menu: 'Wall display', _link: '#/wall' }, 0, true));
@@ -352,6 +354,7 @@ function applyFilter() {
 // --- keyboard shortcuts ------------------------------------------------
 
 document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); openPalette(); return; }
   if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
   const t = e.target;
   const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
@@ -387,7 +390,14 @@ document.addEventListener('keydown', (e) => {
 
 function currentRoute() {
   const h = location.hash || '#/';
-  if (h.startsWith('#/node/')) return { name: 'node', path: h.slice(6).split('?')[0] };
+  if (h.startsWith('#/node/')) {
+    const qs = new URLSearchParams(h.split('?')[1] || '');
+    return { name: 'node', path: h.slice(6).split('?')[0], start: qs.get('start'), end: qs.get('end') };
+  }
+  if (h.startsWith('#/timeline')) {
+    const qs = new URLSearchParams(h.split('?')[1] || '');
+    return { name: 'timeline', range: qs.get('range') || '', start: qs.get('start'), end: qs.get('end') };
+  }
   if (h.startsWith('#/alerts')) {
     const qs = new URLSearchParams(h.split('?')[1] || '');
     return { name: 'alerts', sev: qs.get('sev') || 'all' };
@@ -406,7 +416,7 @@ function currentRoute() {
 }
 
 // views that fetch their own data and hold form state: a background refresh must not rebuild them
-const NO_REFRESH_VIEWS = new Set(['settings', 'report', 'compare']);
+const NO_REFRESH_VIEWS = new Set(['settings', 'report', 'compare', 'timeline']);
 let lastRouteName = null;
 function render(fromRefresh) {
   const r = currentRoute();
@@ -418,11 +428,16 @@ function render(fromRefresh) {
   }
   lastRouteName = r.name;
   document.body.classList.toggle('wall-mode', r.name === 'wall');
-  if (r.name === 'node') renderNode(r.path);
+  if (r.name === 'node') {
+    // #/node/<path>?start=&end= (from the timeline): open zoomed to that window
+    if (r.start && r.end && !fromRefresh) zoom = { path: r.path, start: +r.start, end: +r.end };
+    renderNode(r.path);
+  }
   else if (r.name === 'alerts') renderAlerts(r.sev);
   else if (r.name === 'settings') renderSettings(r.tab);
   else if (r.name === 'report') renderReport(document.getElementById('main'), r.range);
   else if (r.name === 'compare') renderCompare(document.getElementById('main'), r);
+  else if (r.name === 'timeline') renderTimeline(document.getElementById('main'), r);
   else if (r.name === 'wall') renderWall();
   else renderDashboard();
   decorateTree();
@@ -451,7 +466,7 @@ function renderDashboard() {
     latency: (a, b) => (b.medianNowMs || 0) - (a.medianNowMs || 0),
     stddev: (a, b) => (b.stddevMs || 0) - (a.stddevMs || 0),
   };
-  nodes.sort(sorters[state.sort] || sorters.severity);
+  if (state.sort !== 'group') nodes.sort(sorters[state.sort] || sorters.severity);
 
   main.innerHTML = '';
   main.append(el('div', { class: 'page-head' },
@@ -466,14 +481,20 @@ function renderDashboard() {
 
   if (!nodes.length) { main.append(el('div', { class: 'empty' }, 'No targets match your filter.')); return; }
 
-  const grid = el('div', { class: 'grid' });
-  const draws = [];
-  for (const n of nodes) {
-    const c = card(n);
-    draws.push([c.querySelector('canvas'), n.spark]);
-    grid.append(c);
+  let draws = [];
+  if (state.sort === 'group') {
+    const g = groupedSections(nodes, card, sevSort, renderDashboard);
+    main.append(...g.elements);
+    draws = g.draws;
+  } else {
+    const grid = el('div', { class: 'grid' });
+    for (const n of nodes) {
+      const c = card(n);
+      draws.push([c.querySelector('canvas'), n.spark]);
+      grid.append(c);
+    }
+    main.append(grid);
   }
-  main.append(grid);
   requestAnimationFrame(() => {
     for (const [cv, spark] of draws) if (cv && spark) drawSpark(cv, spark);
   });
@@ -521,7 +542,7 @@ function maintenanceBanners() {
 }
 
 function sortControl() {
-  const opts = [['severity', 'Status'], ['name', 'Name'], ['loss', 'Loss'], ['latency', 'Latency'], ['stddev', 'Jitter']];
+  const opts = [['group', 'Groups'], ['severity', 'Status'], ['name', 'Name'], ['loss', 'Loss'], ['latency', 'Latency'], ['stddev', 'Jitter']];
   return el('div', { class: 'seg' }, ...opts.map(([k, label]) =>
     el('button', {
       class: state.sort === k ? 'on' : '',
@@ -562,6 +583,28 @@ function nodeQuery(path) {
     qs.set('start', zoom.start); qs.set('end', zoom.end);
   }
   return '/node?' + qs.toString();
+}
+
+// incidents + maintenance overlapping the plotted window, as chart spans
+const spanCache = new Map();
+async function nodeSpans(path, win) {
+  if (!win || !win.start) return [];
+  const now = Date.now() / 1000;
+  const back = now - win.start;
+  const range = back <= 86400 ? '24h' : back <= 7 * 86400 ? '7d' : back <= 30 * 86400 ? '30d' : back <= 90 * 86400 ? '90d' : '365d';
+  const key = path + '|' + range;
+  let hit = spanCache.get(key);
+  if (!hit || Date.now() - hit.at > 30_000) {
+    hit = { at: Date.now(), data: await api('/events?range=' + range + '&target=' + encodeURIComponent(path)) };
+    spanCache.set(key, hit);
+  }
+  const ev = hit.data;
+  const spans = (ev.maintWindows || []).map(m => ({ start: m.start, end: m.end, kind: 'maintenance', label: 'Maintenance: ' + m.title }));
+  for (const i of ev.incidents || []) {
+    spans.push({ start: i.start, end: i.end || now, kind: 'incident',
+                 label: `${i.alert} ${i.open ? '(ongoing, ' + fmtDur(now - i.start) + ' so far)' : fmtDur((i.end || now) - i.start)}` });
+  }
+  return spans.filter(sp => sp.end > win.start && sp.start < win.end);
 }
 
 async function renderNode(path) {
@@ -631,8 +674,15 @@ async function renderNode(path) {
   ));
   main.append(wrap);
 
+  const spans = await nodeSpans(path, d.window).catch(() => []);
+  if (spans.length) {
+    const legend = wrap.querySelector('.chart-legend');
+    const zh = legend.querySelector('.zoom-hint');
+    if (spans.some(sp => sp.kind === 'incident')) legend.insertBefore(el('span', {}, el('i', { class: 'lg-incident' }), 'incident'), zh);
+    if (spans.some(sp => sp.kind === 'maintenance')) legend.insertBefore(el('span', {}, el('i', { class: 'lg-maint' }), 'maintenance'), zh);
+  }
   const drawNow = () => {
-    const geom = drawSmoke(cv, d.series);
+    const geom = drawSmoke(cv, d.series, { spans });
     attachSmokeHover(cv, geom, tip);
     attachSmokeZoom(cv, geom, sel,
       (s, e) => { zoom = { path, start: s, end: e }; renderNode(path); },
@@ -1711,7 +1761,9 @@ themeBtn.addEventListener('click', () => {
 
 // --- boot ---------------------------------------------------
 
-initViews({ el, api, post, state, fmtPct, downloadBlob, rowsToCsv, toast, field, input, resultBox, showResult, renderTree });
+initViews({ el, api, post, state, fmtPct, downloadBlob, rowsToCsv, toast, field, input, resultBox, showResult, renderTree, SEV_LABEL });
+
+document.getElementById('paletteBtn')?.addEventListener('click', () => openPalette());
 
 let booted = false;
 async function boot() {

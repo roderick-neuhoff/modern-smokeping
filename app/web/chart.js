@@ -98,6 +98,30 @@ export function drawSmoke(canvas, series, opts = {}) {
     ctx.fillText(fmtTimeAxis(ts, spanSec), x, pad.t + plotH + 6);
   }
 
+  // incident / maintenance periods, shaded behind the data (opts.spans:
+  // [{ start, end, kind: 'incident'|'maintenance', label }])
+  const spans = (opts.spans || []).filter(sp => sp.end > t0 && sp.start < t1);
+  for (const sp of spans) {
+    const x0 = Math.max(pad.l, X(Math.max(sp.start, t0)));
+    const x1 = Math.min(pad.l + plotW, X(Math.min(sp.end, t1)));
+    const wpx = Math.max(2, x1 - x0);
+    if (sp.kind === 'maintenance') {
+      ctx.fillStyle = css('--span-maint') || 'rgba(100,116,139,0.14)';
+      ctx.fillRect(x0, pad.t, wpx, plotH);
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x0, pad.t, wpx, plotH); ctx.clip();
+      ctx.strokeStyle = css('--span-maint-line') || 'rgba(100,116,139,0.28)';
+      ctx.lineWidth = 1;
+      for (let x = x0 - plotH; x < x0 + wpx; x += 8) { ctx.beginPath(); ctx.moveTo(x, pad.t + plotH); ctx.lineTo(x + plotH, pad.t); ctx.stroke(); }
+      ctx.restore();
+    } else {
+      ctx.fillStyle = css('--span-incident') || 'rgba(217,58,58,0.12)';
+      ctx.fillRect(x0, pad.t, wpx, plotH);
+      ctx.fillStyle = css('--crit') || '#d93a3a';
+      ctx.fillRect(x0, pad.t, wpx, 3);                 // a solid cap so short ones stay visible
+    }
+  }
+
   // one closed polygon per contiguous run of samples, so a gap never gets
   // bridged by the return path
   const band = (lo, hi, color) => {
@@ -155,7 +179,7 @@ export function drawSmoke(canvas, series, opts = {}) {
     ctx.fillRect(X(t[i]) - slotW / 2, ribbonY, slotW + 0.5, ribbonH);
   }
 
-  return { X, Y, t0, t1, spanSec, ymax, pad, plotW, plotH, series };
+  return { X, Y, t0, t1, spanSec, ymax, pad, plotW, plotH, series, spans };
 }
 
 // loss (%) -> colour ramp. 0 = ok green, then amber, orange, red, purple.
@@ -213,6 +237,8 @@ export function attachSmokeZoom(canvas, geom, selEl, onZoom, onReset) {
   canvas.style.cursor = 'crosshair';
 }
 
+const escHtml = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
 export function attachSmokeHover(canvas, geom, tooltipEl) {
   if (!geom) { tooltipEl.hidden = true; return; }
   const { X, pad, plotH, t0, spanSec, series } = geom;
@@ -237,7 +263,9 @@ export function attachSmokeHover(canvas, geom, tooltipEl) {
       `<b>${d.toLocaleString()}</b><br>` +
       `median ${fmtMs(series.median[i])}<br>` +
       `pings ${fmtMs((series.pmin || series.p20)[i])} – ${fmtMs(series.pmax[i])}<br>` +
-      `loss ${lp == null ? '–' : lp.toFixed(0) + ' %'}`;
+      `loss ${lp == null ? '–' : lp.toFixed(0) + ' %'}` +
+      (geom.spans || []).filter(sp => series.t[i] >= sp.start && series.t[i] < sp.end)
+        .map(sp => `<br><span class="tip-${sp.kind}">${sp.kind === 'maintenance' ? '🔧' : '⚠'} ${escHtml(sp.label)}</span>`).join('');
     const px = Math.min(X(series.t[i]) + 12, rect.width - 160);
     tooltipEl.style.left = (canvas.offsetLeft + Math.max(4, px)) + 'px';
     tooltipEl.style.top = (canvas.offsetTop + 8) + 'px';

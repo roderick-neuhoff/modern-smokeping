@@ -12,6 +12,9 @@ $ENV{SMOKEPING_LOG}        = "$d/log/smokeping.log";
 $ENV{SMOKEPING_CONF}       = $0;                 # any readable file: Info is stubbed
 $ENV{SPM_TEST_DATADIR}     = "$d/data";
 $ENV{SPM_CACHE_DIR}        = "$d/cache";
+# load the stand-ins first: Api.pm adds /usr/share/smokeping to \@INC, which on a
+# real SmokePing install would otherwise win over t/lib
+require RRDs; require Smokeping; require Smokeping::Info;
 require SmokepingModern::Api;
 my $fails = 0;
 sub ok { my ($c, $m) = @_; print(($c ? "ok   " : "FAIL ") . $m . "\n"); $fails++ unless $c }
@@ -71,7 +74,7 @@ ok(@{ $s->{delivery} } == 1 && $s->{delivery}[0]{channel} eq 'webhook' && $s->{d
 my $m = $A->can('metrics_text')->();
 ok($m =~ /^smokeping_modern_up 1$/m && $m =~ /^smokeping_target_loss_percent\{/m, 'metrics: basic series');
 ok($m =~ /^smokeping_polling_stopped 0$/m && $m =~ /^smokeping_target_stale\{/m, 'metrics: polling + stale');
-ok($m =~ /^smokeping_notification_channel_failing\{channel="webhook"\} 1$/m, 'metrics: failing channel');
+ok(scalar($m =~ /^smokeping_notification_channel_failing\{channel="webhook"\} 1$/m), 'metrics: failing channel');
 SmokepingModern::Delivery::record('webhook', 1, 'HTTP 204');
 $s = $A->can('summary')->({});
 ok(@{ $s->{delivery} } == 0, 'summary: a successful send clears the failure');

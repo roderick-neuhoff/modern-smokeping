@@ -90,10 +90,11 @@ ok($st == 422 && $r->{error} =~ /nothing was restored/, 'failed smokeping --chec
 ok(slurp("$d/Alerts") eq "changed again\n", '... and nothing was written');
 $check_ok = 1;
 
-# history + secrets
+# history + secrets (change the live msmtp.conf first, so the restore really rewrites it)
+spew("$d/msmtp.conf", "password changed\n"); chmod 0644, "$d/msmtp.conf";
 ($st, $r) = $A->can('backup_restore')->({ archive => $round, parts => ['history', 'secrets'] });
-ok(slurp("$d/modern-events.jsonl") =~ /hostdown/, 'history restored');
-ok(slurp("$d/modern-notify.json") =~ /secret\.example/, 'credentials restored when chosen');
+ok(scalar(slurp("$d/modern-events.jsonl") =~ /hostdown/), 'history restored');
+ok(scalar(slurp("$d/modern-notify.json") =~ /secret\.example/),'credentials restored when chosen');
 ok(((stat "$d/msmtp.conf")[2] & 07777) == 0600 || $^O !~ /linux/i, 'msmtp.conf keeps mode 0600');
 my $state = $J->decode(slurp("$d/modern-events.state"));
 ok(exists $state->{open}{'hostdown|Sites.Google'}, 'event state rebuilt: the open incident is remembered');

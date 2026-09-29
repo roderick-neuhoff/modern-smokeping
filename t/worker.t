@@ -15,7 +15,7 @@ my $unix = $^O ne 'MSWin32';
 # fake notifier + sendmail that just record how they were called
 my $calls = "$d/calls.txt";
 for my $name (qw(fakenotify fakesendmail)) {
-    spew("$d/$name", "#!$^X\nopen my \$o, '>>', '$calls'; my \$in = ''; \$in = join '', <STDIN> if '$name' eq 'fakesendmail';\n"
+    spew("$d/$name", "#!/usr/bin/env perl\nopen my \$o, '>>', '$calls'; my \$in = ''; \$in = join '', <STDIN> if '$name' eq 'fakesendmail';\n"
         . "print \$o '$name|' . join('|', \@ARGV) . '|MSG=' . (\$ENV{SPM_MESSAGE} // '') . '|IN=' . \$in . \"\\n---\\n\";\n");
     chmod 0755, "$d/$name";
 }
@@ -48,7 +48,7 @@ ok($s->{pollingStopped} && $s->{pollingStopped} == $old, 'stale rrds -> polling 
 SKIP: {
     last SKIP unless $unix;
     my $c = slurp($calls);
-    ok($c =~ /^fakenotify\|polling\|SmokePing\|\|\|\|1\|MSG=SmokePing has not recorded a measurement since/m, 'webhook notifier called with a RAISED polling notice');
+    ok(scalar($c =~ /^fakenotify\|polling\|SmokePing\|\|\|\|1\|MSG=SmokePing has not recorded a measurement since/m), 'webhook notifier called with a RAISED polling notice');
     ok($c =~ /^fakesendmail\|-f\|sp\@example\.com\|ops\@example\.com\|/m && $c =~ /Subject: \[SmokeAlert\] polling was raised on SmokePing/, 'e-mail sent to the alert recipients');
 }
 my $n1 = () = slurp($calls) =~ /---/g;
@@ -64,8 +64,8 @@ ok(!$s->{pollingStopped}, 'fresh rrd again -> recovered');
 SKIP: {
     last SKIP unless $unix;
     my $c = slurp($calls);
-    ok($c =~ /^fakenotify\|polling\|SmokePing\|\|\|\|0\|MSG=SmokePing is recording measurements again - back after 1h/m, 'recovery notice with outage length');
-    ok($c =~ /polling was cleared on SmokePing/, 'recovery e-mail');
+    ok(scalar($c =~ /^fakenotify\|polling\|SmokePing\|\|\|\|0\|MSG=SmokePing is recording measurements again - back after 1h/m), 'recovery notice with outage length');
+    ok(scalar($c =~ /polling was cleared on SmokePing/), 'recovery e-mail');
 }
 ok(slurp("$d/log/notify.log") =~ /polling RAISED/ && slurp("$d/log/notify.log") =~ /polling CLEARED/, 'both notices logged');
 

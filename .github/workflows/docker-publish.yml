@@ -20,7 +20,23 @@ permissions:
   packages: write
 
 jobs:
+  # Perl API/worker tests (with SmokePing + RRDs stubbed, t/lib) and the SPA
+  # render checks in jsdom. Nothing is built or published unless these pass.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: t/web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: t/web
+      - run: sh t/run-all.sh
+
   image:
+    needs: test
     runs-on: ubuntu-latest
     env:
       # Which lscr.io/linuxserver/smokeping tag to build FROM. Priority:
